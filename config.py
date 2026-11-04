@@ -1,0 +1,348 @@
+"""
+config.py - конфигурация бота и персистентное состояние.
+
+Загружает все параметры из переменных окружения (.env / EnvironmentFile
+systemd). Никаких хардкодных токенов - только os.getenv().
+
+Также содержит StateStore: маленькое JSON-хранилище runtime-состояния
+(флаги торговли/аудитора, режим песочницы, открытые позиции, последние
+действия). Персистентность нужна, чтобы флаги переживали перезапуск
+процесса systemd. Файл крошечный (< 5 КБ), атомарная запись через os.replace.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import time
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+
+# python-dotenv - опциональная зависимость: под systemd переменные приходят
+# через EnvironmentFile, .env нужен в основном для локальных запусков/тестов.
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()  # Если .env отсутствует - просто ничего не делает.
+except ImportError:  # pragma: no cover
+    pass
+
+log = logging.getLogger("config")
+
+# Базовый каталог проекта = папка, где лежит этот файл.
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+#: Максимум тикеров - жёсткое требование по памяти и лимитам API.
+MAX_TICKERS = 5
+
+_TRUE_VALUES = {"1", "true", "yes", "on", "y", "t", "да"}
+
+
+class ConfigError(RuntimeError):
+    """Критическая ошибка конфигурации (запуск невозможен)."""
+
+
+# ---------------------------------------------------------------------------
+# Небольшие парсеры окружения с безопасными значениями по умолчанию.
+# ---------------------------------------------------------------------------
+def _env_str(name: str, default: str = "") -> str:
+    value = os.getenv(name)
+    return value.strip() if value and value.strip() else default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    return value.strip().lower() in _TRUE_VALUES
+
+
+def _env_int(name: str, default: int, *, low: int = 1, high: int = 10**9) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        log.warning("ENV %s=%r не число, беру значение по умолчанию %s", name, raw, default)
+        return default
+    return max(low, min(high, value))
+
+
+def _env_float(name: str, default: float, *, low: float = -1e9, high: float = 1e9) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw.replace(",", "."))
+    except ValueError:
+        log.warning("ENV %s=%r не число, беру значение по умолчанию %s", name, raw, default)
+        return default
+    return max(low, min(high, value))
+
+
+def _env_list(name: str, default: Tuple[str, ...]) -> Tuple[str, ...]:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    # dict.fromkeys: убираем дубли, СОХРАНЯЯ порядок из .env
+    # (порядок важен: тикеры обрабатываются строго последовательно).
+    items = tuple(dict.fromkeys(part.strip().upper() for part in raw.split(",") if part.strip()))
+    return items or default
+
+
+def _env_urls(name: str, default: Tuple[str, ...]) -> Tuple[str, ...]:
+    """Список URL через запятую - БЕЗ приведения регистра (иначе ломаются ссылки)."""
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    items = tuple(part.strip() for part in raw.split(",") if part.strip())
+    return items or default
+
+
+# ---------------------------------------------------------------------------
+# Основной объект конфигурации.
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class BotConfig:
+    """Иммутабельный снимок всех настроек бота."""
+
+    # --- Секреты (только из окружения) ---
+    tinkoff_token: str            # токен реального счёта
+    tinkoff_sandbox_token: str    # токен песочницы
+    groq_api_key: str
+    telegram_bot_token: str
+    telegram_admin_id: int
+
+    # --- Режимы ---
+    use_sandbox: bool             # стартовый режим (далее живёт в state.json)
+    trading_enabled_default: bool
+    auditor_enabled_default: bool
+
+    # --- Стратегия ---
+    trading_tickers: Tuple[str, ...]
+    sma_period: int
+    poll_interval_sec: int
+    max_position_pct: float
+    stop_loss_pct: float
+    take_profit_pct: float
+    sentiment_threshold: float
+
+    # --- ИИ ---
+    groq_model: str
+    audit_interval_sec: int
+    audit_log_lines: int
+    sentiment_ttl_sec: int
+
+    # --- Инфраструктура ---
+    rate_limit_rpm: int
+    news_rss_urls: Tuple[str, ...]
+    http_timeout_sec: int
+    sandbox_start_balance: float
+    cleanup_keep_days: int
+    cleanup_max_logs_mb: int
+    log_level: str
+    base_dir: str
+    logs_dir: str
+    state_file: str
+
+    @property
+    def log_file(self) -> str:
+        return os.path.join(self.logs_dir, "bot.log")
+
+
+def load_config() -> BotConfig:
+    """
+    Собирает BotConfig из окружения и валидирует критичные поля.
+    Бросает ConfigError, если бот запускать нельзя.
+    """
+    tinkoff_token = _env_str("TINKOFF_TOKEN")
+    sandbox_token = _env_str("TINKOFF_SANDBOX_TOKEN") or tinkoff_token
+    groq_key = _env_str("GROQ_API_KEY")
+    tg_token = _env_str("TELEGRAM_BOT_TOKEN")
+    admin_raw = _env_str("TELEGRAM_ADMIN_ID")
+
+    problems: List[str] = []
+    if not sandbox_token and not tinkoff_token:
+        problems.append("TINKOFF_SANDBOX_TOKEN / TINKOFF_TOKEN - не задан ни один токен")
+    if not groq_key:
+        problems.append("GROQ_API_KEY - не задан (нужен для сентимента и аудитора)")
+    if not tg_token:
+        problems.append("TELEGRAM_BOT_TOKEN - не задан (нужен для управления)")
+    if not admin_raw.isdigit():
+        problems.append("TELEGRAM_ADMIN_ID - должен быть числовым Telegram ID администратора")
+    if problems:
+        raise ConfigError("Ошибки конфигурации:\n  - " + "\n  - ".join(problems))
+
+    # Тикеры: верхний регистр, без дублей, максимум MAX_TICKERS.
+    tickers = _env_list("TRADING_TICKERS", ("SBER", "GAZP", "LKOH"))
+    if len(tickers) > MAX_TICKERS:
+        # Логгер ещё не настроен - предупреждаем через stderr.
+        print(
+            f"[config] ВНИМАНИЕ: TRADING_TICKERS содержит {len(tickers)} тикеров, "
+            f"оставляю первые {MAX_TICKERS}: {', '.join(tickers[:MAX_TICKERS])}",
+            flush=True,
+        )
+        tickers = tickers[:MAX_TICKERS]
+
+    logs_dir = os.path.join(BASE_DIR, "logs")
+    return BotConfig(
+        tinkoff_token=tinkoff_token,
+        tinkoff_sandbox_token=sandbox_token,
+        groq_api_key=groq_key,
+        telegram_bot_token=tg_token,
+        telegram_admin_id=int(admin_raw),
+        use_sandbox=_env_bool("USE_SANDBOX", True),
+        trading_enabled_default=_env_bool("TRADING_ENABLED", False),
+        auditor_enabled_default=_env_bool("AUDITOR_ENABLED", True),
+        trading_tickers=tickers,
+        sma_period=_env_int("SMA_PERIOD", 24, low=2, high=500),
+        poll_interval_sec=_env_int("POLL_INTERVAL_SEC", 300, low=30, high=3600),
+        max_position_pct=_env_float("MAX_POSITION_PCT", 10.0, low=0.5, high=100.0),
+        stop_loss_pct=_env_float("STOP_LOSS_PCT", 3.0, low=0.1, high=50.0),
+        take_profit_pct=_env_float("TAKE_PROFIT_PCT", 5.0, low=0.1, high=100.0),
+        sentiment_threshold=_env_float("SENTIMENT_THRESHOLD", -0.3, low=-1.0, high=1.0),
+        groq_model=_env_str("GROQ_MODEL", "llama-3.1-8b-instant"),
+        audit_interval_sec=_env_int("AUDIT_INTERVAL_SEC", 3600, low=300, high=86400),
+        audit_log_lines=_env_int("AUDIT_LOG_LINES", 50, low=10, high=200),
+        sentiment_ttl_sec=_env_int("SENTIMENT_TTL_SEC", 21600, low=60, high=86400),
+        rate_limit_rpm=_env_int("RATE_LIMIT_RPM", 90, low=5, high=250),
+        news_rss_urls=_env_urls(
+            "NEWS_RSS_URLS",
+            ("https://www.interfax.ru/rss.asp",),
+        ),
+        http_timeout_sec=_env_int("HTTP_TIMEOUT_SEC", 15, low=5, high=120),
+        sandbox_start_balance=_env_float("SANDBOX_START_BALANCE", 100_000.0, low=1000.0),
+        cleanup_keep_days=_env_int("CLEANUP_KEEP_DAYS", 14, low=1, high=365),
+        cleanup_max_logs_mb=_env_int("CLEANUP_MAX_LOGS_MB", 20, low=5, high=1024),
+        log_level=_env_str("LOG_LEVEL", "INFO").upper(),
+        base_dir=BASE_DIR,
+        logs_dir=logs_dir,
+        state_file=os.path.join(BASE_DIR, "state.json"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Персистентное runtime-состояние (state.json).
+# ---------------------------------------------------------------------------
+class StateStore:
+    """
+    Крошечное JSON-хранилище runtime-состояния.
+
+    Хранит: флаги торговли/аудитора, текущий режим (песочница/реал),
+    открытые позиции, последние действия, результат последнего аудита.
+    Запись атомарная (tmp + os.replace), файл < 5 КБ - для 15 ГБ диска это ничто.
+    """
+
+    _DEFAULTS: Dict[str, Any] = {
+        "trading_enabled": False,
+        "auditor_enabled": True,
+        "use_sandbox": True,
+        "positions": {},          # ticker -> {lots, entry_price, entry_ts}
+        "last_actions": [],       # до 3 последних строк для /status
+        "last_audit_result": "",
+        "last_audit_ts": 0,
+        "sandbox_confirm_ts": 0,  # время выдачи подтверждения перехода в реал
+    }
+
+    def __init__(self, path: str, initial_overrides: Optional[Dict[str, Any]] = None):
+        self._path = path
+        self._data: Dict[str, Any] = dict(self._DEFAULTS)
+        self._load(initial_overrides)
+
+    # --- внутреннее ---------------------------------------------------------
+    def _load(self, overrides: Optional[Dict[str, Any]]) -> None:
+        if os.path.exists(self._path):
+            try:
+                with open(self._path, "r", encoding="utf-8") as fh:
+                    stored = json.load(fh)
+                if isinstance(stored, dict):
+                    self._data.update(stored)
+                log.info("Состояние загружено: %s", self._path)
+            except (OSError, json.JSONDecodeError) as exc:
+                # Битый state.json - не повод не торговать: начинаем с дефолтов.
+                log.warning("Не удалось прочитать %s (%s); начинаю с чистого состояния",
+                            self._path, exc)
+        else:
+            # Первый запуск: применяем стартовые значения из окружения.
+            if overrides:
+                self._data.update(overrides)
+            self.save()
+            log.info("Создан новый файл состояния: %s", self._path)
+
+    def save(self) -> None:
+        """Атомарная запись состояния на диск."""
+        tmp_path = self._path + ".tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as fh:
+                json.dump(self._data, fh, ensure_ascii=False, indent=1)
+            os.replace(tmp_path, self._path)
+        except OSError as exc:
+            log.error("Не удалось сохранить состояние в %s: %s", self._path, exc)
+
+    # --- флаги-свойства -------------------------------------------------------
+    @property
+    def trading_enabled(self) -> bool:
+        return bool(self._data["trading_enabled"])
+
+    def set_trading_enabled(self, value: bool) -> None:
+        self._data["trading_enabled"] = bool(value)
+        self.save()
+
+    @property
+    def auditor_enabled(self) -> bool:
+        return bool(self._data["auditor_enabled"])
+
+    def set_auditor_enabled(self, value: bool) -> None:
+        self._data["auditor_enabled"] = bool(value)
+        self.save()
+
+    @property
+    def use_sandbox(self) -> bool:
+        return bool(self._data["use_sandbox"])
+
+    def set_use_sandbox(self, value: bool) -> None:
+        self._data["use_sandbox"] = bool(value)
+        self.save()
+
+    # --- позиции ---------------------------------------------------------------
+    @property
+    def positions(self) -> Dict[str, Dict[str, Any]]:
+        return self._data["positions"]
+
+    def set_position(self, ticker: str, info: Dict[str, Any]) -> None:
+        self._data["positions"][ticker] = info
+        self.save()
+
+    def drop_position(self, ticker: str) -> None:
+        self._data["positions"].pop(ticker, None)
+        self.save()
+
+    # --- журнал действий и аудит -----------------------------------------------
+    def record_action(self, text: str) -> None:
+        """Помнит последние 3 действия для команды /status (deque не нужен)."""
+        actions: List[str] = self._data["last_actions"]
+        actions.append(f"{time.strftime('%d.%m %H:%M')}: {text}")
+        del actions[:-3]
+        self.save()
+
+    @property
+    def last_actions(self) -> List[str]:
+        return list(self._data["last_actions"])
+
+    @property
+    def last_audit_result(self) -> str:
+        return str(self._data.get("last_audit_result", ""))
+
+    def set_audit_result(self, text: str) -> None:
+        self._data["last_audit_result"] = text[:500]
+        self._data["last_audit_ts"] = int(time.time())
+        self.save()
+
+    @property
+    def sandbox_confirm_ts(self) -> float:
+        return float(self._data.get("sandbox_confirm_ts", 0))
+
+    def set_sandbox_confirm_ts(self, ts: float) -> None:
+        self._data["sandbox_confirm_ts"] = ts
+        self.save()
