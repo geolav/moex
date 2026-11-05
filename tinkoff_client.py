@@ -384,6 +384,31 @@ class TinkoffClient:
                 closes.append(float(quotation_to_decimal(candle.close)))
         return closes[-count:]
 
+    async def get_hourly_history(self, ticker: str, hours: float = 48.0) -> List[Tuple[float, float]]:
+        """История часовых закрытий с биржи (ретроспектива для /stats): [(ts, price), ...]."""
+        instrument = self._instruments.get(ticker)
+        if instrument is None:
+            return []
+        interval = CandleInterval.CANDLE_INTERVAL_HOUR
+        interval_td = candle_interval_to_timedelta(interval)
+        now_utc = sdk_now()
+        response = await self._call(
+            "get_candles",
+            lambda: self._api.market_data.get_candles(
+                figi=instrument["figi"],
+                interval=interval,
+                # Запас 1.5x: биржа торгует не 24/7, часть часов пустая.
+                from_=now_utc - interval_td * int(hours * 1.5 + 3),
+                to=now_utc,
+            ),
+        )
+        out: List[Tuple[float, float]] = []
+        for candle in response.candles:
+            if candle.time + interval_td <= now_utc:  # только закрытые свечи
+                out.append((candle.time.timestamp(),
+                            float(quotation_to_decimal(candle.close))))
+        return out
+
     async def get_sma(self, ticker: str) -> Optional[float]:
         """Простая скользящая средняя за SMA_PERIOD закрытых часовых свечей."""
         closes = await self.get_closes(ticker, count=self._cfg.sma_period)

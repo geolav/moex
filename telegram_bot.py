@@ -182,7 +182,7 @@ def create_router(ctx: AppContext) -> Router:
                 hours = 6.0
         hours = max(1.0, min(STATS_MAX_HOURS, hours))
 
-        text, series = _stats_text(ctx, hours)
+        text, series = await _stats_text(ctx, hours)
         png = _render_chart(series, hours, dict(ctx.state.positions))
         try:
             if png:
@@ -304,20 +304,34 @@ def create_router(ctx: AppContext) -> Router:
 # ---------------------------------------------------------------------------
 # Статистика (/stats): текст + график.
 # ---------------------------------------------------------------------------
-def _stats_text(ctx: AppContext, hours: float) -> Tuple[str, List[Tuple[str, list]]]:
-    """Готовит текст статистики и набор данных для графика."""
+async def _stats_text(ctx: AppContext, hours: float) -> Tuple[str, List[Tuple[str, list]]]:
+    """Готовит текст статистики и набор данных для графика.
+
+    Источник данных: бот сам собирает цены каждые 5 минут (state.json).
+    Если своих точек за окно мало (бот недавно запущен), история добирается
+    с биржи по часовым свечам через API.
+    """
     series: List[Tuple[str, list]] = []
     lines: List[str] = []
-    since = datetime.now().strftime("%d.%m %H:%M")
     dt_from = datetime.fromtimestamp(time.time() - hours * 3600)
     lines.append(f"📈 Статистика за {hours:.0f} ч "
-                 f"(с {dt_from.strftime('%d.%m %H:%M')} до {since})")
+                 f"(с {dt_from.strftime('%d.%m %H:%M')} до "
+                 f"{datetime.now().strftime('%d.%m %H:%M')})")
 
     trades_in_window = _count_trades_in_window(ctx, hours)
     have_any = False
 
     for ticker in ctx.config.trading_tickers:
         hist = ctx.state.price_history(ticker, hours)
+        source = "мои замеры"
+        if len(hist) < 2:
+            # Своей истории мало - добираем ретроспективу с биржи.
+            try:
+                hist = await ctx.client.get_hourly_history(ticker, hours)
+                source = "история биржи (часовые свечи)"
+            except Exception as exc:  # noqa: BLE001
+                log.warning("%s: ретроспектива недоступна (%s)", ticker, exc)
+                hist = []
         if len(hist) < 2:
             continue
         have_any = True
@@ -335,7 +349,8 @@ def _stats_text(ctx: AppContext, hours: float) -> Tuple[str, List[Tuple[str, lis
             trend = f"почти не изменилась ({change_pct:+.1f}%)"
         block = [
             f"\n{ticker}: сейчас {last:.2f} ₽, за {hours:.0f} ч {trend}.",
-            f"   Диапазон: от {mn:.2f} до {mx:.2f} ₽, средняя {avg:.2f} ₽.",
+            f"   Диапазон: от {mn:.2f} до {mx:.2f} ₽, средняя {avg:.2f} ₽ "
+            f"(данные: {source}).",
         ]
         pos = ctx.state.positions.get(ticker)
         if pos:
@@ -353,13 +368,16 @@ def _stats_text(ctx: AppContext, hours: float) -> Tuple[str, List[Tuple[str, lis
         series.append((ticker, hist))
 
     if not have_any:
-        return (f"Статистики пока нет: бот собирает историю цен раз "
-                f"{ctx.config.poll_interval_sec // 60} мин. Загляните через "
-                f"полчаса-час, данных наберётся.", series)
+        return (f"Статистики пока нет ни у меня, ни на бирже за этот период. "
+                f"Попробуйте ещё раз позже.", series)
 
     if trades_in_window is not None:
         lines.append(f"\nСделок за период: {trades_in_window}.")
-    lines.append("\nГрафик цен прикладываю картинкой выше "
+    lines.append("\nКак я считаю: сам замеряю цены каждые "
+                 f"{ctx.config.poll_interval_sec // 60} мин; если бот запущен "
+                 "недавно, добираю историю с биржи (часовые свечи). Ночью и в "
+                 "выходные рынок закрыт - линии будут ровными, это норма.")
+    lines.append("График цен - картинкой выше "
                  "(пунктиром - цена вашей покупки, если позиция открыта).")
     return "\n".join(lines), series
 
