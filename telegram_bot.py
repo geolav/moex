@@ -323,8 +323,9 @@ async def _stats_text(ctx: AppContext, hours: float) -> Tuple[str, List[Tuple[st
 
     for ticker in ctx.config.trading_tickers:
         hist = ctx.state.price_history(ticker, hours)
+        span_h = ((hist[-1][0] - hist[0][0]) / 3600.0) if len(hist) >= 2 else 0.0
         source = "мои замеры"
-        if len(hist) < 2:
+        if span_h < hours * 0.5:  # своими замерами покрыто меньше половины окна
             # Своей истории мало - добираем ретроспективу с биржи.
             try:
                 hist = await ctx.client.get_hourly_history(ticker, hours)
