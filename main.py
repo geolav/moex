@@ -46,6 +46,15 @@ LOG_BACKUP_COUNT = 3
 LOG_FORMAT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
 
 
+async def _hard_exit_if_stuck(exit_code: int) -> None:
+    """Последний рубеж остановки: если цикл так и не закрылся (зависший
+    поток gRPC/aiohttp), через 3 секунды выходим принудительно - systemd
+    должен видеть завершение процесса, а не вечное 'deactivating'."""
+    await asyncio.sleep(3.0)
+    log.warning("Цикл не завершился после очистки - принудительный выход (os._exit)")
+    os._exit(exit_code or 0)
+
+
 def setup_logging(config: BotConfig) -> None:
     """Файловый лог с ротацией + дублирование в stdout (для journald)."""
     os.makedirs(config.logs_dir, exist_ok=True)
@@ -73,7 +82,7 @@ def setup_logging(config: BotConfig) -> None:
 def _print_banner(config: BotConfig, state: StateStore) -> None:
     mode = "ПЕСОЧНИЦА" if state.use_sandbox else "РЕАЛЬНЫЙ СЧЁТ"
     log.info("=" * 60)
-    log.info("MOEX Trading Bot v1.0.0 стартует")
+    log.info("MOEX Trading Bot v1.1.0 стартует")
     log.info("Режим: %s | торговля: %s | аудитор: %s", mode,
              "вкл" if state.trading_enabled else "выкл",
              "вкл" if state.auditor_enabled else "выкл")
@@ -113,18 +122,35 @@ async def async_main() -> int:
     engine = TradingEngine(config, state, client, analyst, notify_admin)
     auditor = AIAuditor(config, state, analyst, notify_admin)
 
-    bot = Bot(token=config.telegram_bot_token)
+    # TELEGRAM_API_BASE: если api.telegram.org недоступен с VPS (блокировка
+    # хостера), укажите здесь адрес реверс-прокси (например, Cloudflare Worker):
+    #   TELEGRAM_API_BASE=https://<ваш-worker>.workers.dev
+    # Пусто (по умолчанию) = официальный api.telegram.org.
+    api_base = os.getenv("TELEGRAM_API_BASE", "").strip().rstrip("/")
+    if api_base:
+        from aiogram.client.session.aiohttp import AiohttpSession
+        from aiogram.client.telegram import TelegramAPIServer
+
+        log.info("Telegram API работает через прокси: %s", api_base)
+        session = AiohttpSession(api=TelegramAPIServer.from_base(api_base))
+        bot = Bot(token=config.telegram_bot_token, session=session)
+    else:
+        bot = Bot(token=config.telegram_bot_token)
     ctx = AppContext(
         config=config, state=state, client=client, analyst=analyst,
         engine=engine, auditor=auditor, bot=bot,
         started_monotonic=time.monotonic(),
+        shutdown_event=None,  # присвоим ниже, после создания события
     )
     dispatcher = build_dispatcher(ctx)
     stop_event = asyncio.Event()
+    ctx.shutdown_event = stop_event  # /shutdown из Telegram выставит его
 
     # --- graceful shutdown по SIGINT/SIGTERM (systemd присылает SIGINT) -----
     def _handle_signal() -> None:
-        log.info("Получен сигнал остановки - завершаю работу корректно...")
+        # Защита от многократного Ctrl+C: сообщение - только один раз.
+        if not stop_event.is_set():
+            log.info("Получен сигнал остановки - завершаю работу корректно...")
         stop_event.set()
         engine.request_stop()
         auditor.request_stop()
@@ -155,14 +181,36 @@ async def async_main() -> int:
         try:
             mode = "Sandbox" if state.use_sandbox else "РЕАЛЬНЫЙ режим"
             await notify_admin(
-                f"Бот запущен (v1.0.0). Режим: {mode}. "
+                f"Бот запущен (v1.1.0). Режим: {mode}. "
                 f"Тикеры: {', '.join(config.trading_tickers)}. "
-                f"Торговля: {'вкл' if state.trading_enabled else 'выкл'}.")
+                f"Торговля: {'вкл' if state.trading_enabled else 'выкл'}. "
+                f"Новые команды: /stats (статистика с графиком), /shutdown.")
         except Exception as exc:  # noqa: BLE001 - Telegram мог быть недоступен
             log.warning("Приветствие в Telegram не отправлено: %s", exc)
 
-        # Long-polling Telegram - основная корутина; сигналы обрабатываем сами.
-        await dispatcher.start_polling(bot, handle_signals=False)
+        # Long-polling Telegram запускаем задачей и ждём ПЕРВОЕ из двух событий:
+        #   а) polling завершился сам (ошибка/конфликт) -> выходим;
+        #   б) /shutdown из Telegram выставил stop_event -> глушим polling сами.
+        # Раньше здесь был await start_polling(...) - из-за этого Ctrl+C
+        # и /shutdown не могли прервать бесконечный цикл aiogram.
+        polling_task = asyncio.create_task(
+            dispatcher.start_polling(bot, handle_signals=False), name="tg-polling")
+        shutdown_watch = asyncio.create_task(stop_event.wait(), name="shutdown-watch")
+        done, _pending = await asyncio.wait(
+            {polling_task, shutdown_watch}, return_when=asyncio.FIRST_COMPLETED)
+
+        if shutdown_watch in done:
+            log.info("Остановка по команде /shutdown - глушу polling")
+        polling_task.cancel()
+        try:
+            await asyncio.wait_for(polling_task, timeout=8.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            log.warning("Telegram-polling не завершился за 8 c - принудительно пропускаю")
+        except Exception:  # noqa: BLE001
+            # polling упал сам (например, Conflict от второго экземпляра):
+            # выводим ошибку - наружу, чтобы systemd перезапустил бота.
+            polling_task.result()
+        shutdown_watch.cancel()
 
     except ConfigError:
         raise
@@ -176,27 +224,28 @@ async def async_main() -> int:
         stop_event.set()
         engine.request_stop()
         auditor.request_stop()
+
+        async def _limited(label: str, coro, timeout: float = 8.0) -> None:
+            """Закрытие ресурса с жёстким таймаутом: зависший сокет/канал
+            не должен задерживать остановку процесса больше 8 секунд."""
+            try:
+                await asyncio.wait_for(coro, timeout=timeout)
+            except Exception:  # noqa: BLE001 - включая TimeoutError и CancelledError
+                log.warning("%s: не завершилось за %.0f c - принудительно пропускаю",
+                            label, timeout)
+
         for task in background_tasks:
             task.cancel()
         for task in background_tasks:  # отменяем/ждём строго по одной
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                pass
-        # 2) сетевые ресурсы
-        try:
-            await bot.session.close()
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            await analyst.close()
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            await client.close()
-        except Exception:  # noqa: BLE001
-            pass
+            await _limited("Фоновая задача", task)
+        # 2) сетевые ресурсы (каждое - с таймаутом, чтобы Ctrl+C всегда срабатывал)
+        await _limited("Telegram-сессия", bot.session.close())
+        await _limited("Groq-клиент", analyst.close())
+        await _limited("T-Invest gRPC-канал", client.close())
         log.info("Завершение: все ресурсы освобождены")
+        # Последний рубеж: если какой-то небоевой поток всё же держит цикл,
+        # через 3 секунды процесс будет прибит принудительно.
+        asyncio.get_running_loop().create_task(_hard_exit_if_stuck(exit_code))
     return exit_code
 
 

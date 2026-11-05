@@ -397,7 +397,7 @@ class TinkoffClient:
         """Сводка портфеля: кэш, всего, позиции (тикер, лоты, количество, цена)."""
         response = await self._call(
             "get_portfolio",
-            lambda: self._api.portfolio.get_portfolio(account_id=self._account_id),
+            lambda: self._api.operations.get_portfolio(account_id=self._account_id),
         )
 
         def _to_float(quotation: Any) -> float:
@@ -426,8 +426,13 @@ class TinkoffClient:
         }
 
     # ------------------------------------------------------------------ ордера
-    async def _post_order(self, ticker: str, lots: int, direction: Any) -> Dict[str, Any]:
-        """Рыночный ордер: в песочнице post_sandbox_order, в реале post_order."""
+    async def _post_order(self, ticker: str, lots: int, direction: Any,
+                          price: Optional[float] = None) -> Dict[str, Any]:
+        """Рыночный ордер: в песочнице post_sandbox_order, в реале post_order.
+
+        ВАЖНО: для акций MOEX (класс TQBR) брокер требует поле price даже у
+        рыночной заявки (иначе INVALID_ARGUMENT 30079) - поэтому цену
+        передаём всегда, когда она известна."""
         instrument = self._instruments.get(ticker)
         if instrument is None:
             raise TinkoffClientError(f"Ордер {ticker}: тикер не найден в кэше инструментов")
@@ -444,6 +449,7 @@ class TinkoffClient:
                     order_type=OrderType.ORDER_TYPE_MARKET,
                     account_id=self._account_id,
                     order_id=order_id,
+                    price=decimal_to_quotation(Decimal(str(round(price, 2)))) if price else None,
                 ),
             )
         else:
@@ -456,6 +462,7 @@ class TinkoffClient:
                     order_type=OrderType.ORDER_TYPE_MARKET,
                     account_id=self._account_id,
                     order_id=order_id,
+                    price=decimal_to_quotation(Decimal(str(round(price, 2)))) if price else None,
                 ),
             )
         return {
@@ -465,11 +472,11 @@ class TinkoffClient:
             "requested_lots": lots,
         }
 
-    async def buy(self, ticker: str, lots: int) -> Dict[str, Any]:
-        return await self._post_order(ticker, lots, OrderDirection.ORDER_DIRECTION_BUY)
+    async def buy(self, ticker: str, lots: int, price: float = 0.0) -> Dict[str, Any]:
+        return await self._post_order(ticker, lots, OrderDirection.ORDER_DIRECTION_BUY, price)
 
-    async def sell(self, ticker: str, lots: int) -> Dict[str, Any]:
-        return await self._post_order(ticker, lots, OrderDirection.ORDER_DIRECTION_SELL)
+    async def sell(self, ticker: str, lots: int, price: float = 0.0) -> Dict[str, Any]:
+        return await self._post_order(ticker, lots, OrderDirection.ORDER_DIRECTION_SELL, price)
 
     # ------------------------------------------------------------------ новости
     async def get_news(self, ticker: str, limit: int = 8) -> List[str]:

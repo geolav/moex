@@ -243,6 +243,7 @@ class StateStore:
         "last_audit_result": "",
         "last_audit_ts": 0,
         "sandbox_confirm_ts": 0,  # время выдачи подтверждения перехода в реал
+        "price_history": {},      # ticker -> [[ts, price], ...] для /stats
     }
 
     def __init__(self, path: str, initial_overrides: Optional[Dict[str, Any]] = None):
@@ -346,3 +347,21 @@ class StateStore:
     def set_sandbox_confirm_ts(self, ts: float) -> None:
         self._data["sandbox_confirm_ts"] = ts
         self.save()
+
+    # --- история цен для /stats -------------------------------------------------
+    #: 2 точки/час * 50 часов - файл state.json останется крошечным (< 40 КБ).
+    PRICE_HISTORY_MAX_POINTS = 100
+
+    def record_price(self, ticker: str, price: float) -> None:
+        """Точка истории цен: движок вызывает её раз в цикл опроса (5 мин)."""
+        hist: List[List[float]] = (
+            self._data.setdefault("price_history", {}).setdefault(ticker, []))
+        hist.append([round(time.time(), 1), round(price, 4)])
+        del hist[:-self.PRICE_HISTORY_MAX_POINTS]
+        self.save()
+
+    def price_history(self, ticker: str, hours: float = 6.0) -> List[Tuple[float, float]]:
+        """Точки (ts, price) за последние `hours` часов, старые - обрезаются."""
+        cutoff = time.time() - max(0.5, hours) * 3600.0
+        raw = self._data.get("price_history", {}).get(ticker, [])
+        return [(float(ts), float(p)) for ts, p in raw if float(ts) >= cutoff]
