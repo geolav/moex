@@ -2,6 +2,7 @@
 .env.save
 state.json
 venv/
+.venv/
 logs/
 __pycache__/
 *.pyc
