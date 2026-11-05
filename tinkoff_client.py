@@ -374,7 +374,7 @@ class TinkoffClient:
             lambda: self._api.market_data.get_candles(
                 figi=instrument["figi"],
                 interval=interval,
-                from_=now_utc - interval_td * (count + 3),
+                from_=now_utc - interval_td * (count * 3 + 3),
                 to=now_utc,
             ),
         )
