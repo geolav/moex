@@ -155,13 +155,14 @@ class TradingEngine:
         return round(base + (self._state.aggressiveness() - 50) / 100.0 * 0.4, 2)
 
     def _cooldown_sec(self) -> float:
-        factor = 1.5 - self._state.aggressiveness() / 100.0
+        # При высокой агрессивности кулдаун сокращается сильнее (до 0.25x).
+        factor = max(0.25, 1.5 - 1.25 * self._state.aggressiveness() / 100.0)
         return self._cfg.trade_cooldown_min * 60.0 * factor
 
     def _max_buys_today(self) -> int:
-        # 2..6 в зависимости от агрессивности, но не больше env-потолка.
+        # 2..22 в зависимости от агрессивности, но не больше env-потолка.
         return min(self._cfg.max_buys_per_day,
-                   2 + self._state.aggressiveness() // 25)
+                   2 + self._state.aggressiveness() // 5)
 
     def _cooldown_active(self, ticker: str) -> bool:
         elapsed = time.time() - self._state.last_buy_ts(ticker)

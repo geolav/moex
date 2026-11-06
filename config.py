@@ -213,7 +213,7 @@ def load_config() -> BotConfig:
         sentiment_ttl_sec=_env_int("SENTIMENT_TTL_SEC", 21600, low=60, high=86400),
         llm_decisions_enabled=_env_bool("LLM_DECISIONS", True),
         trade_cooldown_min=_env_int("TRADE_COOLDOWN_MIN", 120, low=0, high=1440),
-        max_buys_per_day=_env_int("MAX_BUYS_PER_DAY", 4, low=1, high=50),
+        max_buys_per_day=_env_int("MAX_BUYS_PER_DAY", 25, low=1, high=100),
         rate_limit_rpm=_env_int("RATE_LIMIT_RPM", 90, low=5, high=250),
         news_rss_urls=_env_urls(
             "NEWS_RSS_URLS",

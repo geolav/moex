@@ -385,7 +385,11 @@ class TinkoffClient:
         return closes[-count:]
 
     async def get_hourly_history(self, ticker: str, hours: float = 48.0) -> List[Tuple[float, float]]:
-        """История часовых закрытий с биржи (ретроспектива для /stats): [(ts, price), ...]."""
+        """История часовых закрытий с биржи: [(ts, price), ...].
+
+        ts - момент ЗАКРЫТИЯ свечи: цена закрытия относится к концу часа,
+        иначе вся линия уезжает на час влево от реального времени.
+        """
         instrument = self._instruments.get(ticker)
         if instrument is None:
             return []
@@ -395,17 +399,16 @@ class TinkoffClient:
         response = await self._call(
             "get_candles",
             lambda: self._api.market_data.get_candles(
-                figi=instrument["figi"],
-                interval=interval,
-                # Запас 1.5x: биржа торгует не 24/7, часть часов пустая.
+                figi=instrument["figi"], interval=interval,
                 from_=now_utc - interval_td * int(hours * 1.5 + 3),
                 to=now_utc,
             ),
         )
         out: List[Tuple[float, float]] = []
         for candle in response.candles:
-            if candle.time + interval_td <= now_utc:  # только закрытые свечи
-                out.append((candle.time.timestamp(),
+            close_dt = candle.time + interval_td
+            if close_dt <= now_utc:  # только закрытые свечи
+                out.append((close_dt.timestamp(),
                             float(quotation_to_decimal(candle.close))))
         return out
 

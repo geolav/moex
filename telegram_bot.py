@@ -24,7 +24,7 @@ import io
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
 from aiogram import Bot, Dispatcher, Router
@@ -236,7 +236,7 @@ def create_router(ctx: AppContext) -> Router:
             f"• порог сигнала индикаторов: {0.60 - 0.55 * value / 100:.2f} "
             f"(чем меньше, тем чаще срабатывает);\n"
             f"• требуемая уверенность ИИ-трейдера: {0.65 - 0.35 * value / 100:.2f};\n"
-            f"• лимит покупок в сутки: {min(ctx.config.max_buys_per_day, 2 + value // 25)}.\n\n"
+            f"• лимит покупок в сутки: {min(ctx.config.max_buys_per_day, 2 + value // 5)}.\n\n"
             f"Страховки прежние: стоп-лосс −{ctx.config.stop_loss_pct:.0f}%, "
             f"тейк-профит +{ctx.config.take_profit_pct:.0f}%.")
 
@@ -349,7 +349,7 @@ def create_router(ctx: AppContext) -> Router:
 # ---------------------------------------------------------------------------
 # Статистика (/stats): текст + график.
 # ---------------------------------------------------------------------------
-def _stats_text(ctx: AppContext, hours: float) -> Tuple[str, List[Tuple[str, list]]]:
+async def _stats_text(ctx: AppContext, hours: float) -> Tuple[str, List[Tuple[str, list]]]:
     """Готовит текст статистики и набор данных для графика."""
     series: List[Tuple[str, list]] = []
     lines: List[str] = []
@@ -363,6 +363,25 @@ def _stats_text(ctx: AppContext, hours: float) -> Tuple[str, List[Tuple[str, lis
 
     for ticker in ctx.config.trading_tickers:
         hist = ctx.state.price_history(ticker, hours)
+        # Достраиваю историю часовыми свечами с биржи всегда: мои замеры
+        # живут максимум ~8 ч (100 точек по 5 мин) и теряются при рестарте.
+        # Сливаю оба источника (мои точки главнее) и режу строго к окну,
+        # т.к. биржа отдаёт свечи с запасом (hours * 1.5 + 3).
+        try:
+            exch = await ctx.client.get_hourly_history(ticker, hours)
+        except Exception as exc:  # noqa: BLE001 - обойдёмся своими точками
+            log.warning("%s: история с биржи недоступна (%s)", ticker, exc)
+            exch = []
+        if exch:
+            # Свечи, рядом с которыми есть своя точка (±30 мин), убираю:
+            # своя точка замеряется чаще и точнее. Свечи между ними -
+            # остаются: они и достраивают историю до полного окна.
+            own = sorted(hist)
+            extra = [(ts, p) for ts, p in exch
+                     if all(abs(ts - ots) > 1800 for ots, _ in own)]
+            hist = sorted(own + extra)
+        hist = [(ts, p) for ts, p in hist
+                if ts >= time.time() - hours * 3600.0]
         if len(hist) < 2:
             continue
         have_any = True
@@ -454,17 +473,31 @@ def _render_chart(series: List[Tuple[str, list]], hours: float,
         ax.set_ylabel("цена, ₽", fontsize=8)
         ax.grid(alpha=0.3)
         ax.tick_params(labelsize=8)
-        # Ось времени - строго до текущего момента: линия обязана доходить
-        # до "сейчас", а последняя метка времени не должна срезаться.
-        ax.set_xlim(left=xs[0], right=now_dt)
-        # Линия цены покупки, если позиция открыта.
+        # Ось времени - строго запрошенное окно: левый край - начало окна,
+        # правый - сейчас. Тогда масштаб всегда честный относительно
+        # подписи "за N часов" (свечи с биржи приходят с запасом).
+        ax.set_xlim(left=min(xs[0], now_dt - timedelta(hours=hours)),
+                    right=now_dt)
+        # Линия цены покупки и момент покупки, если позиция открыта.
         pos = positions.get(ticker)
         if pos:
             entry = float(pos.get("entry_price", 0) or 0) or None
             if entry:
                 ax.axhline(entry, ls="--", lw=1.0, color="#d62728")
+            try:
+                buy_dt = datetime.strptime(
+                    str(pos.get("entry_ts", "")), "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                buy_dt = None
+            if buy_dt and xs[0] <= buy_dt <= xs[-1]:
+                ax.axvline(buy_dt, ls=":", lw=1.4, color="#ff7f0e")
+                ytop = ax.get_ylim()[1]
+                ax.annotate("покупка", xy=(buy_dt, ytop),
+                            xytext=(3, -2), textcoords="offset points",
+                            fontsize=8, color="#ff7f0e", va="top")
     fig.suptitle(f"Цены за последние {hours:.0f} ч "
-                 "(пунктир - цена покупки)", fontsize=11)
+                 "(пунктир - цена покупки, оранжевая линия - момент покупки)",
+                 fontsize=11)
     # Наклон подписей времени (autofmt_xdate несовместим с constrained_layout).
     for ax in axes:
         for label in ax.get_xticklabels():
