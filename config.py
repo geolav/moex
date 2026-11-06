@@ -133,6 +133,11 @@ class BotConfig:
     audit_interval_sec: int
     audit_log_lines: int
     sentiment_ttl_sec: int
+    llm_decisions_enabled: bool   # скилл 'трейдер-LLM' (AI-Trader-стиль)
+
+    # --- Риск-контроль активности ---
+    trade_cooldown_min: int       # пауза между покупками одной бумаги, мин
+    max_buys_per_day: int         # потолок покупок в сутки (по всем тикерам)
 
     # --- Инфраструктура ---
     rate_limit_rpm: int
@@ -206,6 +211,9 @@ def load_config() -> BotConfig:
         audit_interval_sec=_env_int("AUDIT_INTERVAL_SEC", 3600, low=300, high=86400),
         audit_log_lines=_env_int("AUDIT_LOG_LINES", 50, low=10, high=200),
         sentiment_ttl_sec=_env_int("SENTIMENT_TTL_SEC", 21600, low=60, high=86400),
+        llm_decisions_enabled=_env_bool("LLM_DECISIONS", True),
+        trade_cooldown_min=_env_int("TRADE_COOLDOWN_MIN", 120, low=0, high=1440),
+        max_buys_per_day=_env_int("MAX_BUYS_PER_DAY", 4, low=1, high=50),
         rate_limit_rpm=_env_int("RATE_LIMIT_RPM", 90, low=5, high=250),
         news_rss_urls=_env_urls(
             "NEWS_RSS_URLS",
@@ -244,6 +252,10 @@ class StateStore:
         "last_audit_ts": 0,
         "sandbox_confirm_ts": 0,  # время выдачи подтверждения перехода в реал
         "price_history": {},      # ticker -> [[ts, price], ...] для /stats
+        "aggressiveness": 50,     # 0..100 - активность торговли (/set_aggressiveness)
+        "decision_log": [],       # последние решения трейдера (память для LLM)
+        "last_buy_ts": {},        # ticker -> unix-ts последней покупки (кулдаун)
+        "daily_buys": {"date": "", "count": 0},  # покупки за сегодня
     }
 
     def __init__(self, path: str, initial_overrides: Optional[Dict[str, Any]] = None):
@@ -365,3 +377,51 @@ class StateStore:
         cutoff = time.time() - max(0.5, hours) * 3600.0
         raw = self._data.get("price_history", {}).get(ticker, [])
         return [(float(ts), float(p)) for ts, p in raw if float(ts) >= cutoff]
+
+    # --- агрессивность торговли -------------------------------------------------
+    def aggressiveness(self) -> int:
+        """Активность торговли 0 (осторожно) .. 100 (агрессивно)."""
+        try:
+            return int(self._data.get("aggressiveness", 50))
+        except (TypeError, ValueError):
+            return 50
+
+    def set_aggressiveness(self, value: int) -> None:
+        self._data["aggressiveness"] = max(0, min(100, int(value)))
+        self.save()
+
+    # --- журнал решений трейдера (память для LLM) --------------------------------
+    def append_decision(self, decision: Dict[str, Any]) -> None:
+        """Помнит последние 12 решений: {ts, ticker, action, confidence, price, reason}."""
+        log_: List[Dict[str, Any]] = self._data.setdefault("decision_log", [])
+        log_.append(decision)
+        del log_[:-12]
+        self.save()
+
+    def decision_log(self) -> List[Dict[str, Any]]:
+        return list(self._data.get("decision_log", []))
+
+    # --- кулдаун и дневной лимит покупок ------------------------------------------
+    def last_buy_ts(self, ticker: str) -> float:
+        return float(self._data.get("last_buy_ts", {}).get(ticker, 0))
+
+    def set_last_buy_ts(self, ticker: str, ts: float) -> None:
+        self._data.setdefault("last_buy_ts", {})[ticker] = ts
+        self.save()
+
+    def buys_today(self) -> int:
+        """Сколько покупок уже сделано сегодня (сброс в полночь)."""
+        today = time.strftime("%Y-%m-%d")
+        record = self._data.get("daily_buys", {})
+        if record.get("date") != today:
+            return 0
+        return int(record.get("count", 0))
+
+    def record_buy_today(self) -> None:
+        today = time.strftime("%Y-%m-%d")
+        record = self._data.get("daily_buys", {})
+        if record.get("date") != today:
+            self._data["daily_buys"] = {"date": today, "count": 1}
+        else:
+            record["count"] = int(record.get("count", 0)) + 1
+        self.save()

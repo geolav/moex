@@ -19,6 +19,7 @@ ai_analyst.py - ИИ-аналитик на бесплатном Groq API.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from typing import Optional
@@ -63,6 +64,47 @@ _AUDIT_USER_PROMPT = (
 
 _NUM_RE = re.compile(r"-?\d+(?:[.,]\d+)?")
 
+# Промпт "трейдера" (скилл из AI-Trader/TradingAgents): мини-дебаты бык/медведь
+# внутри одного запроса, затем строгий JSON-вердикт. Экономно по токенам.
+_TRADER_SYSTEM_PROMPT = (
+    "Ты - опытный трейдер Мосбиржи. Тебе дают сводку по одной акции: "
+    "технические индикаторы (средние, RSI, MACD, полосы Боллинджера, изменения "
+    "цены, волатильность), свежие новости и твои прошлые решения.\n"
+    "ПОРЯДОК МЫСЛЕЙ (внутренне, не печатай): 1) аргументы 'быка' (за рост); "
+    "2) аргументы 'медведя' (за падение); 3) взвесь их с учётом того, что "
+    "стратегия - возврат к среднему на горизонте нескольких часов-дней.\n"
+    "ПРАВИЛА: при явно плохих новостях не покупай; при перепроданности и "
+    "стабильных новостях - кандидат на покупку; если позицию выгодно закрыть "
+    "до цели - предлагай sell. Не выдумывай чисел, которых нет в сводке.\n"
+    "ОТВЕТ - СТРОГО один JSON-объект без пояснений, формат:\n"
+    '{"action": "buy|sell|hold", "confidence": 0.0..1.0, '
+    '"reason": "одно короткое предложение по-русски, человеческим языком"}'
+)
+
+
+def parse_decision_json(raw_text: str) -> Optional[dict]:
+    """
+    Достаёт JSON-вердикт трейдера из ответа модели.
+
+    Модели иногда оборачивают JSON в текст/``` - берём от первой '{'
+    до последней '}' и парсим. При неудаче ищем действие регуляркой.
+    """
+    text = raw_text or ""
+    start, end = text.find("{"), text.rfind("}")
+    if 0 <= start < end:
+        try:
+            data = json.loads(text[start:end + 1])
+            if isinstance(data, dict):
+                return data
+        except json.JSONDecodeError:
+            pass
+    # Фолбэк: ищем слово-действие в тексте.
+    lowered = text.lower()
+    for action in ("buy", "sell", "hold"):
+        if f'"{action}"' in lowered or f"'{action}'" in lowered:
+            return {"action": action, "confidence": 0.3, "reason": "ответ без JSON"}
+    return None
+
 #: Коды HTTP, при которых имеет смысл повторить запрос (5xx).
 _RETRYABLE_STATUS_MIN = 500
 
@@ -91,8 +133,18 @@ class AIAnalyst:
     # --- жизненный цикл ------------------------------------------------------
     async def start(self) -> None:
         # max_retries=0: ретраи делаем сами (контроль задержек и логов).
+        # GROQ_BASE_URL: если с VPS Groq отвечает 403/блокируется по гео,
+        # укажите адрес реверс-прокси (Deno Deploy/Cloudflare Worker) на api.groq.com.
+        # ВАЖНО: БЕЗ суффикса /openai/v1 - SDK Groq добавляет его сам!
+        #   GROQ_BASE_URL=https://<имя>.deno.dev
+        import os as _os
+
+        base_url = _os.getenv("GROQ_BASE_URL", "").strip().rstrip("/") or None
+        if base_url:
+            log.info("Groq API работает через прокси: %s", base_url)
         self._client = AsyncGroq(
             api_key=self._cfg.groq_api_key,
+            base_url=base_url,
             timeout=self._cfg.http_timeout_sec,
             max_retries=0,
         )
@@ -195,6 +247,40 @@ class AIAnalyst:
             temperature=0.2,
         )
         return raw.strip() or "Все ОК"
+
+    async def analyze_market(self, market_brief: str) -> Optional[dict]:
+        """
+        Скилл 'трейдер': вердикт по сводке рынка -> dict с ключами
+        action ('buy'|'sell'|'hold'), confidence (0..1), reason (str).
+
+        При ошибке API возвращает None (движок переходит на правило-фолбэк).
+        """
+        brief = (market_brief or "").strip()[:6000]  # страховка TPM free-тарифа
+        if not brief:
+            return None
+        try:
+            raw = await self._chat(
+                _TRADER_SYSTEM_PROMPT,
+                brief,
+                max_tokens=220,
+                temperature=0.2,
+            )
+        except AnalystError as exc:
+            log.warning("Трейдер-LLM недоступен (%s) - фолбэк на правила", exc)
+            return None
+        decision = parse_decision_json(raw)
+        if not decision:
+            log.warning("Трейдер-LLM вернул нечитаемый ответ: %.120r", raw)
+            return None
+        action = str(decision.get("action", "hold")).lower().strip()
+        if action not in ("buy", "sell", "hold"):
+            action = "hold"
+        try:
+            confidence = max(0.0, min(1.0, float(decision.get("confidence", 0.5))))
+        except (TypeError, ValueError):
+            confidence = 0.5
+        reason = str(decision.get("reason", ""))[:300]
+        return {"action": action, "confidence": confidence, "reason": reason}
 
 
 def _extract_retry_after(exc: Exception) -> Optional[float]:

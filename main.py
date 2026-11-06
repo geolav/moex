@@ -82,7 +82,7 @@ def setup_logging(config: BotConfig) -> None:
 def _print_banner(config: BotConfig, state: StateStore) -> None:
     mode = "ПЕСОЧНИЦА" if state.use_sandbox else "РЕАЛЬНЫЙ СЧЁТ"
     log.info("=" * 60)
-    log.info("MOEX Trading Bot v1.1.0 стартует")
+    log.info("MOEX Trading Bot v1.2.0 стартует")
     log.info("Режим: %s | торговля: %s | аудитор: %s", mode,
              "вкл" if state.trading_enabled else "выкл",
              "вкл" if state.auditor_enabled else "выкл")
@@ -181,10 +181,10 @@ async def async_main() -> int:
         try:
             mode = "Sandbox" if state.use_sandbox else "РЕАЛЬНЫЙ режим"
             await notify_admin(
-                f"Бот запущен (v1.1.0). Режим: {mode}. "
+                f"Бот запущен (v1.2.0). Режим: {mode}. "
                 f"Тикеры: {', '.join(config.trading_tickers)}. "
                 f"Торговля: {'вкл' if state.trading_enabled else 'выкл'}. "
-                f"Новые команды: /stats (статистика с графиком), /shutdown.")
+                f"Новые: /stats (график), /shutdown, /set_aggressiveness (активность).")
         except Exception as exc:  # noqa: BLE001 - Telegram мог быть недоступен
             log.warning("Приветствие в Telegram не отправлено: %s", exc)
 

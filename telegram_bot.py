@@ -10,6 +10,7 @@ telegram_bot.py - Telegram-интерфейс управления (aiogram 3.x)
   /toggle_sandbox  - переключить песочница <-> реальный счёт
                      (переход в реал требует подтверждения "/toggle_sandbox confirm");
   /toggle_auditor  - включить/выключить ИИ-аудитора логов;
+  /set_aggressiveness N - активность торговли 0-100 (по умолчанию 50);
   /shutdown        - остановить бота (если он запущен как служба systemd -
                      он автоматически поднимется заново);
   /help            - справка + словарик терминов.
@@ -32,7 +33,7 @@ from aiogram.types import BufferedInputFile, Message
 
 log = logging.getLogger("telegram")
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 HELP_TEXT = (
     "Команды:\n"
@@ -43,6 +44,7 @@ HELP_TEXT = (
     "/toggle_trading - вкл/выкл автоматическую торговлю\n"
     "/toggle_sandbox - переключить песочница/реальный счёт\n"
     "/toggle_auditor - вкл/выкл ИИ-аудитора логов\n"
+    "/set_aggressiveness 70 - активность торговли 0-100\n"
     "/shutdown - выключить бота\n"
     "/help - эта справка\n\n"
     "📖 Словарик (чтобы всё было понятно):\n"
@@ -183,7 +185,18 @@ def create_router(ctx: AppContext) -> Router:
         hours = max(1.0, min(STATS_MAX_HOURS, hours))
 
         text, series = await _stats_text(ctx, hours)
-        png = _render_chart(series, hours, dict(ctx.state.positions))
+        # Живая точка: добавляем текущую цену, чтобы график доходил до "сейчас",
+        # а не обрывался на последней закрытой часовой свече.
+        live_series: List[Tuple[str, list]] = []
+        for ticker, hist in series:
+            try:
+                live = await ctx.client.get_price(ticker)
+            except Exception:  # noqa: BLE001 - без живой точки обойдёмся
+                live = None
+            if live and hist:
+                hist = hist + [(time.time(), float(live))]
+            live_series.append((ticker, hist))
+        png = _render_chart(live_series, hours, dict(ctx.state.positions))
         try:
             if png:
                 await message.answer_photo(
@@ -194,6 +207,38 @@ def create_router(ctx: AppContext) -> Router:
         except Exception as exc:  # noqa: BLE001 - картинка не прошла, шлём текст
             log.warning("Не удалось отправить график: %s", exc)
             await message.answer(text)
+
+    # ------------------------------------------------ /set_aggressiveness
+    @router.message(Command("set_aggressiveness"))
+    async def cmd_set_aggressiveness(message: Message,
+                                     command: Optional[CommandObject] = None) -> None:
+        if not is_admin(message):
+            return
+        if not (command and command.args and command.args.strip().isdigit()):
+            await message.answer(
+                "Укажи число от 0 до 100, например: /set_aggressiveness 70\n\n"
+                "Что меняет это число:\n"
+                "• 0-30 - осторожно: покупки редкие, только при очень сильном "
+                "сигнале и высокой уверенности ИИ;\n"
+                "• 40-60 - обычный режим (по умолчанию 50);\n"
+                "• 70-100 - активно: покупки чаще, порог сигнала ниже. "
+                "Стоп-лосс и тейк-профит работают как и раньше.")
+            return
+        value = int(command.args.strip())
+        ctx.state.set_aggressiveness(value)
+        style = ("осторожный" if value <= 30 else
+                 "обычный" if value <= 60 else "активный")
+        frequency = ("реже - только при сильных сигналах" if value <= 30 else
+                     "с обычной частотой" if value <= 60 else "заметно чаще")
+        await message.answer(
+            f"⚙️ Активность торговли: {value}/100 ({style}).\n"
+            f"Покупать буду {frequency}:\n"
+            f"• порог сигнала индикаторов: {0.60 - 0.55 * value / 100:.2f} "
+            f"(чем меньше, тем чаще срабатывает);\n"
+            f"• требуемая уверенность ИИ-трейдера: {0.65 - 0.35 * value / 100:.2f};\n"
+            f"• лимит покупок в сутки: {min(ctx.config.max_buys_per_day, 2 + value // 25)}.\n\n"
+            f"Страховки прежние: стоп-лосс −{ctx.config.stop_loss_pct:.0f}%, "
+            f"тейк-профит +{ctx.config.take_profit_pct:.0f}%.")
 
     # -------------------------------------------------------- /toggle_trading
     @router.message(Command("toggle_trading"))
@@ -304,35 +349,20 @@ def create_router(ctx: AppContext) -> Router:
 # ---------------------------------------------------------------------------
 # Статистика (/stats): текст + график.
 # ---------------------------------------------------------------------------
-async def _stats_text(ctx: AppContext, hours: float) -> Tuple[str, List[Tuple[str, list]]]:
-    """Готовит текст статистики и набор данных для графика.
-
-    Источник данных: бот сам собирает цены каждые 5 минут (state.json).
-    Если своих точек за окно мало (бот недавно запущен), история добирается
-    с биржи по часовым свечам через API.
-    """
+def _stats_text(ctx: AppContext, hours: float) -> Tuple[str, List[Tuple[str, list]]]:
+    """Готовит текст статистики и набор данных для графика."""
     series: List[Tuple[str, list]] = []
     lines: List[str] = []
+    since = datetime.now().strftime("%d.%m %H:%M")
     dt_from = datetime.fromtimestamp(time.time() - hours * 3600)
     lines.append(f"📈 Статистика за {hours:.0f} ч "
-                 f"(с {dt_from.strftime('%d.%m %H:%M')} до "
-                 f"{datetime.now().strftime('%d.%m %H:%M')})")
+                 f"(с {dt_from.strftime('%d.%m %H:%M')} до {since})")
 
     trades_in_window = _count_trades_in_window(ctx, hours)
     have_any = False
 
     for ticker in ctx.config.trading_tickers:
         hist = ctx.state.price_history(ticker, hours)
-        span_h = ((hist[-1][0] - hist[0][0]) / 3600.0) if len(hist) >= 2 else 0.0
-        source = "мои замеры"
-        if span_h < hours * 0.5:  # своими замерами покрыто меньше половины окна
-            # Своей истории мало - добираем ретроспективу с биржи.
-            try:
-                hist = await ctx.client.get_hourly_history(ticker, hours)
-                source = "история биржи (часовые свечи)"
-            except Exception as exc:  # noqa: BLE001
-                log.warning("%s: ретроспектива недоступна (%s)", ticker, exc)
-                hist = []
         if len(hist) < 2:
             continue
         have_any = True
@@ -350,8 +380,7 @@ async def _stats_text(ctx: AppContext, hours: float) -> Tuple[str, List[Tuple[st
             trend = f"почти не изменилась ({change_pct:+.1f}%)"
         block = [
             f"\n{ticker}: сейчас {last:.2f} ₽, за {hours:.0f} ч {trend}.",
-            f"   Диапазон: от {mn:.2f} до {mx:.2f} ₽, средняя {avg:.2f} ₽ "
-            f"(данные: {source}).",
+            f"   Диапазон: от {mn:.2f} до {mx:.2f} ₽, средняя {avg:.2f} ₽.",
         ]
         pos = ctx.state.positions.get(ticker)
         if pos:
@@ -369,16 +398,13 @@ async def _stats_text(ctx: AppContext, hours: float) -> Tuple[str, List[Tuple[st
         series.append((ticker, hist))
 
     if not have_any:
-        return (f"Статистики пока нет ни у меня, ни на бирже за этот период. "
-                f"Попробуйте ещё раз позже.", series)
+        return (f"Статистики пока нет: бот собирает историю цен раз "
+                f"{ctx.config.poll_interval_sec // 60} мин. Загляните через "
+                f"полчаса-час, данных наберётся.", series)
 
     if trades_in_window is not None:
         lines.append(f"\nСделок за период: {trades_in_window}.")
-    lines.append("\nКак я считаю: сам замеряю цены каждые "
-                 f"{ctx.config.poll_interval_sec // 60} мин; если бот запущен "
-                 "недавно, добираю историю с биржи (часовые свечи). Ночью и в "
-                 "выходные рынок закрыт - линии будут ровными, это норма.")
-    lines.append("График цен - картинкой выше "
+    lines.append("\nГрафик цен прикладываю картинкой выше "
                  "(пунктиром - цена вашей покупки, если позиция открыта).")
     return "\n".join(lines), series
 
@@ -419,6 +445,7 @@ def _render_chart(series: List[Tuple[str, list]], hours: float,
         n, 1, figsize=(7.0, max(3.0, 2.2 * n)), constrained_layout=True)
     axes = [axes] if n == 1 else list(axes)
 
+    now_dt = datetime.now()
     for ax, (ticker, hist) in zip(axes, series):
         xs = [datetime.fromtimestamp(ts) for ts, _ in hist]
         ys = [p for _, p in hist]
@@ -427,6 +454,9 @@ def _render_chart(series: List[Tuple[str, list]], hours: float,
         ax.set_ylabel("цена, ₽", fontsize=8)
         ax.grid(alpha=0.3)
         ax.tick_params(labelsize=8)
+        # Ось времени - строго до текущего момента: линия обязана доходить
+        # до "сейчас", а последняя метка времени не должна срезаться.
+        ax.set_xlim(left=xs[0], right=now_dt)
         # Линия цены покупки, если позиция открыта.
         pos = positions.get(ticker)
         if pos:
