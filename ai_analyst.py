@@ -22,7 +22,7 @@ import asyncio
 import json
 import logging
 import re
-from typing import Optional
+from typing import Dict, Optional
 
 from groq import (
     APIConnectionError,
@@ -82,25 +82,40 @@ _ASK_SYSTEM_PROMPT = (
     "(стратегия - возврат к среднему: покупка при откате цены ниже средних, "
     "продажа по стоп-лоссу/тейк-профиту). Тебе дают текущую сводку по счёту, "
     "бумагам и твоим последним решениям, а также вопрос владельца.\n"
-    "ПРАВИЛА: отвечай по-русски, кратко (до 200 слов), человеческим языком, "
+    "ПРАВИЛА: отвечай по-русски, кратко (до 100 слов), человеческим языком, "
     "термины объясняй; опирайся ТОЛЬКО на данные из сводки; не выдумывай "
-    "цифр; если данных не хватает - так и скажи, чего именно не хватает."
+    "цифр; ссылайся на конкретные значения из сводки (порог сигнала, оценка "
+    "score, лимиты, кулдаун) - владелец хочет понять, ПОЧЕМУ сделка прошла "
+    "или не прошла; если данных не хватает - прямо скажи, чего именно "
+    "не хватает. Отвечай сразу финальным текстом, без служебных рассуждений."
 )
 
 _NUM_RE = re.compile(r"-?\d+(?:[.,]\d+)?")
 
-# Промпт "трейдера" (скилл из AI-Trader/TradingAgents): мини-дебаты бык/медведь
-# внутри одного запроса, затем строгий JSON-вердикт. Экономно по токенам.
+# Промпт "трейдера" (скиллы по мотивам AI-Trader/TradingAgents и классических
+# трейдинг-скиллов: теханализ, риск-менеджмент, дисциплина; мини-дебаты
+# бык/медведь внутри одного запроса). Экономно по токенам.
 _TRADER_SYSTEM_PROMPT = (
-    "Ты - опытный трейдер Мосбиржи. Тебе дают сводку по одной акции: "
-    "технические индикаторы (средние, RSI, MACD, полосы Боллинджера, изменения "
-    "цены, волатильность), свежие новости и твои прошлые решения.\n"
-    "ПОРЯДОК МЫСЛЕЙ (внутренне, не печатай): 1) аргументы 'быка' (за рост); "
-    "2) аргументы 'медведя' (за падение); 3) взвесь их с учётом того, что "
-    "стратегия - возврат к среднему на горизонте нескольких часов-дней.\n"
-    "ПРАВИЛА: при явно плохих новостях не покупай; при перепроданности и "
-    "стабильных новостях - кандидат на покупку; если позицию выгодно закрыть "
-    "до цели - предлагай sell. Не выдумывай чисел, которых нет в сводке.\n"
+    "Ты - опытный трейдер Мосбиржи; управляешь торговым ботом со стратегией "
+    "возврата к среднему на горизонте от часа до суток. Тебе дают сводку по "
+    "одной акции: рабочая средняя (SMA) и медленная SMA, RSI, MACD, полосы "
+    "Боллинджера, изменения цены за 1/6/24 ч, волатильность, свежий путь "
+    "цены, новости и твои прошлые решения.\n"
+    "КАК АНАЛИЗИРОВАТЬ (внутренне, не печатай):\n"
+    "1) Тренд: цена выше или ниже SMA; быстрая/медленная SMA показывают "
+    "направление и силу тренда.\n"
+    "2) Импульс: MACD-гистограмма и её изменение; RSI (меньше 30 - перепродан, "
+    "больше 70 - перекуплен).\n"
+    "3) Положение в коридоре: %B Боллинджера (около 0 - у нижней границы, "
+    "кандидат на отскок; около 1 - у верхней границы, не покупать на хаях).\n"
+    "4) Волатильность: при сильном дрожании цены уменьшай уверенность.\n"
+    "5) Новости: явно плохие новости перебивают технические сигналы.\n"
+    "6) Дисциплина: если аргументы противоречивы - держи деньги (hold); "
+    "не выдумывай чисел, которых нет в сводке.\n"
+    "ПОРЯДОК МЫСЛЕЙ (внутренне): аргументы 'быка' (за рост) -> аргументы "
+    "'медведя' (за падение) -> взвесь их с учётом горизонта стратегии. "
+    "Если позиция уже открыта - оцени, стоит ли закрыть её раньше цели "
+    "(sell) или оставить (hold); без позиции - buy или hold.\n"
     "ОТВЕТ - СТРОГО один JSON-объект без пояснений, формат:\n"
     '{"action": "buy|sell|hold", "confidence": 0.0..1.0, '
     '"reason": "одно короткое предложение по-русски, человеческим языком"}'
@@ -186,24 +201,61 @@ class AIAnalyst:
         if self._client is None:
             raise AnalystError("AIAnalyst не запущен (вызовите start())")
 
-        messages = [
+        model = self._cfg.groq_model
+        # gpt-oss сначала "думает" - reasoning-токены расходуют лимит ответа,
+        # и при маленьком max_tokens content приходит ПУСТЫМ (finish_reason
+        # ='length'), а бот показывал заглушку 'Не смог сформулировать ответ'.
+        # Просим низкие рассуждения точечно: llama такой параметр не знает
+        # и вернул бы 400.
+        extra: Dict[str, str] = {}
+        if "gpt-oss" in (model or "").lower():
+            extra["reasoning_effort"] = "low"
+
+        messages: list[Dict[str, str]] = [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ]
         delay = 2.0
-        last_exc: Exception | None = None
+        last_exc: Optional[Exception] = None
+        empty_streak = 0
+        tokens_eff = max_tokens
 
         for attempt in range(1, tries + 1):
             try:
                 response = await self._client.chat.completions.create(
-                    model=self._cfg.groq_model,
+                    model=model,
                     messages=messages,  # type: ignore[arg-type]
                     temperature=temperature,
-                    max_tokens=max_tokens,
+                    max_tokens=tokens_eff,
+                    **extra,
                 )
-                content = response.choices[0].message.content or ""
-                log.debug("Groq ответил за попытку %d: %.120r", attempt, content)
-                return content
+                choice = response.choices[0]
+                content = (choice.message.content or "").strip()
+                if content:
+                    log.debug("Groq ответил за попытку %d: %.120r", attempt, content)
+                    return content
+
+                # Пустой content: весь лимит токенов ушёл на рассуждения.
+                # На следующей попытке даём в 2.5 раза больше токенов и
+                # требуем финальный ответ сразу.
+                empty_streak += 1
+                reasoning = (getattr(choice.message, "reasoning", "") or "").strip()
+                log.warning(
+                    "Groq вернул пустой content (попытка %d/%d, finish_reason=%s, "
+                    "reasoning=%d симв., лимит был %d ток.)",
+                    attempt, tries, getattr(choice, "finish_reason", "?"),
+                    len(reasoning), tokens_eff)
+                if empty_streak >= 2 and reasoning:
+                    # Последний шанс: отдаём цепочку рассуждений - это лучше,
+                    # чем ничего; она по-русски и осмысленная.
+                    return reasoning[:2000]
+                tokens_eff = int(tokens_eff * 2.5) + 100
+                if len(messages) == 2:
+                    messages.append({
+                        "role": "system",
+                        "content": "Финальный ответ обязателен: сразу дай ответ, "
+                                   "без внутренних рассуждений.",
+                    })
 
             except AuthenticationError as exc:
                 # Ключ неверный - повторять бессмысленно.
@@ -236,6 +288,10 @@ class AIAnalyst:
 
             delay *= 2.0  # экспоненциальная задержка: 2, 4, 8 сек
 
+        if last_exc is None:
+            raise AnalystError(
+                f"Модель {model} три раза вернула пустой ответ "
+                f"(лимит последней попытки: {tokens_eff} ток.) - попробуйте позже")
         raise AnalystError(f"Groq не ответил после {tries} попыток: {last_exc}")
 
     # --- публичные задачи -------------------------------------------------------
@@ -247,12 +303,14 @@ class AIAnalyst:
         if not news_text or not news_text.strip():
             return 0.0
         # ~1500 символов хватит с запасом: экономим TPM free-тарифа (6K TPM).
+        # max_tokens 384: gpt-oss тратит часть на рассуждения - раньше лимит
+        # 16 токенов давал пустой ответ, и сентимент молча считался нейтральным.
         snippet = news_text.strip()[:1500]
         try:
             raw = await self._chat(
                 _SENTIMENT_SYSTEM_PROMPT,
                 snippet,
-                max_tokens=16,
+                max_tokens=384,
                 temperature=0.0,
             )
         except AnalystError as exc:
@@ -268,7 +326,7 @@ class AIAnalyst:
         raw = await self._chat(
             _AUDIT_SYSTEM_PROMPT,
             f"{_AUDIT_USER_PROMPT}\n\nЛоги:\n{snippet}",
-            max_tokens=200,
+            max_tokens=350,
             temperature=0.2,
         )
         return raw.strip() or "Все ОК"
@@ -287,7 +345,7 @@ class AIAnalyst:
             raw = await self._chat(
                 _TRADER_SYSTEM_PROMPT,
                 brief,
-                max_tokens=220,
+                max_tokens=512,
                 temperature=0.2,
             )
         except AnalystError as exc:
@@ -307,6 +365,7 @@ class AIAnalyst:
         reason = str(decision.get("reason", ""))[:300]
         return {"action": action, "confidence": confidence, "reason": reason}
 
+
     async def answer_question(self, question: str, context: str) -> str:
         """
         Ответ на вопрос владельца (/ask): сводка по счёту/бумагам + вопрос.
@@ -322,7 +381,7 @@ class AIAnalyst:
         raw = await self._chat(
             _ASK_SYSTEM_PROMPT,
             f"Сводка:\n{ctx_text}\n\nВопрос владельца: {q}",
-            max_tokens=400,
+            max_tokens=800,
             temperature=0.4,
         )
         return raw.strip() or "Не смог сформулировать ответ - попробуй переформулировать вопрос."

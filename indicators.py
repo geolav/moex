@@ -149,20 +149,53 @@ def volatility_pct(closes: Sequence[float], period: int = 24) -> Optional[float]
 # ---------------------------------------------------------------------------
 # Сводка для LLM и свёртка в оценку.
 # ---------------------------------------------------------------------------
-def summarize(closes: Sequence[float], price: float) -> Dict[str, Optional[float]]:
-    """Все индикаторы одним словарём; при нехватке данных поле = None."""
+def summarize_generic(closes: Sequence[float], price: float,
+                      fast_n: int, step_h: float) -> Dict[str, Optional[float]]:
+    """
+    Все индикаторы одним словарём для ЛЮБОГО таймфрейма свечей.
+
+    fast_n - период рабочей средней В СВЕЧАХ (быстрая средняя стратегии);
+    slow_n - вдвое длиннее (медленная средняя);
+    step_h - длительность одной свечи в часах (1.0 - часовые,
+    0.25 - 15-минутные, 1/12 - 5-минутные).
+
+    Классические осцилляторы (RSI, MACD, Боллинджер) считаются по свечам
+    как обычно: на внутридневных свечах они автоматически становятся
+    внутридневными, на часовых ведут себя по-старому.
+    Изменения цены за 1/6/24 ч пересчитываются из шага свечей.
+    """
+    slow_n = max(fast_n * 2, fast_n + 2)
+    per_hour = max(1, round(1.0 / step_h)) if step_h > 0 else 1
+    vol_candle = volatility_pct(closes, max(6, fast_n))
+    # Волатильность в %/час: на внутридневных свечах пересчитываем из
+    # дрожания за свечу (std умножается на корень из числа свечей в часе).
+    vol_hour = (vol_candle * math.sqrt(per_hour)) if (vol_candle is not None and
+                                                      step_h < 1.0) else vol_candle
     return {
-        "sma24": sma(closes, 24),
-        "sma48": sma(closes, 48),
+        "fast_n": fast_n,
+        "slow_n": slow_n,
+        "step_h": step_h,
+        "fast_hours": round(fast_n * step_h, 4),
+        "per_hour": per_hour,
+        "sma_fast": sma(closes, fast_n),
+        "sma_slow": sma(closes, slow_n),
         "rsi14": rsi(closes, 14),
         "macd": macd(closes),
         "bollinger": bollinger(closes),
-        "chg_1h": change_pct(closes, 1),
-        "chg_6h": change_pct(closes, 6),
-        "chg_24h": change_pct(closes, 24),
-        "volatility": volatility_pct(closes, 24),
+        "chg_1h": change_pct(closes, per_hour),
+        "chg_6h": change_pct(closes, per_hour * 6),
+        "chg_24h": change_pct(closes, per_hour * 24),
+        "volatility": vol_hour,
         "price": price,
     }
+
+
+def summarize(closes: Sequence[float], price: float) -> Dict[str, Optional[float]]:
+    """Часовая версия summarize_generic (совместимость со старым кодом)."""
+    data = summarize_generic(closes, price, fast_n=24, step_h=1.0)
+    data["sma24"] = data["sma_fast"]
+    data["sma48"] = data["sma_slow"]
+    return data
 
 
 def build_score(summary: Dict[str, Optional[float]]) -> float:
@@ -172,14 +205,28 @@ def build_score(summary: Dict[str, Optional[float]]) -> float:
     Стратегия - возврат к среднему (как в исходной SMA-стратегии, но умнее):
     падение ниже средних/полос при затухающем импульсе вниз = шанс на отскок.
     Веса подобраны так, чтобы одиночный индикатор не давал сильный сигнал.
+
+    Насколько глубоко цена ушла под среднюю, измеряется В ДОЛЯХ ОКНА: на
+    часовом окне 24 ч отклонение 1% - слабое, на часовом окне 1 ч - сильное.
+    Поэтому множитель растёт по мере укорочения окна (sqrt(24 / fast_hours)),
+    так что активный режим реагирует на локальные откаты, а спокойный -
+    только на заметные отклонения от среднесуточной.
     """
     score = 0.0
 
-    sma24 = summary.get("sma24")
+    sma_fast = summary.get("sma_fast", summary.get("sma24"))
     price = summary.get("price") or 0.0
-    if sma24 and price:
-        # Насколько цена ниже средней за сутки (до -5%..+5% -> +/-0.35).
-        score += max(-0.35, min(0.35, (sma24 / price - 1.0) * 7.0))
+    if sma_fast and price:
+        fast_hours = float(summary.get("fast_hours") or 24.0) or 24.0
+        scale = min(40.0, 7.0 * math.sqrt(24.0 / max(fast_hours, 0.5)))
+        # Насколько цена ниже рабочей средней (до -5%..+5% -> +/-0.35).
+        score += max(-0.35, min(0.35, (sma_fast / price - 1.0) * scale))
+
+    sma_slow = summary.get("sma_slow", summary.get("sma48"))
+    if sma_slow and price:
+        # Медленная средняя - подстраховка: покупаем только если цена ниже
+        # и долгого окна (устойчивое отклонение, а не случайный прокол).
+        score += max(-0.20, min(0.20, (sma_slow / price - 1.0) * 4.0))
 
     rsi14 = summary.get("rsi14")
     if rsi14 is not None:
@@ -220,12 +267,14 @@ def build_score(summary: Dict[str, Optional[float]]) -> float:
 def describe_for_human(summary: Dict[str, Optional[float]]) -> str:
     """Индикаторы человеческими словами (для Telegram-сообщений)."""
     parts: List[str] = []
-    sma24 = summary.get("sma24")
+    sma_fast = summary.get("sma_fast", summary.get("sma24"))
     price = summary.get("price") or 0.0
-    if sma24 and price:
-        diff = (price / sma24 - 1.0) * 100.0
+    if sma_fast and price:
+        diff = (price / sma_fast - 1.0) * 100.0
         where = "ниже" if diff < 0 else "выше"
-        parts.append(f"цена {where} средней за сутки на {abs(diff):.1f}%")
+        fast_hours = float(summary.get("fast_hours") or 24.0)
+        window = f"{fast_hours:g} ч" if fast_hours < 48 else "сутки"
+        parts.append(f"цена {where} средней за {window} на {abs(diff):.1f}%")
     rsi14 = summary.get("rsi14")
     if rsi14 is not None:
         if rsi14 <= 30:

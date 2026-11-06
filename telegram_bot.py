@@ -10,6 +10,9 @@ telegram_bot.py - Telegram-интерфейс управления (aiogram 3.x)
   /toggle_sandbox  - переключить песочница <-> реальный счёт
                      (переход в реал требует подтверждения "/toggle_sandbox confirm");
   /toggle_auditor  - включить/выключить ИИ-аудитора логов;
+  /audit [строк]   - запустить ИИ-проверку логов прямо сейчас;
+  /ask вопрос      - задать короткий вопрос ИИ-трейдеру (почему купил /
+                     не купил и т.п.);
   /set_aggressiveness N - активность торговли 0-100 (по умолчанию 50);
   /shutdown        - остановить бота (если он запущен как служба systemd -
                      он автоматически поднимется заново);
@@ -33,7 +36,7 @@ from aiogram.types import BufferedInputFile, Message
 
 log = logging.getLogger("telegram")
 
-VERSION = "1.3.2"
+VERSION = "1.4.0"
 
 HELP_TEXT = (
     "Команды:\n"
@@ -45,17 +48,26 @@ HELP_TEXT = (
     "/toggle_sandbox - переключить песочница/реальный счёт\n"
     "/toggle_auditor - вкл/выкл ИИ-аудитора логов\n"
     "/audit - ИИ-проверка логов прямо сейчас\n"
-    "/ask почему не покупаешь GAZP? - вопрос ИИ-трейдеру\n"
     "/audit 150 - то же, но по последним 150 строкам (10-200)\n"
-    "/set_aggressiveness 70 - активность торговли 0-100\n"
+    "/ask почему не покупаешь GAZP? - вопрос ИИ-трейдеру\n"
+    "/set_aggressiveness 70 - решительность торговли 0-100\n"
+    "/set_activity 80 - режим активности 0-100: какие движения цены следить\n"
     "/set_invested 30 - максимум % ВСЕХ денег в акциях (5-100)\n"
     "/shutdown - выключить бота\n"
     "/help - эта справка\n\n"
     "📖 Словарик (чтобы всё было понятно):\n"
     "• Лот - акции продаются не по одной, а пачками. Например, "
     "1 лот Сбера = 10 акций. «Купил 3 лота» = 30 акций.\n"
-    "• SMA-24 - средняя цена за последние 24 часа. Стратегия бота: "
-    "покупать, когда цена НИЖЕ этой средней (бумага подешевела).\n"
+    "• Рабочая средняя (SMA) - средняя цена за период, который выбрал бот "
+    "через /set_activity (от 1 часа до суток). Стратегия: покупать, когда "
+    "цена НИЖЕ этой средней (бумага подешевела), продавать - когда "
+    "выросла до цели.\n"
+    "• Активность (/set_activity) - масштаб времени стратегии: при высоких "
+    "значениях бот смотрит короткие внутридневные движения (свечи 5-15 мин, "
+    "средняя за 1-6 ч) и торгует заметно чаще; при низких - суточные "
+    "изменения на часовых свечах.\n"
+    "• Агрессивность (/set_aggressiveness) - решительность: насколько "
+    "сильный сигнал нужен для покупки.\n"
     "• Сентимент - «настроение» новостей, оценка от −1 (плохие новости) "
     "до +1 (хорошие). Бот покупает, только если новостей нет плохих.\n"
     "• Стоп-лосс - автоматическая продажа, если цена упала слишком низко, "
@@ -109,7 +121,8 @@ def create_router(ctx: AppContext) -> Router:
         trading = ("включена - бот сам покупает и продаёт"
                    if ctx.state.trading_enabled
                    else "выключена - бот только наблюдает и сообщает")
-        auditor = ("включён - раз в час проверяет свою работу по логам"
+        auditor = ("включён - раз в час проверяет свою работу по логам "
+                   "(или по команде /audit)"
                    if ctx.state.auditor_enabled else "выключен")
         balance_line = await _balance_line(ctx)
         uptime = _uptime(ctx.started_monotonic)
@@ -133,6 +146,7 @@ def create_router(ctx: AppContext) -> Router:
 
         balance_line = await _balance_line(ctx)
         parts.append(balance_line)
+
         # Текущая вложенность: сколько % всех денег сейчас в акциях
         # (считается по факту счёта ниже, в блоке сверки с брокером).
         invested_share: Optional[float] = None
@@ -186,6 +200,10 @@ def create_router(ctx: AppContext) -> Router:
                     f"(уверенность {d.get('confidence')}) — {d.get('reason')}")
 
         settings = (f"\n⚙️ Настройки: агрессивность {ctx.state.aggressiveness()}/100, "
+                    f"активность {ctx.state.activity()}/100 "
+                    f"(рабочая средняя ~{ctx.engine.activity_info()['sma_hours']:g} ч, "
+                    f"свечи {ctx.engine.activity_info()['step_min']} мин - "
+                    f"меняется командой /set_activity), "
                     f"максимум в акциях: {ctx.state.max_invested_pct()}% всех денег "
                     f"(меняется командой /set_invested)")
         if invested_share is not None:
@@ -193,6 +211,7 @@ def create_router(ctx: AppContext) -> Router:
         settings += f".\nНа одну сделку: не больше " \
                     f"{ctx.config.max_position_pct:.0f}% свободных средств."
         parts.append(settings)
+
         parts.append(f"\nДвижок: {ctx.engine.describe()}")
         audit = ctx.state.last_audit_result
         if audit:
@@ -255,18 +274,64 @@ def create_router(ctx: AppContext) -> Router:
             return
         value = int(command.args.strip())
         ctx.state.set_aggressiveness(value)
+        info = ctx.engine.activity_info()
         style = ("осторожный" if value <= 30 else
                  "обычный" if value <= 60 else "активный")
         frequency = ("реже - только при сильных сигналах" if value <= 30 else
                      "с обычной частотой" if value <= 60 else "заметно чаще")
         await message.answer(
-            f"⚙️ Активность торговли: {value}/100 ({style}).\n"
+            f"⚙️ Решительность торговли: {value}/100 ({style}).\n"
             f"Покупать буду {frequency}:\n"
-            f"• порог сигнала индикаторов: {0.60 - 0.55 * value / 100:.2f} "
+            f"• порог сигнала индикаторов: {info['score_threshold']:.2f} "
             f"(чем меньше, тем чаще срабатывает);\n"
-            f"• требуемая уверенность ИИ-трейдера: {0.65 - 0.35 * value / 100:.2f};\n"
-            f"• лимит покупок в сутки: {min(ctx.config.max_buys_per_day, 2 + value // 5)}.\n\n"
+            f"• требуемая уверенность ИИ-трейдера: {info['required_confidence']:.2f};\n"
+            f"• лимит покупок в сутки: {info['max_buys']}.\n\n"
             f"Страховки прежние: стоп-лосс −{ctx.config.stop_loss_pct:.0f}%, "
+            f"тейк-профит +{ctx.config.take_profit_pct:.0f}%.\n"
+            f"Масштаб времени (какие движения отслеживать) - отдельная "
+            f"настройка: /set_activity.")
+
+    # ------------------------------------------------ /set_activity
+    @router.message(Command("set_activity"))
+    async def cmd_set_activity(message: Message,
+                               command: Optional[CommandObject] = None) -> None:
+        """Масштаб времени стратегии: какие движения цены отслеживает бот."""
+        if not is_admin(message):
+            return
+        if not (command and command.args and command.args.strip().isdigit()):
+            await message.answer(
+                "Укажи число от 0 до 100, например: /set_activity 80\n\n"
+                "Это НЕ решительность (она - /set_aggressiveness). Активность "
+                "задаёт, за какие движения цены следит стратегия:\n"
+                "• 0-30 - спокойно: средняя за ~24 ч, часовые свечи, сделки "
+                "редкие (прошлый режим);\n"
+                "• 40-60 - обычный (по умолчанию 50): средняя за ~5 ч, свечи "
+                "15 мин;\n"
+                "• 70-100 - активный: средняя за 1-2 ч, свечи 5 мин - бот "
+                "замечает локальные откаты и торгует заметно чаще. ИИ-трейдер "
+                "при этом анализирует короткий свежий отрезок графика и чаще "
+                "пересматривает открытые позиции (вплоть до досрочной продажи).")
+            return
+        value = int(command.args.strip())
+        ctx.state.set_activity(value)
+        info = ctx.engine.activity_info()
+        style = ("спокойный" if value <= 30 else
+                 "обычный" if value <= 60 else "активный")
+        await message.answer(
+            f"✅ Режим активности: {value}/100 ({style}).\n\n"
+            f"Теперь стратегия работает так:\n"
+            f"• рабочая средняя: ~{info['sma_hours']:g} ч "
+            f"(свечи {info['step_min']} мин);\n"
+            f"• ИИ-трейдер анализирует последние ~{info['ai_window_hours']:g} ч "
+            f"графика;\n"
+            f"• пересмотр позиций и вердиктов: каждые "
+            f"{ctx.engine._llm_ttl_sec() / 60:.0f} мин;\n"
+            f"• кулдаун между покупками одной бумаги: ~{info['cooldown_min']} мин;\n"
+            f"• лимит покупок в сутки: {info['max_buys']};\n"
+            f"• порог сигнала: {info['score_threshold']:.2f}.\n\n"
+            f"Решительность (пороги сигнала/уверенности) осталась прежней - "
+            f"она меняется командой /set_aggressiveness. Страховки прежние: "
+            f"стоп-лосс −{ctx.config.stop_loss_pct:.0f}%, "
             f"тейк-профит +{ctx.config.take_profit_pct:.0f}%.")
 
     # ------------------------------------------------ /set_invested
@@ -494,8 +559,8 @@ async def _stats_text(ctx: AppContext, hours: float) -> Tuple[str, List[Tuple[st
             exch = []
         if exch:
             # Свечи, рядом с которыми есть своя точка (±30 мин), убираю:
-            # своя точка замеряется чаще и точнее. Свечи между ними -
-            # остаются: они и достраивают историю до полного окна.
+            # своя точка замеряется чаще и точнее. Свечи между ними - остаются:
+            # они и достраивают историю до полного окна.
             own = sorted(hist)
             extra = [(ts, p) for ts, p in exch
                      if all(abs(ts - ots) > 1800 for ots, _ in own)]

@@ -252,8 +252,9 @@ class StateStore:
         "last_audit_ts": 0,
         "sandbox_confirm_ts": 0,  # время выдачи подтверждения перехода в реал
         "price_history": {},      # ticker -> [[ts, price], ...] для /stats
-        "aggressiveness": 50,     # 0..100 - активность торговли (/set_aggressiveness)
-        "max_invested_pct": 30,  # потолок доли ВСЕХ денег в акциях (/set_invested)
+        "aggressiveness": 50,     # 0..100 - решительность торговли (/set_aggressiveness)
+        "activity": 50,           # 0..100 - масштаб времени стратегии (/set_activity)
+        "max_invested_pct": 30,   # потолок доли ВСЕХ денег в акциях (/set_invested)
         "decision_log": [],       # последние решения трейдера (память для LLM)
         "last_buy_ts": {},        # ticker -> unix-ts последней покупки (кулдаун)
         "daily_buys": {"date": "", "count": 0},  # покупки за сегодня
@@ -389,6 +390,23 @@ class StateStore:
 
     def set_aggressiveness(self, value: int) -> None:
         self._data["aggressiveness"] = max(0, min(100, int(value)))
+        self.save()
+
+    # --- активность стратегии (масштаб времени) -----------------------------------
+    def activity(self) -> int:
+        """Масштаб времени стратегии 0 (сутки) .. 100 (часовые движения).
+
+        НЕ то же самое, что агрессивность (пороги/уверенность): активность
+        задаёт, за какой период считается рабочая средняя, на каких свечах
+        работает движок и какой отрезок графика видит ИИ-трейдер.
+        """
+        try:
+            return int(self._data.get("activity", 50))
+        except (TypeError, ValueError):
+            return 50
+
+    def set_activity(self, value: int) -> None:
+        self._data["activity"] = max(0, min(100, int(value)))
         self.save()
 
     # --- потолок общей вложенности ------------------------------------------------

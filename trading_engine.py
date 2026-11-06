@@ -1,42 +1,51 @@
 """
 trading_engine.py - торговая логика бота v2: гибрид "индикаторы + LLM-трейдер".
 
-Скиллы (по мотивам AI-Trader/HKUDS и TradingAgents):
-  1. ТЕХНИЧЕСКИЙ АНАЛИТИК (код, без LLM): SMA-24/48, RSI-14, MACD,
-     полосы Боллинджера, изменения за 1/6/24 ч, волатильность.
+Скиллы (по мотивам AI-Trader/HKUDS, TradingAgents и классических трейдинг-
+скиллов: теханализ, риск-менеджмент, дисциплина):
+  1. ТЕХНИЧЕСКИЙ АНАЛИТИК (код, без LLM): быстрая/медленная SMA, RSI-14,
+     MACD, полосы Боллинджера, изменения за 1/6/24 ч, волатильность.
      Свёртка в оценку сигнала score от -1 до +1 (indicators.build_score).
-  2. ТРЕЙДЕР-LLM (Groq): получает сводку (индикаторы + новости + память
-     прошлых решений), внутри делает мини-дебаты "бык vs медведь" и
-     возвращает JSON {action: buy|sell|hold, confidence, reason}.
+  2. ТРЕЙДЕР-LLM (Groq): получает сводку (индикаторы + свежий ПУТЬ ЦЕНЫ в
+     масштабе активности + новости + память прошлых решений), внутри делает
+     мини-дебаты "бык vs медведь" и возвращает JSON
+     {action: buy|sell|hold, confidence, reason}.
   3. ПАМЯТЬ: последние 12 решений хранятся в state.json и включаются
      в следующий промпт ("что я решал и чем это кончилось").
   4. РИСК-КОНТРОЛЬ (код, LLM его обойти не может):
      - жёсткие стоп-лосс (-3%) и тейк-профит (+5%) у каждой позиции;
      - кулдаун между покупками одной бумаги (TRADE_COOLDOWN_MIN, при
-       высокой агрессивности сокращается);
-     - дневной лимит покупок (MAX_BUYS_PER_DAY, растёт с агрессивностью);
-     - порог сигнала и требуемая уверенность LLM зависят от уровня
-       агрессивности (/set_aggressiveness 0..100 из Telegram).
+       высокой агрессивности/активности сокращается);
+     - дневной лимит покупок (MAX_BUYS_PER_DAY - потолок);
+     - порог сигнала и требуемая уверенность LLM зависят от уровней
+       агрессивности (/set_aggressiveness) и активности (/set_activity).
 
-АГРЕССИВНОСТЬ (aggr 0..100) управляет сразу:
-  score_threshold = 0.60  - 0.55 * aggr/100   (при 100 - почти любой плюс)
-  llm_confidence  = 0.65  - 0.35 * aggr/100
-  sentiment_shift = (aggr - 50)/100 * 0.4     (ослабление новостного фильтра)
-  cooldown_factor = 1.5 - aggr/100            (0.5x..1.5x к TRADE_COOLDOWN_MIN)
+АГРЕССИВНОСТЬ (aggr 0..100) - РЕШИТЕЛЬНОСТЬ (сколько надо доказательств):
+  score_threshold = 0.60 - 0.55 * aggr/100 - 0.05 * act/100
+  llm_confidence  = 0.65 - 0.35 * aggr/100 - 0.05 * act/100
+  sentiment_shift = (aggr - 50)/100 * 0.4 (ослабление новостного фильтра)
+
+АКТИВНОСТЬ (act 0..100) - МАСШТАБ ВРЕМЕНИ (какие движения отслеживаем):
+  sma_hours = 24 ** (1 - act/100)   # 24 ч при 0 ... 1 ч при 100
+  свечи: окно >=10 ч - часовые; 3..10 ч - 15-минутные; <3 ч - 5-минутные;
+  ИИ смотрит путь цены за последние ~4 окна средней (в активном режиме -
+  локальный отрезок, в спокойном - трёхсуточный);
+  кэш вердиктов LLM: 30 мин (act=0) ... 10 мин (act=100) - в активном
+  режиме ИИ пересматривает рынок и позиции чаще;
+  cooldown_factor *= (1 - 0.6 * act/100), дневной лимит + act/10.
 
 Фолбэк: если LLM недоступен, работает старая стратегия
-(цена < SMA-24 И сентимент > порога).
+(цена < рабочей средней И сентимент > порога).
 
 КРИТИЧНО ДЛЯ VPS 1 ГБ ОЗУ: тикеры обрабатываются СТРОГО последовательно
-(for-цикл), asyncio.gather() не используется. LLM-решение кэшируется на
-30 минут - не больше одного Groq-запроса на тикер за полчаса.
+(for-цикл), asyncio.gather() не используется.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 import time
-from typing import Any, Awaitable, Callable, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 import indicators
 
@@ -44,8 +53,10 @@ log = logging.getLogger("engine")
 
 Notifier = Callable[[str], Awaitable[None]]
 
-#: Кэш LLM-вердиктов: ticker -> (monotonic-ts, decision). Экономит лимиты Groq.
+#: Базовый кэш LLM-вердиктов (при активности сокращается, см. _llm_ttl_sec).
 _LLM_CACHE_TTL_SEC = 30 * 60
+#: Как часто можно сообщать админу о пропущенной покупке (один тикер).
+_SKIP_NOTIFY_TTL_SEC = 30 * 60
 
 
 def _fmt_rub(value: float) -> str:
@@ -78,6 +89,8 @@ class TradingEngine:
         self._llm_cache: Dict[str, tuple[float, Optional[dict]]] = {}
         # Последние заголовки новостей (для промпта трейдера).
         self._news_cache: Dict[str, list] = {}
+        # Когда последний раз сообщали о пропущенной покупке (анти-спам).
+        self._skip_notify_ts: Dict[str, float] = {}
         self._cycles_done = 0
 
     # -------------------------------------------------------------- жизненный цикл
@@ -86,10 +99,13 @@ class TradingEngine:
 
     async def run(self) -> None:
         """Вечный цикл: один проход по всем тикерам, пауза, повтор."""
+        info = self.activity_info()
         log.info("Торговый движок v2 запущен: тикеры %s, период %d сек, "
-                 "стратегия: индикаторы + LLM-трейдер, агрессивность %d",
+                 "стратегия: индикаторы + LLM-трейдер, агрессивность %d, "
+                 "активность %d (средняя ~%.4g ч, свечи %d мин)",
                  ",".join(self._cfg.trading_tickers),
-                 self._cfg.poll_interval_sec, self._state.aggressiveness())
+                 self._cfg.poll_interval_sec, self._state.aggressiveness(),
+                 info["activity"], info["sma_hours"], info["step_min"])
         while not self._stop_event.is_set():
             try:
                 await self.cycle()
@@ -144,29 +160,99 @@ class TradingEngine:
         await self._evaluate_entry(ticker, price)
 
     # ------------------------------------------------------------------ пороги
+    def _activity(self) -> int:
+        return self._state.activity()
+
     def _score_threshold(self) -> float:
-        return round(0.60 - 0.55 * (self._state.aggressiveness() / 100.0), 3)
+        aggr = self._state.aggressiveness()
+        act = self._activity()
+        return max(0.05, round(0.60 - 0.55 * (aggr / 100.0) - 0.05 * (act / 100.0), 3))
 
     def _required_confidence(self) -> float:
-        return round(0.65 - 0.35 * (self._state.aggressiveness() / 100.0), 3)
+        aggr = self._state.aggressiveness()
+        act = self._activity()
+        return max(0.30, round(0.65 - 0.35 * (aggr / 100.0) - 0.05 * (act / 100.0), 3))
+
+    def _sell_confidence(self) -> float:
+        """Уверенность LLM, необходимая для досрочной продажи позиции."""
+        aggr = self._state.aggressiveness()
+        act = self._activity()
+        return max(0.35, round(0.60 - 0.15 * (aggr / 100.0) - 0.10 * (act / 100.0), 3))
 
     def _sentiment_limit(self) -> float:
         base = self._cfg.sentiment_threshold
         return round(base + (self._state.aggressiveness() - 50) / 100.0 * 0.4, 2)
 
     def _cooldown_sec(self) -> float:
-        # При высокой агрессивности кулдаун сокращается сильнее (до 0.25x).
-        factor = max(0.25, 1.5 - 1.25 * self._state.aggressiveness() / 100.0)
+        # При высокой агрессивности кулдаун сокращается (до 0.25x),
+        # при высокой активности - ещё вдвое-втрое (итог до ~0.1x).
+        factor = (max(0.25, 1.5 - 1.25 * self._state.aggressiveness() / 100.0)
+                  * max(0.40, 1.0 - 0.6 * self._activity() / 100.0))
         return self._cfg.trade_cooldown_min * 60.0 * factor
 
     def _max_buys_today(self) -> int:
-        # 2..22 в зависимости от агрессивности, но не больше env-потолка.
+        # 2..~32 в зависимости от агрессивности и активности, но не больше env-потолка.
         return min(self._cfg.max_buys_per_day,
-                   2 + self._state.aggressiveness() // 5)
+                   2 + self._state.aggressiveness() // 5 + self._activity() // 10)
+
+    def _llm_ttl_sec(self) -> float:
+        # Кэш вердикта трейдера: 30 мин в спокойном режиме, 10 мин в активном -
+        # ИИ пересматривает рынок и открытые позиции по свежим данным.
+        return max(600.0, _LLM_CACHE_TTL_SEC - self._activity() * 12.0)
 
     def _cooldown_active(self, ticker: str) -> bool:
         elapsed = time.time() - self._state.last_buy_ts(ticker)
         return elapsed < self._cooldown_sec()
+
+    # --------------------------------------------- активность: масштаб времени
+    def _sma_hours(self) -> float:
+        """Рабочее окно средней: 24 ч при act=0 ... 1 ч при act=100."""
+        return max(1.0, 24.0 ** (1.0 - self._activity() / 100.0))
+
+    def _candle_step_h(self, sma_hours: float) -> float:
+        """Длительность рабочей свечи (в часах) под текущее окно средней."""
+        if sma_hours >= 10.0:
+            return 1.0             # часовые свечи
+        if sma_hours >= 3.0:
+            return 0.25            # 15-минутные свечи
+        return 1.0 / 12.0          # 5-минутные свечи
+
+    def _fast_n(self, sma_hours: float, step_h: float) -> int:
+        """Период рабочей средней в свечах."""
+        return max(6, int(round(sma_hours / step_h)))
+
+    def _min_candles(self, fast_n: int) -> int:
+        """Минимум свечей для всех индикаторов: медленная SMA = 2*fast_n,
+        MACD требует 26+9 свечей, RSI - 15, плюс небольшой запас."""
+        return max(fast_n * 2, 35) + 3
+
+    def _fetch_hours(self, fast_n: int, step_h: float) -> float:
+        """Сколько часов истории просить у биржи: запас на ночные паузы и
+        выходные (торги идут ~14 ч в сутки), но не больше трёх суток."""
+        need = self._min_candles(fast_n) + 8
+        return min(72.0, max(6.0, need * step_h * 2.5 + 3.0))
+
+    def _ai_window_hours(self, sma_hours: float) -> float:
+        """Отрезок графика, который видит ИИ-трейдер: в активном режиме -
+        короткий локальный, в спокойном - трёхсуточный."""
+        return max(1.5, sma_hours * 4.0)
+
+    def activity_info(self) -> Dict[str, Any]:
+        """Текущие следствия активности - для /set_activity, /status и /ask."""
+        sma_h = self._sma_hours()
+        step_h = self._candle_step_h(sma_h)
+        fast_n = self._fast_n(sma_h, step_h)
+        return {
+            "activity": self._activity(),
+            "sma_hours": round(sma_h, 1),
+            "fast_n": fast_n,
+            "step_min": max(1, round(step_h * 60)),
+            "ai_window_hours": round(self._ai_window_hours(sma_h), 1),
+            "cooldown_min": int(round(self._cooldown_sec() / 60.0)),
+            "max_buys": self._max_buys_today(),
+            "score_threshold": self._score_threshold(),
+            "required_confidence": self._required_confidence(),
+        }
 
     # ------------------------------------------------------------------- вход
     async def _evaluate_entry(self, ticker: str, price: float) -> None:
@@ -181,23 +267,32 @@ class TradingEngine:
             return
 
         # Шаг 1. Скилл "технический аналитик": история цен -> индикаторы -> score.
+        # Рабочий таймфрейм зависит от АКТИВНОСТИ: спокойный режим смотрит
+        # сутки на часовых свечах, активный - последний час на 5-минутных.
+        sma_h = self._sma_hours()
+        step_h = self._candle_step_h(sma_h)
+        fast_n = self._fast_n(sma_h, step_h)
         try:
-            history = await self._client.get_hourly_history(ticker, 72)
+            history = await self._client.get_candles_history(
+                ticker, self._fetch_hours(fast_n, step_h), step_h)
         except Exception as exc:  # noqa: BLE001
             log.warning("%s: история свечей недоступна (%s)", ticker, exc)
             history = []
         closes = [p for _, p in history]
-        if len(closes) < 30:
-            log.info("%s: мало часовых свечей (%d) - обычный SMA-фолбэк",
-                     ticker, len(closes))
-            await self._entry_fallback_sma(ticker, price)
+        if len(closes) < self._min_candles(fast_n):
+            log.info("%s: мало рабочих свечей (%d из %d по %.0f мин) - "
+                     "обычный SMA-фолбэк", ticker, len(closes),
+                     self._min_candles(fast_n), step_h * 60)
+            await self._entry_fallback_sma(ticker, price, closes, fast_n)
             return
 
-        summary = indicators.summarize(closes, price)
+        summary = indicators.summarize_generic(closes, price, fast_n, step_h)
         score = indicators.build_score(summary)
         needed = self._score_threshold()
-        log.info("%s: score %.2f (порог %.2f, агрессивность %d) RSI %.0f",
+        log.info("%s: score %.2f (порог %.2f, агрессивность %d, активность %d, "
+                 "SMA-%.4g ч, свечи %.0f мин) RSI %.0f",
                  ticker, score, needed, self._state.aggressiveness(),
+                 self._activity(), sma_h, step_h * 60,
                  summary.get("rsi14") or 0.0)
         if score < needed:
             return
@@ -212,14 +307,19 @@ class TradingEngine:
                 "action": "skip", "confidence": score,
                 "price": round(price, 2), "reason": "плохие новости",
             })
+            await self._notify_skip(
+                ticker, score,
+                f"сигнал был ({score:+.2f}), но новости плохие "
+                f"(сентимент {sentiment:+.2f} при допуске "
+                f"{self._sentiment_limit():+.2f}).")
             return
 
         decision = await self._get_llm_decision(ticker, price, summary, score,
-                                                sentiment)
+                                                sentiment, history)
         if decision is None:
             # LLM недоступен -> старое правило (цена ниже средней + не-плохие
             # новости), чтобы бот не вставал полностью.
-            await self._entry_fallback_sma(ticker, price)
+            await self._entry_fallback_sma(ticker, price, closes, fast_n)
             return
 
         self._state.append_decision({
@@ -232,25 +332,46 @@ class TradingEngine:
             log.info("%s: трейдер-LLM сказал '%s' (%.2f): %s",
                      ticker, decision["action"], decision["confidence"],
                      decision["reason"])
+            await self._notify_skip(
+                ticker, score,
+                f"сигнал был ({score:+.2f}), но ИИ-трейдер выбрал "
+                f"«{decision['action']}» (уверенность "
+                f"{decision['confidence']:.0%}): {decision['reason']}")
             return
         if decision["confidence"] < self._required_confidence():
             log.info("%s: LLM 'buy' с уверенностью %.2f < требуемой %.2f - пропуск",
                      ticker, decision["confidence"], self._required_confidence())
+            await self._notify_skip(
+                ticker, score,
+                f"сигнал был ({score:+.2f}), ИИ за покупку, но уверенность "
+                f"{decision['confidence']:.0%} ниже требуемой "
+                f"{self._required_confidence():.0%}: {decision['reason']}")
             return
 
         await self._buy(ticker, price, sentiment, summary, score, decision)
 
-    async def _entry_fallback_sma(self, ticker: str, price: float) -> None:
-        """Старая стратегия без LLM: цена < SMA-24 и новости не плохие."""
-        sma = await self._client.get_sma(ticker)
+    async def _entry_fallback_sma(self, ticker: str, price: float,
+                                  closes: Optional[List[float]] = None,
+                                  fast_n: int = 0) -> None:
+        """Старая стратегия без LLM: цена < рабочей средней и новости не плохие."""
+        sma: Optional[float] = None
+        fast_hours = 24.0
+        if closes and fast_n and len(closes) >= fast_n:
+            sma = sum(closes[-fast_n:]) / fast_n
+            fast_hours = fast_n * self._candle_step_h(self._sma_hours())
+        if sma is None:
+            sma = await self._client.get_sma(ticker)
         if sma is None or price >= sma:
             return
         sentiment = await self._get_sentiment(ticker)
         if sentiment <= self._sentiment_limit():
             return
-        summary = indicators.summarize([price] * 24, price)
+        summary: Dict[str, Optional[float]] = {
+            "fast_hours": round(fast_hours, 4), "price": price,
+            "sma_fast": sma, "sma24": sma,
+        }
         decision = {"action": "buy", "confidence": 0.4,
-                    "reason": "цена ниже средней за сутки (правило-фолбэк)"}
+                    "reason": "цена ниже рабочей средней (правило-фолбэк)"}
         await self._buy(ticker, price, sentiment, summary, 0.3, decision)
 
     async def _buy(self, ticker: str, price: float, sentiment: float,
@@ -270,7 +391,7 @@ class TradingEngine:
         for t, pos in self._state.positions.items():
             sz = self._client.get_lot_size(t) or 1
             invested += int(pos.get("lots", 0) or 0) * sz * \
-                        float(pos.get("entry_price", 0) or 0)
+                float(pos.get("entry_price", 0) or 0)
         total_money = portfolio["cash"] + invested
         room = total_money * self._state.max_invested_pct() / 100.0 - invested
         if room < budget:
@@ -306,6 +427,7 @@ class TradingEngine:
         stop_price = price * (1.0 - self._cfg.stop_loss_pct / 100.0)
         take_price = price * (1.0 + self._cfg.take_profit_pct / 100.0)
         name = self._client.instrument_name(ticker)
+        info = self.activity_info()
         friendly = (
             f"🛒 ПОКУПКА {ticker}" + (f" ({name})" if name else "") + "\n"
             f"Купил {lots} лот(а) = {shares} шт по ~{price:.2f} ₽, "
@@ -316,8 +438,12 @@ class TradingEngine:
             f"• {indicators.describe_for_human(summary)}.\n"
             f"• Комплексная оценка сигнала: {score:+.2f} "
             f"(от −1 до +1; порог сейчас {self._score_threshold():.2f} "
-            f"при агрессивности {self._state.aggressiveness()}).\n"
-            f"• Новости: {_human_sentiment(sentiment)} (оценка {sentiment:+.2f}).\n\n"
+            f"при агрессивности {self._state.aggressiveness()} и активности "
+            f"{info['activity']}).\n"
+            f"• Новости: {_human_sentiment(sentiment)} (оценка {sentiment:+.2f}).\n"
+            f"• Режим: активность {info['activity']}/100 - работаю на средних "
+            f"~{info['sma_hours']:g} ч (свечи {info['step_min']} мин), ИИ смотрел "
+            f"последние ~{info['ai_window_hours']:g} ч графика.\n\n"
             f"Мнение ИИ-трейдера (уверенность {decision['confidence']:.0%}):\n"
             f"«{decision['reason']}»\n\n"
             f"План выхода - сделаю сам:\n"
@@ -349,22 +475,33 @@ class TradingEngine:
             return
 
         # Скилл "ранний выход": LLM может предложить продать раньше цели,
-        # если позиция уже в плюсе и аргументы против роста перевесили.
-        if (self._cfg.llm_decisions_enabled and 0.5 < profit_pct
-                and not self._cooldown_active(ticker)):
+        # если аргументы против роста перевесили. Частота пересмотра и
+        # требуемая уверенность зависят от активности: в активном режиме ИИ
+        # смотрит позиции чаще (кэш 10-30 мин) и готов фиксировать и
+        # небольшой минус, пока убыток не доехал до стоп-лосса.
+        act = self._activity()
+        review_wanted = (profit_pct > 0.5
+                         or (act >= 60
+                             and profit_pct > -self._cfg.stop_loss_pct / 2.0))
+        if self._cfg.llm_decisions_enabled and review_wanted:
             decision = self._llm_cache.get(ticker)
-            fresh = decision and (time.monotonic() - decision[0]) < _LLM_CACHE_TTL_SEC
+            fresh = decision and (time.monotonic() - decision[0]) < self._llm_ttl_sec()
             if not fresh:
+                history = None
                 try:
-                    history = await self._client.get_hourly_history(ticker, 72)
+                    sma_h = self._sma_hours()
+                    step_h = self._candle_step_h(sma_h)
+                    fast_n = self._fast_n(sma_h, step_h)
+                    history = await self._client.get_candles_history(
+                        ticker, self._fetch_hours(fast_n, step_h), step_h)
                     closes = [p for _, p in history]
-                    summary = (indicators.summarize(closes, price)
-                               if len(closes) >= 30 else {})
+                    summary = (indicators.summarize_generic(closes, price, fast_n, step_h)
+                               if len(closes) >= self._min_candles(fast_n) else {})
                 except Exception:  # noqa: BLE001
                     summary = {}
                 sentiment = await self._get_sentiment(ticker)
                 brief = self._build_brief(ticker, price, summary, sentiment,
-                                          position=position)
+                                          position=position, history=history)
                 verdict = await self._analyst.analyze_market(brief)
                 self._llm_cache[ticker] = (time.monotonic(), verdict)
                 if verdict:
@@ -377,7 +514,7 @@ class TradingEngine:
             else:
                 verdict = decision[1]
             if verdict and verdict["action"] == "sell" and \
-                    verdict["confidence"] >= (0.60 - 0.15 * self._state.aggressiveness() / 100.0):
+                    verdict["confidence"] >= self._sell_confidence():
                 await self._sell(ticker, price, position, "решение ИИ", profit_pct,
                                  verdict["reason"])
 
@@ -423,17 +560,28 @@ class TradingEngine:
     # ------------------------------------------------------------------ LLM
     def _build_brief(self, ticker: str, price: float,
                      summary: Dict[str, Optional[float]], sentiment: float,
-                     position: Optional[Dict[str, Any]] = None) -> str:
-        """Компактная сводка для трейдера-LLM: индикаторы + новости + память."""
+                     position: Optional[Dict[str, Any]] = None,
+                     history: Optional[List[Tuple[float, float]]] = None) -> str:
+        """Сводка для трейдера-LLM: индикаторы + путь цены в масштабе
+        активности + новости + память прошлых решений."""
         name = self._client.instrument_name(ticker)
+        info = self.activity_info()
         lines: list[str] = [f"Акция {ticker}" + (f" ({name})" if name else "") +
-                            f". Текущая цена {price:.2f} ₽."]
+                            f". Текущая цена {price:.2f} ₽.",
+                            f"Режим: активность {info['activity']}/100, "
+                            f"стратегия смотрит средние ~{info['sma_hours']:g} ч "
+                            f"(свечи {info['step_min']} мин)."]
         if summary:
-            sma24 = summary.get("sma24")
-            if sma24:
-                lines.append(f"SMA-24 (средняя за сутки): {sma24:.2f} ₽ "
-                             f"(цена {'ниже' if price < sma24 else 'выше'} на "
-                             f"{abs(price / sma24 - 1.0) * 100:.1f}%)")
+            sma_fast = summary.get("sma_fast")
+            if sma_fast:
+                fast_h = float(summary.get("fast_hours") or 24.0)
+                lines.append(f"SMA-{fast_h:g} ч (рабочая средняя): {sma_fast:.2f} ₽ "
+                             f"(цена {'ниже' if price < sma_fast else 'выше'} на "
+                             f"{abs(price / sma_fast - 1.0) * 100:.1f}%)")
+            sma_slow = summary.get("sma_slow")
+            if sma_slow:
+                slow_h = float(summary.get("fast_hours") or 24.0) * 2.0
+                lines.append(f"SMA-{slow_h:g} ч (медленная средняя): {sma_slow:.2f} ₽")
             rsi14 = summary.get("rsi14")
             if rsi14 is not None:
                 lines.append(f"RSI-14: {rsi14:.1f} (меньше 30 = перепродан, "
@@ -453,6 +601,22 @@ class TradingEngine:
             vol = summary.get("volatility")
             if vol is not None:
                 lines.append(f"Волатильность: {vol:.2f}% в час")
+
+        # Свежий путь цены - "график до настоящего момента" в масштабе
+        # активности: активный режим видит локальные минуты, спокойный -
+        # длинный отрезок суток. Сэмплируем до 30 точек, чтобы промпт не
+        # раздувать.
+        if history:
+            window = self._ai_window_hours(self._sma_hours()) * 3600.0
+            fresh = [(ts, p) for ts, p in history if ts >= time.time() - window]
+            if len(fresh) >= 3:
+                sample = fresh[::max(1, len(fresh) // 30)][-30:]
+                path = ", ".join(
+                    f"{time.strftime('%H:%M', time.localtime(ts))}={p:.2f}"
+                    for ts, p in sample)
+                lines.append(f"Путь цены за последние ~{info['ai_window_hours']:g} ч "
+                             f"(время-цена): {path}")
+
         lines.append(f"Сентимент новостей: {sentiment:+.2f} "
                      f"(от −1 плохие до +1 хорошие).")
 
@@ -484,16 +648,30 @@ class TradingEngine:
                      '"reason": "коротко по-русски"}.')
         return "\n".join(lines)
 
+    async def _notify_skip(self, ticker: str, score: float, detail: str) -> None:
+        """Почему сигнал не превратился в покупку - админу, но не чаще
+        одного сообщения за 30 минут на тикер (анти-спам)."""
+        last = self._skip_notify_ts.get(ticker)
+        if last is not None and (time.monotonic() - last) < _SKIP_NOTIFY_TTL_SEC:
+            log.info("%s: пропуск сделки (о нём недавно уже сообщал): %s",
+                     ticker, detail)
+            return
+        self._skip_notify_ts[ticker] = time.monotonic()
+        await self._safe_notify(f"🤔 {ticker}: сигнал был, но покупку отложил.\n{detail}")
+
     async def _get_llm_decision(self, ticker: str, price: float,
                                 summary: Dict[str, Optional[float]], score: float,
-                                sentiment: float) -> Optional[dict]:
-        """Вердикт трейдера-LLM с кэшем на 30 минут (без LLM -> None)."""
+                                sentiment: float,
+                                history: Optional[List[Tuple[float, float]]] = None
+                                ) -> Optional[dict]:
+        """Вердикт трейдера-LLM с кэшем на 10-30 минут (без LLM -> None)."""
         if not self._cfg.llm_decisions_enabled:
             return None
         cached = self._llm_cache.get(ticker)
-        if cached and (time.monotonic() - cached[0]) < _LLM_CACHE_TTL_SEC:
+        if cached and (time.monotonic() - cached[0]) < self._llm_ttl_sec():
             return cached[1]
-        brief = self._build_brief(ticker, price, summary, sentiment)
+        brief = self._build_brief(ticker, price, summary, sentiment,
+                                  history=history)
         verdict = await self._analyst.analyze_market(brief)
         self._llm_cache[ticker] = (time.monotonic(), verdict)
         if verdict:
@@ -528,6 +706,7 @@ class TradingEngine:
         self._sentiment_cache[ticker] = (time.monotonic(), score)
         return score
 
+    # ------------------------------------------------------------------ прочее
     async def situation_brief(self) -> str:
         """
         Сводка о счёте и бумагах для ручных вопросов владельца (/ask).
@@ -537,8 +716,13 @@ class TradingEngine:
         Ошибка по одной бумаге не ломает всю сводку.
         """
         aggr = self._state.aggressiveness()
+        act = self._state.activity()
+        info = self.activity_info()
         lines: list[str] = [
-            f"Настройки: агрессивность {aggr}/100, порог сигнала "
+            f"Настройки: агрессивность {aggr}/100, активность {act}/100 "
+            f"(рабочая средняя ~{info['sma_hours']:g} ч на свечах "
+            f"{info['step_min']} мин, ИИ смотрит последние "
+            f"~{info['ai_window_hours']:g} ч), порог сигнала "
             f"{self._score_threshold():.2f}, требуемая уверенность LLM "
             f"{self._required_confidence():.2f}, потолок вложенности "
             f"{self._state.max_invested_pct()}% всех денег, на одну сделку "
@@ -574,24 +758,31 @@ class TradingEngine:
                     lines.append(f"{ticker}: цена недоступна.")
                     continue
                 line = f"{ticker}: сейчас {price:.2f} ₽."
-                history = await self._client.get_hourly_history(ticker, 72)
+                # Индикаторы считаю в том же масштабе, что и живой движок:
+                # иначе /ask ответит про одни пороги, а бот торговал по другим.
+                sma_h = self._sma_hours()
+                step_h = self._candle_step_h(sma_h)
+                fast_n = self._fast_n(sma_h, step_h)
+                history = await self._client.get_candles_history(
+                    ticker, self._fetch_hours(fast_n, step_h), step_h)
                 closes = [p for _, p in history]
-                if len(closes) >= 30:
-                    summary = indicators.summarize(closes, price)
+                if len(closes) >= self._min_candles(fast_n):
+                    summary = indicators.summarize_generic(closes, price, fast_n, step_h)
                     score = indicators.build_score(summary)
                     needed = self._score_threshold()
                     line += (f" Оценка сигнала {score:+.2f} при пороге "
                              f"{needed:.2f} -> "
                              f"{'сигнал на покупку ЕСТЬ' if score >= needed else 'сигнала нет'}"
                              f". RSI {summary.get('rsi14') or 0:.0f}")
-                    sma24 = summary.get("sma24")
-                    if sma24:
-                        line += (f", цена {'ниже' if price < sma24 else 'выше'} "
-                                 f"SMA-24 {sma24:.2f} ₽ на "
-                                 f"{abs(price / sma24 - 1.0) * 100:.1f}%")
+                    sma_fast = summary.get("sma_fast")
+                    if sma_fast:
+                        line += (f", цена {'ниже' if price < sma_fast else 'выше'} "
+                                 f"средней за ~{sma_h:.4g} ч ({sma_fast:.2f} ₽) на "
+                                 f"{abs(price / sma_fast - 1.0) * 100:.1f}%")
                     line += "."
                 else:
-                    line += f" Часовых свечей мало ({len(closes)}) - индикаторы не построить."
+                    line += (f" Рабочих свечей мало ({len(closes)} из "
+                             f"{self._min_candles(fast_n)}) - индикаторы не построить.")
                 # Сентимент из кэша (без похода в Groq), если он ещё свежий.
                 cached = self._sentiment_cache.get(ticker)
                 if cached and (time.monotonic() - cached[0]) < self._cfg.sentiment_ttl_sec:
@@ -600,7 +791,7 @@ class TradingEngine:
                              f"(допуск для покупки {limit:+.2f}).")
                 # Последний вердикт трейдера-LLM из кэша (без похода в Groq).
                 verdict = self._llm_cache.get(ticker)
-                if verdict and (time.monotonic() - verdict[0]) < _LLM_CACHE_TTL_SEC \
+                if verdict and (time.monotonic() - verdict[0]) < self._llm_ttl_sec() \
                         and verdict[1]:
                     line += (f" Последний вердикт ИИ-трейдера: "
                              f"{verdict[1]['action']} "
@@ -627,7 +818,6 @@ class TradingEngine:
             lines.append("Журнал решений пуст: сигналов, доходивших до ИИ, ещё не было.")
         return "\n".join(lines)
 
-    # ------------------------------------------------------------------ прочее
     async def _safe_notify(self, text: str) -> None:
         try:
             await self._notify(text)
@@ -637,8 +827,12 @@ class TradingEngine:
     # Для /status и диагностики (формулировка для человека).
     def describe(self) -> str:
         aggr = self._state.aggressiveness()
+        act = self._activity()
+        info = self.activity_info()
         return (f"проверок рынка: {self._cycles_done}, держится позиций: "
-                f"{len(self._state.positions)}, агрессивность: {aggr}/100 "
+                f"{len(self._state.positions)}, агрессивность: {aggr}/100, "
+                f"активность: {act}/100 (средняя ~{info['sma_hours']:g} ч, "
+                f"свечи {info['step_min']} мин) "
                 f"(порог сигнала {self._score_threshold():.2f}), "
                 f"покупок сегодня: {self._state.buys_today()}/"
                 f"{self._max_buys_today()}")

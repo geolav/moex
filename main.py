@@ -79,7 +79,8 @@ def setup_logging(config: BotConfig) -> None:
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
     # Телеметрия SDK Т-Инвест (Sentry) на VPS не работает: прокси режет SSL,
-    # а её ошибки только мусорят в логе и сбивают с толку ИИ-аудитора.
+    # а её ошибки (SSLCertVerificationError, /api/0/envelope/) только мусорят
+    # в логе и сбивают с толку ИИ-аудитора. Вырезаю эти записи из лога.
     class _DropTelemetryNoise(logging.Filter):
         def filter(self, record: logging.LogRecord) -> bool:
             msg = record.getMessage()
@@ -101,9 +102,12 @@ def _print_banner(config: BotConfig, state: StateStore) -> None:
     log.info("Режим: %s | торговля: %s | аудитор: %s", mode,
              "вкл" if state.trading_enabled else "выкл",
              "вкл" if state.auditor_enabled else "выкл")
-    log.info("Тикеры (%d): %s | SMA-%d | опрос %d сек",
+    log.info("Тикеры (%d): %s | опрос %d сек",
              len(config.trading_tickers), ", ".join(config.trading_tickers),
-             config.sma_period, config.poll_interval_sec)
+             config.poll_interval_sec)
+    log.info("Агрессивность %d/100 | активность %d/100 "
+             "(масштаб времени задаётся в Telegram: /set_activity)",
+             state.aggressiveness(), state.activity())
     log.info("SL %.1f%% / TP %.1f%% | позиция <= %.1f%% свободных средств",
              config.stop_loss_pct, config.take_profit_pct, config.max_position_pct)
     log.info("Groq-модель: %s | аудит каждые %d сек",
@@ -196,10 +200,9 @@ async def async_main() -> int:
         try:
             mode = "Sandbox" if state.use_sandbox else "РЕАЛЬНЫЙ режим"
             await notify_admin(
-                f"Бот запущен (v1.2.0). Режим: {mode}. "
+                f"Бот запущен (v{VERSION}). Режим: {mode}. "
                 f"Тикеры: {', '.join(config.trading_tickers)}. "
                 f"Торговля: {'вкл' if state.trading_enabled else 'выкл'}. "
-                f"Новые: /stats (график), /shutdown, /set_aggressiveness (активность)."
                 f"Проверить логи вручную: /audit. Статистика: /stats.")
         except Exception as exc:  # noqa: BLE001 - Telegram мог быть недоступен
             log.warning("Приветствие в Telegram не отправлено: %s", exc)

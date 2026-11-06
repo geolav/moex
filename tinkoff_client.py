@@ -32,7 +32,7 @@ import uuid
 from collections import deque
 from datetime import timedelta
 from decimal import Decimal
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 from xml.etree import ElementTree as ET
 
 import aiohttp
@@ -80,9 +80,11 @@ except ImportError as exc:  # pragma: no cover - путь только для dr
 
 # ---------------------------------------------------------------------------
 # Отключение телеметрии SDK (T-Bank error-hub / Sentry).
-# SDK жёстко инициализирует sentry_sdk на error-hub.tbank.ru (выключателя
-# нет), TLS до этого хоста с VPS не проверяется -> SSL-шум в логе.
-# На торговлю не влияет - глушим отправку, подменяя init-функции на пустые.
+# SDK при входе в клиент жёстко инициализирует sentry_sdk на захардкоженный
+# DSN error-hub.tbank.ru (переменной окружения для отключения нет) и шлёт
+# туда ошибки gRPC. TLS до этого хоста с VPS не проверяется, и в лог сыпятся
+# SSLCertVerificationError на /api/0/envelope/. На торговлю это не влияет -
+# просто глушим отправку, подменяя init-функции на пустые.
 # ---------------------------------------------------------------------------
 if SDK_AVAILABLE:
     import t_tech.invest.clients as _tt_clients
@@ -95,6 +97,7 @@ if SDK_AVAILABLE:
 
     _tt_clients.init_error_hub = _no_error_hub
     _tt_clients.async_init_error_hub = _no_async_error_hub
+
 log = logging.getLogger("tinkoff")
 
 # Коды gRPC, при которых повтор запроса имеет смысл.
@@ -107,6 +110,28 @@ _CODE_RESOURCE_EXHAUSTED = 8
 
 _TAG_RE = re.compile(r"<[^>]+>")
 _SPACES_RE = re.compile(r"\s+")
+
+
+def candle_interval_for_step(step_h: float):
+    """
+    Шаг свечей (в часах) -> (CandleInterval, timedelta).
+
+    Поддерживаем три рабочих масштаба: часовые свечи (1.0),
+    15-минутные (0.25) и 5-минутные (1/12). Любое другое значение
+    (или SDK без перечисления CandleInterval) -> часовые свечи.
+    """
+    if not SDK_AVAILABLE or CandleInterval is None:
+        return None, timedelta(hours=1.0)
+    step = float(step_h)
+    if abs(step - 1.0) < 0.01:
+        interval = CandleInterval.CANDLE_INTERVAL_HOUR
+    elif abs(step - 0.25) < 0.01:
+        interval = CandleInterval.CANDLE_INTERVAL_15_MIN
+    elif abs(step - 1.0 / 12.0) < 0.01:
+        interval = CandleInterval.CANDLE_INTERVAL_5_MIN
+    else:
+        interval = CandleInterval.CANDLE_INTERVAL_HOUR
+    return interval, candle_interval_to_timedelta(interval)
 
 
 class TinkoffClientError(RuntimeError):
@@ -391,7 +416,7 @@ class TinkoffClient:
             lambda: self._api.market_data.get_candles(
                 figi=instrument["figi"],
                 interval=interval,
-                from_=now_utc - interval_td * (count * 3 + 3),
+                from_=now_utc - interval_td * (count + 3),
                 to=now_utc,
             ),
         )
@@ -401,33 +426,51 @@ class TinkoffClient:
                 closes.append(float(quotation_to_decimal(candle.close)))
         return closes[-count:]
 
-    async def get_hourly_history(self, ticker: str, hours: float = 48.0) -> List[Tuple[float, float]]:
-        """История часовых закрытий с биржи: [(ts, price), ...].
+    async def get_candles_history(self, ticker: str, hours_back: float,
+                                  step_h: float = 1.0) -> List[Tuple[float, float]]:
+        """
+        Закрытые свечи за последние `hours_back` часов: [(ts_закрытия, цена)].
 
-        ts - момент ЗАКРЫТИЯ свечи: цена закрытия относится к концу часа,
-        иначе вся линия уезжает на час влево от реального времени.
+        step_h - длительность свечи в часах: 1.0 - часовые, 0.25 - 15-минутные,
+        1/12 - 5-минутные (неизвестное значение -> часовые; без SDK - тоже
+        часовые). ts_закрытия - unix-время закрытия свечи: движок и /stats
+        работают с ним, а не с открытием (свеча 10:00-11:00 реально
+        описывает цену в 11:00).
         """
         instrument = self._instruments.get(ticker)
         if instrument is None:
             return []
-        interval = CandleInterval.CANDLE_INTERVAL_HOUR
-        interval_td = candle_interval_to_timedelta(interval)
+
+        interval, interval_td = candle_interval_for_step(step_h)
+        if interval is None or sdk_now is None:
+            # SDK недоступен (dry-run) - данных нет, движок уйдёт в фолбэк.
+            return []
         now_utc = sdk_now()
+        # Свечей запрашиваем с запасом: торги идут ~14 ч/сутки, а не 24.
+        count = int(float(hours_back) / max(step_h, 1e-9) * 1.5) + 3
+        count = max(10, min(400, count))
         response = await self._call(
             "get_candles",
             lambda: self._api.market_data.get_candles(
-                figi=instrument["figi"], interval=interval,
-                from_=now_utc - interval_td * int(hours * 1.5 + 3),
+                figi=instrument["figi"],
+                interval=interval,
+                from_=now_utc - interval_td * (count + 3),
                 to=now_utc,
             ),
         )
-        out: List[Tuple[float, float]] = []
+        pairs: List[Tuple[float, float]] = []
         for candle in response.candles:
             close_dt = candle.time + interval_td
-            if close_dt <= now_utc:  # только закрытые свечи
-                out.append((close_dt.timestamp(),
-                            float(quotation_to_decimal(candle.close))))
-        return out
+            if close_dt <= now_utc:  # свеча гарантированно закрыта
+                pairs.append((float(close_dt.timestamp()),
+                              float(quotation_to_decimal(candle.close))))
+        pairs.sort(key=lambda p: p[0])
+        return pairs
+
+    async def get_hourly_history(self, ticker: str, hours_back: float
+                                 ) -> List[Tuple[float, float]]:
+        """Часовые закрытые свечи за `hours_back` часов: [(ts_закрытия, цена)]."""
+        return await self.get_candles_history(ticker, hours_back, step_h=1.0)
 
     async def get_sma(self, ticker: str) -> Optional[float]:
         """Простая скользящая средняя за SMA_PERIOD закрытых часовых свечей."""
