@@ -78,6 +78,21 @@ def setup_logging(config: BotConfig) -> None:
     for noisy in ("aiogram.event", "asyncio", "httpx", "aiohttp.access"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
+    # Телеметрия SDK Т-Инвест (Sentry) на VPS не работает: прокси режет SSL,
+    # а её ошибки только мусорят в логе и сбивают с толку ИИ-аудитора.
+    class _DropTelemetryNoise(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            msg = record.getMessage()
+            return ("envelope" not in msg
+                    and "SSLCertVerificationError" not in msg
+                    and "sentry_sdk" not in msg)
+
+    noise_filter = _DropTelemetryNoise()
+    for handler in root.handlers:
+        handler.addFilter(noise_filter)
+    for noisy in ("sentry_sdk", "urllib3.connectionpool"):
+        logging.getLogger(noisy).setLevel(logging.ERROR)
+
 
 def _print_banner(config: BotConfig, state: StateStore) -> None:
     mode = "ПЕСОЧНИЦА" if state.use_sandbox else "РЕАЛЬНЫЙ СЧЁТ"
