@@ -139,6 +139,18 @@ class BotConfig:
     trade_cooldown_min: int       # пауза между покупками одной бумаги, мин
     max_buys_per_day: int         # потолок покупок в сутки (по всем тикерам)
 
+    # --- Обучение на ошибках (память сделок, trade_memory.py) ---
+    learning_enabled: bool        # учитывать итоги прошлых сделок
+    memory_max_trades: int        # сколько сделок хранить в памяти
+    daily_loss_limit_pct: float   # стоп на день: макс. убыток, % от капитала
+    loss_streak_pause_h: float    # пауза бумаге после 3 убытков подряд, ч
+    sl_confirm_cycles: int        # циклов ниже стопа до продажи (1 = сразу)
+    sl_veto_confidence: float     # уверенность ИИ, чтобы отложить стоп-лосс
+    hard_sl_mult: float           # аварийный стоп = стоп-лосс * этот множитель
+    trailing_activate_pct: float  # с какой прибыли включается трейлинг-стоп
+    trailing_drop_pct: float      # откат от максимума прибыли для продажи
+    llm_early_sell_min_profit_pct: float  # ИИ продаёт досрочно только в плюс
+
     # --- Инфраструктура ---
     rate_limit_rpm: int
     news_rss_urls: Tuple[str, ...]
@@ -150,6 +162,7 @@ class BotConfig:
     base_dir: str
     logs_dir: str
     state_file: str
+    data_dir: str
 
     @property
     def log_file(self) -> str:
@@ -214,6 +227,22 @@ def load_config() -> BotConfig:
         llm_decisions_enabled=_env_bool("LLM_DECISIONS", True),
         trade_cooldown_min=_env_int("TRADE_COOLDOWN_MIN", 120, low=0, high=1440),
         max_buys_per_day=_env_int("MAX_BUYS_PER_DAY", 25, low=1, high=100),
+        learning_enabled=_env_bool("LEARNING", True),
+        memory_max_trades=_env_int("MEMORY_MAX_TRADES", 400, low=20, high=5000),
+        daily_loss_limit_pct=_env_float("DAILY_LOSS_LIMIT_PCT", 2.0,
+                                        low=0.0, high=100.0),
+        loss_streak_pause_h=_env_float("LOSS_STREAK_PAUSE_H", 4.0,
+                                       low=0.0, high=168.0),
+        sl_confirm_cycles=_env_int("SL_CONFIRM_CYCLES", 2, low=1, high=10),
+        sl_veto_confidence=_env_float("SL_VETO_CONFIDENCE", 0.60,
+                                      low=0.0, high=1.0),
+        hard_sl_mult=_env_float("HARD_SL_MULT", 1.5, low=1.0, high=5.0),
+        trailing_activate_pct=_env_float("TRAILING_ACTIVATE_PCT", 2.0,
+                                         low=0.0, high=100.0),
+        trailing_drop_pct=_env_float("TRAILING_DROP_PCT", 1.5,
+                                     low=0.1, high=100.0),
+        llm_early_sell_min_profit_pct=_env_float("LLM_EARLY_SELL_MIN_PROFIT", 0.5,
+                                                 low=0.0, high=100.0),
         rate_limit_rpm=_env_int("RATE_LIMIT_RPM", 90, low=5, high=250),
         news_rss_urls=_env_urls(
             "NEWS_RSS_URLS",
@@ -227,6 +256,7 @@ def load_config() -> BotConfig:
         base_dir=BASE_DIR,
         logs_dir=logs_dir,
         state_file=os.path.join(BASE_DIR, "state.json"),
+        data_dir=os.path.join(BASE_DIR, "data"),
     )
 
 

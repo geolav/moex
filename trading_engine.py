@@ -11,14 +11,20 @@ trading_engine.py - торговая логика бота v2: гибрид "и�
      мини-дебаты "бык vs медведь" и возвращает JSON
      {action: buy|sell|hold, confidence, reason}.
   3. ПАМЯТЬ: последние 12 решений хранятся в state.json и включаются
-     в следующий промпт ("что я решал и чем это кончилось").
+     в следующий промпт ("что я решал и чем это кончилось"); КРОМЕ того,
+     trade_memory.py помнит ВСЕ закрытые сделки и выводит уроки (винрейт,
+     серии убытков, плохие часы входа) - и для фильтров движка, и для ИИ.
   4. РИСК-КОНТРОЛЬ (код, LLM его обойти не может):
-     - жёсткие стоп-лосс (-3%) и тейк-профит (+5%) у каждой позиции;
+     - лестница выходов по позиции (см. _check_exit): аварийный стоп,
+       тейк-профит, трейлинг-стоп, стоп-лосс с подтверждением и вето ИИ;
      - кулдаун между покупками одной бумаги (TRADE_COOLDOWN_MIN, при
        высокой агрессивности/активности сокращается);
      - дневной лимит покупок (MAX_BUYS_PER_DAY - потолок);
+     - дневной лимит УБЫТКА (DAILY_LOSS_LIMIT_PCT): после него новых
+       покупок до завтра;
      - порог сигнала и требуемая уверенность LLM зависят от уровней
-       агрессивности (/set_aggressiveness) и активности (/set_activity).
+       агрессивности (/set_aggressiveness) и активности (/set_activity)
+       и РАСТУТ после серии убытков по бумаге (память сделок).
 
 АГРЕССИВНОСТЬ (aggr 0..100) - РЕШИТЕЛЬНОСТЬ (сколько надо доказательств):
   score_threshold = 0.60 - 0.55 * aggr/100 - 0.05 * act/100
@@ -76,12 +82,16 @@ def _human_sentiment(score: float) -> str:
 class TradingEngine:
     """Последовательный торговый цикл: опрос -> индикаторы -> LLM -> сделка."""
 
-    def __init__(self, config, state, client, analyst, notify: Notifier) -> None:
+    def __init__(self, config, state, client, analyst, notify: Notifier,
+                 memory=None) -> None:
         self._cfg = config
         self._state = state
         self._client = client
         self._analyst = analyst
         self._notify = notify
+        # TradeMemory - долговременная память о завершённых сделках
+        # (винрейт, серии убытков, плохие часы). None = обучение выключено.
+        self._memory = memory
         self._stop_event = asyncio.Event()
         # Кэш сентимента: ticker -> (monotonic-время, оценка). Держит Groq-лимиты.
         self._sentiment_cache: Dict[str, tuple[float, float]] = {}
@@ -91,6 +101,8 @@ class TradingEngine:
         self._news_cache: Dict[str, list] = {}
         # Когда последний раз сообщали о пропущенной покупке (анти-спам).
         self._skip_notify_ts: Dict[str, float] = {}
+        # Анти-спам для уведомлений от "памяти" (паузы/плохие часы/дневной стоп).
+        self._memory_notify_ts: Dict[str, float] = {}
         self._cycles_done = 0
 
     # -------------------------------------------------------------- жизненный цикл
@@ -266,6 +278,35 @@ class TradingEngine:
                      ticker)
             return
 
+        # Шаг 0.5. Память об ошибках: пауза после серии убытков, "плохие"
+        # часы входа, повышенный порог после неудач (см. trade_memory.py).
+        needed = self._score_threshold()
+        conf_req = self._required_confidence()
+        if self._cfg.learning_enabled and self._memory is not None:
+            pause = self._memory.pause_reason(ticker,
+                                              self._cfg.loss_streak_pause_h)
+            if pause:
+                log.info("%s: %s - покупки жду", ticker, pause)
+                await self._memory_notify(
+                    ticker,
+                    f"🧠 {ticker}: {pause}. Наблюдаю со стороны, деньги жду "
+                    f"лучшего момента.")
+                return
+            bad_hour = self._memory.bad_hour_reason(ticker)
+            if bad_hour:
+                log.info("%s: %s - сигнал пропускаю", ticker, bad_hour)
+                await self._memory_notify(
+                    ticker, f"🧠 {ticker}: {bad_hour}.")
+                return
+            bump = self._memory.threshold_bump(ticker)
+            if bump > 0:
+                streak = self._memory.loss_streak(ticker)
+                needed = round(needed + bump, 3)
+                conf_req = round(conf_req + 0.05, 3)
+                log.info("%s: %d убытк(а/ов) подряд - порог сигнала поднят "
+                         "до %.2f, требуемая уверенность ИИ %.2f",
+                         ticker, streak, needed, conf_req)
+
         # Шаг 1. Скилл "технический аналитик": история цен -> индикаторы -> score.
         # Рабочий таймфрейм зависит от АКТИВНОСТИ: спокойный режим смотрит
         # сутки на часовых свечах, активный - последний час на 5-минутных.
@@ -288,7 +329,6 @@ class TradingEngine:
 
         summary = indicators.summarize_generic(closes, price, fast_n, step_h)
         score = indicators.build_score(summary)
-        needed = self._score_threshold()
         log.info("%s: score %.2f (порог %.2f, агрессивность %d, активность %d, "
                  "SMA-%.4g ч, свечи %.0f мин) RSI %.0f",
                  ticker, score, needed, self._state.aggressiveness(),
@@ -338,14 +378,14 @@ class TradingEngine:
                 f"«{decision['action']}» (уверенность "
                 f"{decision['confidence']:.0%}): {decision['reason']}")
             return
-        if decision["confidence"] < self._required_confidence():
+        if decision["confidence"] < conf_req:
             log.info("%s: LLM 'buy' с уверенностью %.2f < требуемой %.2f - пропуск",
-                     ticker, decision["confidence"], self._required_confidence())
+                     ticker, decision["confidence"], conf_req)
             await self._notify_skip(
                 ticker, score,
                 f"сигнал был ({score:+.2f}), ИИ за покупку, но уверенность "
                 f"{decision['confidence']:.0%} ниже требуемой "
-                f"{self._required_confidence():.0%}: {decision['reason']}")
+                f"{conf_req:.0%}: {decision['reason']}")
             return
 
         await self._buy(ticker, price, sentiment, summary, score, decision)
@@ -393,6 +433,28 @@ class TradingEngine:
             invested += int(pos.get("lots", 0) or 0) * sz * \
                 float(pos.get("entry_price", 0) or 0)
         total_money = portfolio["cash"] + invested
+        # Дневной лимит убытка: если сегодняшние продажи уже дали убыток
+        # больше DAILY_LOSS_LIMIT_PCT% капитала - новых покупок до завтра.
+        if (self._cfg.learning_enabled and self._memory is not None
+                and self._cfg.daily_loss_limit_pct > 0):
+            day_pnl = self._memory.today_realized_pnl()
+            limit_rub = total_money * self._cfg.daily_loss_limit_pct / 100.0
+            if day_pnl < 0 and abs(day_pnl) >= limit_rub:
+                log.info("Дневной лимит убытка достигнут (сегодня %+.0f ₽ при "
+                         "лимите −%.0f ₽) - покупку %s отменяю до завтра",
+                         day_pnl, limit_rub, ticker)
+                last = self._memory_notify_ts.get("#dailystop")
+                if last is None or (time.monotonic() - last) >= 3600.0:
+                    self._memory_notify_ts["#dailystop"] = time.monotonic()
+                    await self._safe_notify(
+                        f"🛑 Дневной стоп: сегодняшние продажи дали убыток "
+                        f"{day_pnl:+.0f} ₽ - это "
+                        f"{self._cfg.daily_loss_limit_pct:.1f}% капитала "
+                        f"(лимит −{_fmt_rub(limit_rub)} ₽).\n"
+                        f"Новые покупки отменяю до завтра; открытые позиции "
+                        f"продолжаю охранять как обычно. Разбор ошибок: "
+                        f"/memory")
+                return
         room = total_money * self._state.max_invested_pct() / 100.0 - invested
         if room < budget:
             log.info("%s: лимит вложенности %d%% - бюджет урезан с %.0f до %.0f ₽ "
@@ -416,6 +478,8 @@ class TradingEngine:
             "entry_price": round(price, 4),
             "entry_ts": time.strftime("%Y-%m-%d %H:%M:%S"),
             "order_id": result.get("order_id", ""),
+            "max_profit_pct": 0.0,   # для трейлинг-стопа
+            "sl_confirm": 0,         # счётчик циклов ниже стоп-лосса
         })
         self._state.set_last_buy_ts(ticker, time.time())
         self._state.record_buy_today()
@@ -447,15 +511,35 @@ class TradingEngine:
             f"Мнение ИИ-трейдера (уверенность {decision['confidence']:.0%}):\n"
             f"«{decision['reason']}»\n\n"
             f"План выхода - сделаю сам:\n"
-            f"• Страховка «стоп-лосс»: продажа при падении до {stop_price:.2f} ₽ "
-            f"(−{self._cfg.stop_loss_pct:.0f}%).\n"
-            f"• Цель «тейк-профит»: продажа при росте до {take_price:.2f} ₽ "
-            f"(+{self._cfg.take_profit_pct:.0f}%)."
+            f"• трейлинг-стоп: если прибыль дорастёт до "
+            f"+{self._cfg.trailing_activate_pct:.1f}%, а потом откатится на "
+            f"{self._cfg.trailing_drop_pct:.1f}% - зафиксирую заработанное «на спаде»\n"
+            f"• стоп-лосс: при падении до {stop_price:.2f} ₽ "
+            f"(−{self._cfg.stop_loss_pct:.0f}%) уточню у ИИ, не ложный ли "
+            f"прокол, и продам максимум через "
+            f"{self._cfg.sl_confirm_cycles} проверки;\n"
+            f"• аварийный стоп: при −{self._cfg.stop_loss_pct * self._cfg.hard_sl_mult:.1f}% продаю сразу, без разговоров;\n"
+            f"• цель «тейк-профит»: продажа при росте до {take_price:.2f} ₽ "
+            f"(+{self._cfg.take_profit_pct:.0f}%).\n"
+            f"Каждую закрытую сделку запомню и учту: после убытков требования "
+            f"к новой покупке станут строже (/memory - что я выучил)."
         )
         await self._safe_notify(friendly)
 
     # ------------------------------------------------------------------- выход
-    async def _check_exit(self, ticker: str, price: float, position: Dict[str, Any]) -> None:
+    async def _check_exit(self, ticker: str, price: float,
+                          position: Dict[str, Any]) -> None:
+        """Лестница выходов (приоритет сверху вниз):
+
+        1) аварийный стоп-лосс (-SL * HARD_SL_MULT) - продаём немедленно;
+        2) тейк-профит (+TP) - продаём немедленно;
+        3) трейлинг-стоп: прибыль поднималась до TRAILING_ACTIVATE_PCT и
+           откатилась на TRAILING_DROP_PCT - фиксируем остаток прибыли;
+        4) стоп-лосс (-SL): первый цикл даём ИИ право вето (hold = ждём
+           отскок один цикл), дальше продаём (SL_CONFIRM_CYCLES проверок);
+        5) досрочная продажа по ИИ - ТОЛЬКО при прибыли: фиксировать убытки
+           по желанию модели запрещено, убытки режет только стоп-лосс.
+        """
         entry = float(position.get("entry_price", 0) or 0)
         if entry <= 0:
             log.warning("%s: позиция без цены входа (%s) - удаляю из состояния",
@@ -464,26 +548,90 @@ class TradingEngine:
             return
         profit_pct = (price / entry - 1.0) * 100.0
 
-        # Жёсткие страховки - приоритет, LLM их обойти не может.
+        # Помним максимум прибыли по позиции - нужен трейлинг-стопу.
+        prev_max = float(position.get("max_profit_pct", 0.0) or 0.0)
+        max_profit = max(prev_max, profit_pct)
+        if max_profit > prev_max:
+            position = {**position, "max_profit_pct": round(max_profit, 2)}
+            self._state.set_position(ticker, position)
+
+        stop_pct = self._cfg.stop_loss_pct
+        hard_stop_pct = stop_pct * self._cfg.hard_sl_mult
+
+        # 1) Аварийный стоп: падение слишком глубокое - без разговоров.
+        if profit_pct <= -hard_stop_pct:
+            await self._sell(
+                ticker, price, position, "аварийный стоп-лосс", profit_pct,
+                f"падение {profit_pct:.1f}% пробило аварийный уровень "
+                f"−{hard_stop_pct:.1f}% - терять больше нельзя")
+            return
+
+        # 2) Тейк-профит.
         if profit_pct >= self._cfg.take_profit_pct:
             await self._sell(ticker, price, position, "тейк-профит", profit_pct,
                              "достигнута цель по прибыли")
             return
-        if profit_pct <= -self._cfg.stop_loss_pct:
+
+        # 3) Трейлинг-стоп: фиксируем большую часть заработанного.
+        if (self._cfg.trailing_activate_pct > 0
+                and max_profit >= self._cfg.trailing_activate_pct
+                and profit_pct <= max_profit - self._cfg.trailing_drop_pct):
+            await self._sell(
+                ticker, price, position, "трейлинг-стоп", profit_pct,
+                f"прибыль доходила до +{max_profit:.1f}%, но цена откатилась - "
+                f"фиксирую остаток, пока он не превратился в убыток")
+            return
+
+        # 4) Стоп-лосс с подтверждением и правом вето ИИ.
+        if profit_pct <= -stop_pct:
+            seen = int(position.get("sl_confirm", 0) or 0)
+            if seen + 1 >= max(1, self._cfg.sl_confirm_cycles):
+                await self._sell(
+                    ticker, price, position, "стоп-лосс", profit_pct,
+                    f"цена держится ниже стоп-уровня уже {seen + 1} "
+                    f"проверк(и) подряд - убыток подтверждаю и продаю")
+                return
+            # Первый цикл ниже стопа: ИИ может отложить продажу,
+            # если видит восстановление (локальный прокол, а не тренд).
+            verdict = None
+            if self._cfg.llm_decisions_enabled:
+                verdict = await self._sl_verdict(ticker, price, position,
+                                                 profit_pct)
+            if verdict and verdict["action"] == "sell":
+                await self._sell(
+                    ticker, price, position, "решение ИИ на стопе", profit_pct,
+                    verdict["reason"] or "тренд сломан - продаю не откладывая")
+                return
+            if (verdict and verdict["action"] == "hold"
+                    and verdict["confidence"] >= self._cfg.sl_veto_confidence):
+                self._state.set_position(
+                    ticker, {**position, "sl_confirm": seen + 1})
+                log.info("%s: стоп-лосс достигнут (%.2f%%), но ИИ ждёт отскок "
+                         "(%.0f%%): %s - откладываю продажу на цикл",
+                         ticker, profit_pct, verdict["confidence"] * 100,
+                         verdict["reason"])
+                await self._safe_notify(
+                    f"⏳ {ticker}: цена дошла до стоп-лосса "
+                    f"({profit_pct:+.2f}%), но ИИ-трейдер видит признаки "
+                    f"восстановления и советует подождать: "
+                    f"«{verdict['reason']}».\nПроверю ещё раз через "
+                    f"{self._cfg.poll_interval_sec // 60} мин; если цена "
+                    f"останется ниже стопа - продам без уговоров.")
+                return
+            # ИИ недоступен или не уверен - продаём по классике.
             await self._sell(ticker, price, position, "стоп-лосс", profit_pct,
                              "достигнут предел убытка")
             return
 
-        # Скилл "ранний выход": LLM может предложить продать раньше цели,
-        # если аргументы против роста перевесили. Частота пересмотра и
-        # требуемая уверенность зависят от активности: в активном режиме ИИ
-        # смотрит позиции чаще (кэш 10-30 мин) и готов фиксировать и
-        # небольшой минус, пока убыток не доехал до стоп-лосса.
-        act = self._activity()
-        review_wanted = (profit_pct > 0.5
-                         or (act >= 60
-                             and profit_pct > -self._cfg.stop_loss_pct / 2.0))
-        if self._cfg.llm_decisions_enabled and review_wanted:
+        # Цена восстановилась выше стопа - счётчик подтверждения сбрасываем.
+        if position.get("sl_confirm"):
+            log.info("%s: цена вернулась выше стоп-уровня - продажа отменена, "
+                     "продолжаю охранять позицию", ticker)
+            self._state.set_position(ticker, {**position, "sl_confirm": 0})
+
+        # 5) Досрочный выход по ИИ - только при прибыли.
+        if (self._cfg.llm_decisions_enabled
+                and profit_pct >= self._cfg.llm_early_sell_min_profit_pct):
             decision = self._llm_cache.get(ticker)
             fresh = decision and (time.monotonic() - decision[0]) < self._llm_ttl_sec()
             if not fresh:
@@ -518,6 +666,41 @@ class TradingEngine:
                 await self._sell(ticker, price, position, "решение ИИ", profit_pct,
                                  verdict["reason"])
 
+    async def _sl_verdict(self, ticker: str, price: float,
+                          position: Dict[str, Any],
+                          profit_pct: float) -> Optional[dict]:
+        """Спрашивает ИИ-трейдера у стоп-лосса: продавать или дать отскок.
+
+        Это единственное место, где ИИ может помешать продаже в убыток:
+        и то лишь один цикл и при высокой уверенности (SL_VETO_CONFIDENCE).
+        """
+        try:
+            sma_h = self._sma_hours()
+            step_h = self._candle_step_h(sma_h)
+            fast_n = self._fast_n(sma_h, step_h)
+            history = await self._client.get_candles_history(
+                ticker, self._fetch_hours(fast_n, step_h), step_h)
+            closes = [p for _, p in history]
+            summary = (indicators.summarize_generic(closes, price, fast_n, step_h)
+                       if len(closes) >= self._min_candles(fast_n) else {})
+            sentiment = await self._get_sentiment(ticker)
+            extra = (
+                f"СТОП-ЛОСС ДОСТИГНУТ: текущий результат {profit_pct:+.2f}%, "
+                f"предел убытка −{self._cfg.stop_loss_pct:.1f}%. Решается "
+                f"вопрос: продать сразу или дать один цикл на отскок. "
+                f"Если видишь локальное восстановление (цена возвращается к "
+                f"средней, импульс вниз затухает) - держи; если тренд сломан "
+                f"или падение продолжается - продавай. Не откладывай продажу "
+                f"без сильных аргументов: убыток глубже стопа расти не должен.")
+            brief = self._build_brief(ticker, price, summary, sentiment,
+                                      position=position, history=history,
+                                      extra=extra)
+            return await self._analyst.analyze_market(brief)
+        except Exception as exc:  # noqa: BLE001 - сбой ИИ = решаем по правилу
+            log.warning("%s: ИИ не смог оценить стоп-лосс (%s) - решаю по "
+                        "правилу", ticker, exc)
+            return None
+
     async def _sell(self, ticker: str, price: float, position: Dict[str, Any],
                     reason: str, profit_pct: float, detail: str) -> None:
         lots = int(position.get("lots", 0) or 0)
@@ -537,12 +720,50 @@ class TradingEngine:
         log.info("%s, ордер %s исполнено лотов: %s",
                  short, result.get("order_id"), result.get("lots_executed"))
 
+        # Запоминаем сделку - это база "учёта ошибок" (trade_memory.py).
+        lesson = ""
+        if self._cfg.learning_enabled and self._memory is not None:
+            try:
+                self._memory.record(
+                    ticker=ticker, entry_price=entry, exit_price=price,
+                    lots=lots, lot_size=lot_size, reason=reason,
+                    profit_pct=profit_pct,
+                    entry_ts_str=str(position.get("entry_ts", "")))
+                streak = self._memory.loss_streak(ticker)
+                if pnl < 0 and streak >= 2:
+                    if streak >= 3 and self._cfg.loss_streak_pause_h > 0:
+                        lesson = (
+                            f"\n\n🧠 Урок: это {streak}-й убыток подряд по "
+                            f"{ticker}. Запомнил - ставлю покупки этой бумаги "
+                            f"на паузу примерно "
+                            f"{self._cfg.loss_streak_pause_h:.0f} ч и вернусь "
+                            f"к ней только с заметно более сильным сигналом.")
+                    else:
+                        lesson = (
+                            f"\n\n🧠 Урок: это {streak}-й убыток подряд по "
+                            f"{ticker}. Запомнил - следующая покупка по ней "
+                            f"только если сигнал заметно сильнее обычного "
+                            f"(порог поднят на "
+                            f"{self._memory.threshold_bump(ticker):.2f}).")
+            except Exception as exc:  # noqa: BLE001 - память не должна ломать сделки
+                log.warning("%s: не удалось записать сделку в память: %s",
+                            ticker, exc)
+
         if reason == "тейк-профит":
             reason_human = ("сработала цель «тейк-профит» - цена выросла до "
                             "запланированной, фиксирую прибыль")
+        elif reason == "аварийный стоп-лосс":
+            reason_human = ("падение пробило аварийный предел глубже обычного "
+                            "стоп-лосса - продаю немедленно, чтобы убыток не "
+                            "разросся")
         elif reason == "стоп-лосс":
-            reason_human = ("сработала страховка «стоп-лосс» - цена упала "
-                            "слишком сильно, продаю, чтобы потеря не выросла")
+            reason_human = ("цена упала ниже стоп-уровня и не восстановилась "
+                            "за несколько проверок - фиксирую убыток, чтобы "
+                            "он не вырос ещё больше")
+        elif reason == "трейлинг-стоп":
+            reason_human = ("прибыль уже поднималась заметно выше, но цена "
+                            "поехала обратно - фиксирую оставшуюся прибыль, "
+                            "пока откат не съел её целиком")
         else:
             reason_human = f"ИИ-трейдер предложил закрыть позицию заранее: {detail}"
         emoji = "💰" if pnl >= 0 else "🩹"
@@ -554,6 +775,7 @@ class TradingEngine:
             f"Итог сделки: купил по {entry:.2f} ₽, продал по {price:.2f} ₽ → "
             f"{'прибыль' if pnl >= 0 else 'убыток'} "
             f"{'+' if pnl >= 0 else '−'}{_fmt_rub(abs(pnl))} ₽ {emoji}"
+            + lesson
         )
         await self._safe_notify(friendly)
 
@@ -561,7 +783,8 @@ class TradingEngine:
     def _build_brief(self, ticker: str, price: float,
                      summary: Dict[str, Optional[float]], sentiment: float,
                      position: Optional[Dict[str, Any]] = None,
-                     history: Optional[List[Tuple[float, float]]] = None) -> str:
+                     history: Optional[List[Tuple[float, float]]] = None,
+                     extra: Optional[str] = None) -> str:
         """Сводка для трейдера-LLM: индикаторы + путь цены в масштабе
         активности + новости + память прошлых решений."""
         name = self._client.instrument_name(ticker)
@@ -643,6 +866,15 @@ class TradingEngine:
         if news_items:
             lines.append("Свежие новости (заголовки):")
             lines.extend(f"- {item[:150]}" for item in news_items[:5])
+        if extra:
+            lines.append(extra)
+        # Память о завершённых сделках: ИИ видит, чем кончались его прошлые
+        # решения по этой бумаге, и не повторяет ошибок (скилл рефлексии).
+        if self._cfg.learning_enabled and self._memory is not None:
+            try:
+                lines.extend(self._memory.lesson_lines(ticker))
+            except Exception:  # noqa: BLE001 - память не должна ломать промпт
+                pass
         lines.append("\nДай вердикт строго JSON: "
                      '{"action": "buy|sell|hold", "confidence": 0.0-1.0, '
                      '"reason": "коротко по-русски"}.')
@@ -658,6 +890,15 @@ class TradingEngine:
             return
         self._skip_notify_ts[ticker] = time.monotonic()
         await self._safe_notify(f"🤔 {ticker}: сигнал был, но покупку отложил.\n{detail}")
+
+    async def _memory_notify(self, ticker: str, text: str) -> None:
+        """Уведомление от "памяти" (паузы/плохие часы) - не чаще одного
+        сообщения за 30 минут на тикер, чтобы не заспамить администратора."""
+        last = self._memory_notify_ts.get(ticker)
+        if last is not None and (time.monotonic() - last) < _SKIP_NOTIFY_TTL_SEC:
+            return
+        self._memory_notify_ts[ticker] = time.monotonic()
+        await self._safe_notify(text)
 
     async def _get_llm_decision(self, ticker: str, price: float,
                                 summary: Dict[str, Optional[float]], score: float,
@@ -740,6 +981,13 @@ class TradingEngine:
                 f"{portfolio['cash']:.0f} ₽.")
         except Exception as exc:  # noqa: BLE001
             lines.append(f"Счёт: узнать не удалось ({exc}).")
+
+        # Память сделок: результат сегодня и что бот выучил из ошибок.
+        if self._cfg.learning_enabled and self._memory is not None:
+            try:
+                lines.append("Память сделок: " + self._memory.short_line())
+            except Exception:  # noqa: BLE001
+                pass
 
         positions = self._state.positions
         if positions:
@@ -829,10 +1077,17 @@ class TradingEngine:
         aggr = self._state.aggressiveness()
         act = self._activity()
         info = self.activity_info()
+        memory_txt = ""
+        if self._cfg.learning_enabled and self._memory is not None:
+            try:
+                memory_txt = (f", результат сегодня "
+                              f"{self._memory.today_realized_pnl():+.0f} ₽")
+            except Exception:  # noqa: BLE001
+                memory_txt = ""
         return (f"проверок рынка: {self._cycles_done}, держится позиций: "
                 f"{len(self._state.positions)}, агрессивность: {aggr}/100, "
                 f"активность: {act}/100 (средняя ~{info['sma_hours']:g} ч, "
                 f"свечи {info['step_min']} мин) "
                 f"(порог сигнала {self._score_threshold():.2f}), "
                 f"покупок сегодня: {self._state.buys_today()}/"
-                f"{self._max_buys_today()}")
+                f"{self._max_buys_today()}{memory_txt}")

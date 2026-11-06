@@ -35,6 +35,7 @@ from ai_analyst import AIAnalyst, set_default_analyst
 from config import BotConfig, ConfigError, StateStore, load_config
 from telegram_bot import AppContext, VERSION, build_dispatcher, send_admin_message
 from tinkoff_client import TinkoffClient
+from trade_memory import TradeMemory
 from trading_engine import TradingEngine
 
 log = logging.getLogger("main")
@@ -110,6 +111,11 @@ def _print_banner(config: BotConfig, state: StateStore) -> None:
              state.aggressiveness(), state.activity())
     log.info("SL %.1f%% / TP %.1f%% | позиция <= %.1f%% свободных средств",
              config.stop_loss_pct, config.take_profit_pct, config.max_position_pct)
+    log.info("Обучение на ошибках: %s | дневной лимит убытка %.1f%% | "
+             "пауза бумаге после 3 убытков %.1f ч | SL подтверждение %d цикл(а)",
+             "вкл" if config.learning_enabled else "выкл",
+             config.daily_loss_limit_pct, config.loss_streak_pause_h,
+             config.sl_confirm_cycles)
     log.info("Groq-модель: %s | аудит каждые %d сек",
              config.groq_model, config.audit_interval_sec)
     log.info("=" * 60)
@@ -134,11 +140,16 @@ async def async_main() -> int:
     client = TinkoffClient(config, state)
     analyst = AIAnalyst(config)
     set_default_analyst(analyst)  # модульная функция analyze_sentiment()
+    # Долговременная память сделок: каждая закрытая сделка запоминается,
+    # из убытков выводятся правила (паузы, пороги, плохие часы).
+    memory = TradeMemory(os.path.join(config.data_dir, "trade_memory.json"),
+                         max_trades=config.memory_max_trades)
 
     async def notify_admin(text: str) -> None:
         await send_admin_message(bot, config.telegram_admin_id, text)
 
-    engine = TradingEngine(config, state, client, analyst, notify_admin)
+    engine = TradingEngine(config, state, client, analyst, notify_admin,
+                           memory=memory)
     auditor = AIAuditor(config, state, analyst, notify_admin)
 
     # TELEGRAM_API_BASE: если api.telegram.org недоступен с VPS (блокировка
@@ -157,7 +168,7 @@ async def async_main() -> int:
         bot = Bot(token=config.telegram_bot_token)
     ctx = AppContext(
         config=config, state=state, client=client, analyst=analyst,
-        engine=engine, auditor=auditor, bot=bot,
+        engine=engine, auditor=auditor, bot=bot, memory=memory,
         started_monotonic=time.monotonic(),
         shutdown_event=None,  # присвоим ниже, после создания события
     )
