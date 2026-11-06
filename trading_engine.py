@@ -182,9 +182,44 @@ class TradingEngine:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001
-                log.error("Ошибка обработки %s: %s", ticker, exc)
+                if "30079" in str(exc) or "недоступен для торгов" in str(exc):
+                    # INVALID_ARGUMENT 30079 = "instrument is not available for
+                    # trading" - рынок закрыт. Не страшная ошибка, а расписание.
+                    log.warning("%s: брокер не принял заявку - рынок закрыт "
+                                "(инструмент недоступен для торгов). Повторю "
+                                "в следующем цикле.", ticker)
+                else:
+                    log.error("Ошибка обработки %s: %s", ticker, exc)
+
+    async def _market_closed(self, ticker: str) -> bool:
+        """True - биржа точно закрыта по этой бумаге (пауза до открытия).
+
+        Источник правды - T-Invest GetTradingStatus (v1.6.1). Раньше ночью
+        движок честно доходил до ордера и ловил INVALID_ARGUMENT 30079
+        ("instrument is not available for trading"): сейчас таких попыток
+        просто не будет. Fail-open: статус неизвестен (None/ошибка/старый
+        фейковый клиент в тестах) -> False, торговля идёт как раньше.
+        """
+        checker = getattr(self._client, "is_tradable", None)
+        if checker is None:
+            return False
+        try:
+            tradable = await checker(ticker)
+        except Exception as exc:  # noqa: BLE001 - статус не роняет цикл
+            log.info("%s: не удалось проверить торговый статус (%s) - работаю",
+                     ticker, exc)
+            return False
+        if tradable is False:
+            log.info("%s: рынок сейчас закрыт (сессия не идёт) - жду открытия",
+                     ticker)
+            return True
+        return False
 
     async def _process_ticker(self, ticker: str) -> None:
+        # Вне торговой сессии не дёргаем ни цены, ни свечи, ни LLM, ни ордера:
+        # всё равно брокер отклонит заявку (30079), а Groq-квота съестся зря.
+        if await self._market_closed(ticker):
+            return
         price = await self._client.get_price(ticker)
         if not price or price <= 0:
             log.info("%s: нет актуальной цены - пропуск", ticker)
@@ -915,6 +950,11 @@ class TradingEngine:
                 not self._client.ensure_instrument(ticker):
             return (f"❌ Тикер {ticker} не найден на Мосбирже "
                     f"(проверьте написание, например SBER, GAZP, LKOH).")
+        if await self._market_closed(ticker):
+            return (f"⏳ {ticker}: рынок сейчас закрыт (сессия не идёт) - "
+                    f"заявку не отправляю, брокер её всё равно отклонил бы. "
+                    f"Основная сессия: 10:00-18:40 МСК, вечерняя: 19:05-23:50 "
+                    f"(Пн-Пт). Пришлите команду в торговое время.")
         if ticker in self._state.positions:
             pos = self._state.positions[ticker]
             return (f"❌ По {ticker} уже открыта позиция "
@@ -1004,6 +1044,11 @@ class TradingEngine:
                 not self._client.ensure_instrument(ticker):
             return (f"❌ Тикер {ticker} не найден на Мосбирже "
                     f"(проверьте написание, например SBER, GAZP, LKOH).")
+        if await self._market_closed(ticker):
+            return (f"⏳ {ticker}: рынок сейчас закрыт (сессия не идёт) - "
+                    f"заявку не отправляю, брокер её всё равно отклонил бы. "
+                    f"Основная сессия: 10:00-18:40 МСК, вечерняя: 19:05-23:50 "
+                    f"(Пн-Пт). Пришлите команду в торговое время.")
         try:
             units = int(units) if units is not None else None
         except (TypeError, ValueError):

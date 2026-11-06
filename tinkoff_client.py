@@ -49,6 +49,7 @@ try:
         MoneyValue,
         OrderDirection,
         OrderType,
+        SecurityTradingStatus,
     )
     from t_tech.invest.exceptions import InvestError
     from t_tech.invest.sandbox.async_client import AsyncSandboxClient
@@ -72,6 +73,7 @@ except ImportError as exc:  # pragma: no cover - путь только для dr
     MoneyValue = None  # type: ignore[assignment]
     OrderDirection = None  # type: ignore[assignment]
     OrderType = None  # type: ignore[assignment]
+    SecurityTradingStatus = None  # type: ignore[assignment]
     InvestError = Exception  # type: ignore[assignment,misc]
     candle_interval_to_timedelta = lambda interval: timedelta(hours=1)  # type: ignore  # noqa: E731
     decimal_to_quotation = lambda value: None  # type: ignore  # noqa: E731
@@ -492,6 +494,37 @@ class TinkoffClient:
             return None
         price = quotation_to_decimal(response.last_prices[0].price)
         return float(price) if price else None
+
+    async def is_tradable(self, ticker: str) -> Optional[bool]:
+        """Открыта ли сейчас торговая сессия по бумаге (v1.6.1).
+
+        True  - NORMAL_TRADING и API-торговля разрешена: можно ставить ордера;
+        False - сессия закрыта/выходной/бумага недоступна. Именно это было
+                источником INVALID_ARGUMENT 30079 ночью: официальное значение
+                кода - "instrument is not available for trading";
+        None  - статус неизвестен (ошибка API/нет SDK): вызывающий код работает
+                по-старому (fail-open) - статус не должен остановить торговлю.
+        """
+        instrument = self._instruments.get(ticker)
+        if instrument is None:
+            return None
+        if SecurityTradingStatus is None:      # SDK не установлен (dry-run)
+            return None
+        try:
+            response = await self._call(
+                "get_trading_status",
+                lambda: self._api.market_data.get_trading_status(
+                    figi=instrument["figi"]),
+            )
+        except TinkoffClientError as exc:
+            log.warning("%s: торговый статус недоступен (%s) - считаю торгуемой",
+                        ticker, exc)
+            return None
+        api_ok = bool(getattr(response, "api_trade_available_flag", True))
+        status = getattr(response, "trading_status", None)
+        normal = (status == SecurityTradingStatus
+                  .SECURITY_TRADING_STATUS_NORMAL_TRADING)
+        return bool(api_ok and normal)
 
     async def get_closes(self, ticker: str, *, count: int) -> List[float]:
         """

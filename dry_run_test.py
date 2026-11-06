@@ -107,6 +107,10 @@ class FakeClient:
     def instrument_name(self, ticker: str) -> str:
         return "Сбербанк" if ticker == "SBER" else ticker
 
+    async def is_tradable(self, ticker: str) -> bool | None:
+        """Фейковый торговый статус: сессия всегда открыта (v1.6.1)."""
+        return True
+
     async def get_price(self, ticker: str) -> float:
         return self.price
 
