@@ -176,6 +176,9 @@ class TinkoffClient:
         self._account_id: Optional[str] = None
         self._instruments: Dict[str, Dict[str, Any]] = {}   # ticker -> {figi, lot, name}
         self._ticker_by_figi: Dict[str, str] = {}
+        # Полная вселенная акций основного режима торгов TQBR (~250 бумаг):
+        # нужна сканеру и ручным сделкам (/buy любой бумаги без рестарта).
+        self._universe: Dict[str, Dict[str, Any]] = {}
         self._limiter = _RateLimiter(config.rate_limit_rpm)
         self._switch_lock = asyncio.Lock()
         self._http: Optional[aiohttp.ClientSession] = None
@@ -235,6 +238,7 @@ class TinkoffClient:
         self._account_id = None
         self._instruments.clear()
         self._ticker_by_figi.clear()
+        self._universe.clear()
 
     async def _connect(self) -> None:
         use_sandbox = self._state.use_sandbox
@@ -302,7 +306,7 @@ class TinkoffClient:
         log.info("Песочница пополнена на %.2f руб.", amount_rub)
 
     async def _load_instruments(self) -> None:
-        """Кэш figi/лот/название для тикеров из конфига (1 запрос при старте)."""
+        """Кэш figi/лот/название: полный список TQBR + рабочие тикеры конфига."""
         response = await self._call(
             "instruments.shares",
             lambda: self._api.instruments.shares(
@@ -310,24 +314,39 @@ class TinkoffClient:
             ),
         )
         wanted = set(self._cfg.trading_tickers)
+        universe: Dict[str, Dict[str, Any]] = {}
         found: Dict[str, Dict[str, Any]] = {}
         for share in response.instruments:
-            if share.ticker not in wanted:
-                continue
-            # Основная площадка МосБиржи - TQBR; берём её, а прочие классы - в резерв.
-            if share.class_code == "TQBR" or share.ticker not in found:
+            info = {
+                "figi": share.figi,
+                "lot": int(share.lot) or 1,
+                "name": (share.name or "").strip(),
+                "class_code": share.class_code,
+            }
+            # Основная площадка МосБиржи - TQBR; прочие классы храним в резерве.
+            if share.class_code == "TQBR" or share.ticker not in universe:
+                universe[share.ticker] = info
+            if share.ticker in wanted and (
+                    share.class_code == "TQBR" or share.ticker not in found):
+                found[share.ticker] = info
+        # Предпочитаем TQBR: перезаписываем найденное по другим класс-кодам.
+        for share in response.instruments:
+            if share.class_code == "TQBR" and share.ticker in found:
                 found[share.ticker] = {
                     "figi": share.figi,
                     "lot": int(share.lot) or 1,
                     "name": (share.name or "").strip(),
                     "class_code": share.class_code,
                 }
+        self._universe = universe
         self._instruments = found
         self._ticker_by_figi = {info["figi"]: t for t, info in found.items()}
         missing = wanted - set(found)
         if missing:
             log.warning("Тикеры не найдены на MOEX (проверьте написание): %s",
                         ", ".join(sorted(missing)))
+        log.info("Вселенная бумаг TQBR: %d шт (рабочих тикеров: %d)",
+                 len(universe), len(found))
 
     # ------------------------------------------------------- вызов API с retry
     async def _call(
@@ -375,6 +394,82 @@ class TinkoffClient:
         raise TinkoffClientError(f"{what}: не удалось после {tries} попыток: {last_error}")
 
     # ------------------------------------------------------------------- рынок
+    def universe(self) -> Dict[str, Dict[str, Any]]:
+        """Все известные бумаги TQBR (тикер -> figi/лот/название)."""
+        return dict(self._universe)
+
+    def ensure_instrument(self, ticker: str) -> bool:
+        """Подключает тикер к работе (из вселенной TQBR) или сообщает, что нет.
+
+        Нужен для ручных сделок и сканера: бумага может не быть в списке
+        конфига, но figi/лот у клиента уже есть - просто активируем кэш.
+        """
+        ticker = (ticker or "").strip().upper()
+        if ticker in self._instruments:
+            return True
+        info = self._universe.get(ticker)
+        if not info:
+            return False
+        self._instruments[ticker] = info
+        self._ticker_by_figi[info["figi"]] = ticker
+        log.info("Тикер %s подключён к работе из вселенной TQBR", ticker)
+        return True
+
+    #: Открытый API МосБиржи: весь режим TQBR одним запросом, без ключей.
+    MOEX_ISS_URL = ("https://iss.moex.com/iss/engines/stock/markets/shares"
+                    "/boards/TQBR/securities.json")
+
+    async def get_market_snapshot(self) -> List[Dict[str, Any]]:
+        """Снимок всего рынка TQBR одним HTTP-запросом (без ключей и лимитов).
+
+        Возвращает список {ticker, price, day_chg_pct, turnover}:
+        turnover - оборот за сегодня в рублях (важно для фильтра неликвида).
+        Ошибка сети/формата -> TinkoffClientError (сканер покажет пропуск).
+        """
+        url = (self.MOEX_ISS_URL
+               + "?iss.meta=off&iss.only=securities"
+                 "&securities.columns=SECID,PREVPRICE,LAST,LASTTOPREVPRICE,VALTODAY")
+        if self._http is None:
+            raise TinkoffClientError("HTTP-сессия ещё не открыта (client.start())")
+        try:
+            async with self._http.get(url) as response:
+                if response.status != 200:
+                    raise TinkoffClientError(f"MOEX ISS: HTTP {response.status}")
+                payload = await response.json(content_type=None)
+        except TinkoffClientError:
+            raise
+        except (asyncio.TimeoutError, aiohttp.ClientError, OSError, ValueError) as exc:
+            raise TinkoffClientError(f"MOEX ISS недоступен: {exc}") from exc
+
+        block = payload.get("securities", {}) if isinstance(payload, dict) else {}
+        cols = block.get("columns", []) or []
+        idx = {name: i for i, name in enumerate(cols)}
+        if "SECID" not in idx:
+            raise TinkoffClientError("MOEX ISS: неожиданный формат ответа")
+
+        def _num(row: list, name: str) -> float:
+            if name not in idx:
+                return 0.0
+            value = row[idx[name]]
+            try:
+                return float(value) if value is not None else 0.0
+            except (TypeError, ValueError):
+                return 0.0
+
+        out: List[Dict[str, Any]] = []
+        for row in block.get("data", []) or []:
+            secid = row[idx["SECID"]]
+            if not secid:
+                continue
+            out.append({
+                "ticker": str(secid),
+                "price": _num(row, "LAST") or _num(row, "PREVPRICE"),
+                "day_chg_pct": _num(row, "LASTTOPREVPRICE"),
+                "turnover": _num(row, "VALTODAY"),
+            })
+        log.info("Снимок MOEX ISS: %d бумаг", len(out))
+        return out
+
     def get_lot_size(self, ticker: str) -> int:
         """Размер лота бумаги из кэша инструментов (1, если тикер неизвестен)."""
         return int(self._instruments.get(ticker, {}).get("lot", 1))

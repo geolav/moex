@@ -1,5 +1,5 @@
 """
-dry_run_test.py - самопроверка всего бота v1.4.0 на МАКЕТАХ без сети и токенов.
+dry_run_test.py - самопроверка всего бота v1.6.0 на МАКЕТАХ без сети и токенов.
 
 Проверяет ключевую логику ДО выхода на реальные деньги:
   1. торговый движок: сигнал + сентимент + LLM 'buy' -> покупка;
@@ -69,6 +69,14 @@ def make_test_config(tmp: str) -> BotConfig:
         audit_log_lines=50, sentiment_ttl_sec=60,
         llm_decisions_enabled=True,
         trade_cooldown_min=120, max_buys_per_day=25,
+        learning_enabled=True, memory_max_trades=400,
+        daily_loss_limit_pct=2.0, loss_streak_pause_h=4.0,
+        sl_confirm_cycles=2, sl_veto_confidence=0.60,
+        hard_sl_mult=1.5, trailing_activate_pct=2.0, trailing_drop_pct=1.5,
+        llm_early_sell_min_profit_pct=0.5,
+        harvest_tiers=((8.0, 0.25), (5.0, 0.4), (3.0, 0.7)),
+        scan_enabled=False, scan_interval_min=10, scan_min_turnover=50.0,
+        scan_min_price=5.0, scan_deep_n=20, scan_report_top=6, scan_llm=False,
         rate_limit_rpm=90,
         news_rss_urls=("https://example.invalid/rss",), http_timeout_sec=5,
         sandbox_start_balance=100000.0, cleanup_keep_days=14,
@@ -156,7 +164,7 @@ class FakeAnalyst:
 
 async def main() -> int:
     print("=" * 64)
-    print("DRY-RUN самопроверка MOEX Trading Bot v1.4.0 (моки, без сети)")
+    print("DRY-RUN самопроверка MOEX Trading Bot v1.6.0 (моки, без сети)")
     print("=" * 64)
 
     tmp = tempfile.mkdtemp(prefix="bot_dryrun_")

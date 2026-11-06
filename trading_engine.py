@@ -79,6 +79,35 @@ def _human_sentiment(score: float) -> str:
     return "нейтральные"
 
 
+def harvest_signal(max_profit_pct: float, profit_pct: float,
+                   tiers: Tuple[Tuple[float, float], ...]
+                   ) -> Optional[Tuple[float, float]]:
+    """Умная фиксация прибыли: чем выше был пик, тем меньший откат терпим.
+
+    tiers - пары (пик %, допуск отката в пунктах), отсортированы по убыванию
+    пика. Возвращает пару (допуск_отката_пп, порог_пика), если пик прибыли
+    дорос до какого-то тира, иначе None. Само решение о продаже принимает
+    движок: откат от пика >= допуска и прибыль всё ещё в плюсе.
+
+    Пример (тиры 8:0.25, 5:0.4, 3:0.7): пик +8.4% -> возвращается (0.25, 8.0),
+    то есть продадим уже при падении на 0.25 п.п. от максимума.
+    """
+    if max_profit_pct <= 0 or profit_pct <= 0:
+        return None
+    for peak, drop_pp in tiers:
+        if max_profit_pct >= peak:
+            return (drop_pp, peak)
+    return None
+
+
+def _fmt_tiers(tiers: Tuple[Tuple[float, float], ...]) -> str:
+    """Тиры человеческим языком: 'пик ≥3%: откат 0.7 п.п.; пик ≥5%: 0.4 п.п.'."""
+    if not tiers:
+        return "выключена"
+    return "; ".join(f"пик ≥{peak:g}% - откат {drop:g} п.п."
+                      for peak, drop in sorted(tiers))
+
+
 class TradingEngine:
     """Последовательный торговый цикл: опрос -> индикаторы -> LLM -> сделка."""
 
@@ -104,6 +133,12 @@ class TradingEngine:
         # Анти-спам для уведомлений от "памяти" (паузы/плохие часы/дневной стоп).
         self._memory_notify_ts: Dict[str, float] = {}
         self._cycles_done = 0
+        # Сериализация сделок: цикл движка и ручные команды /buy /sell
+        # не должны ставить ордера одновременно.
+        self._trade_lock = asyncio.Lock()
+        # Список тикеров, изменённый командами /watch /unwatch (переживает
+        # состояние без поддержки watchlist; основной источник - state.json).
+        self._watchlist_override: Optional[List[str]] = None
 
     # -------------------------------------------------------------- жизненный цикл
     def request_stop(self) -> None:
@@ -115,7 +150,7 @@ class TradingEngine:
         log.info("Торговый движок v2 запущен: тикеры %s, период %d сек, "
                  "стратегия: индикаторы + LLM-трейдер, агрессивность %d, "
                  "активность %d (средняя ~%.4g ч, свечи %d мин)",
-                 ",".join(self._cfg.trading_tickers),
+                 ",".join(self.watchlist()),
                  self._cfg.poll_interval_sec, self._state.aggressiveness(),
                  info["activity"], info["sma_hours"], info["step_min"])
         while not self._stop_event.is_set():
@@ -139,7 +174,7 @@ class TradingEngine:
         Ошибка по одному тикеру не останавливает остальные.
         """
         self._cycles_done += 1
-        for ticker in self._cfg.trading_tickers:
+        for ticker in self.watchlist():
             if self._stop_event.is_set():
                 break
             try:
@@ -265,6 +300,70 @@ class TradingEngine:
             "score_threshold": self._score_threshold(),
             "required_confidence": self._required_confidence(),
         }
+
+    # ---------------------------------------------------------------- watchlist
+    def watchlist(self) -> List[str]:
+        """Тикеры под управлением бота: /watch-список или TRADING_TICKERS.
+
+        Источники по приоритету: список, изменённый командами (/watch),
+        сохранённый в state.json (StateStore.watchlist), тикеры из .env.
+        """
+        if self._watchlist_override:
+            return list(self._watchlist_override)
+        getter = getattr(self._state, "watchlist", None)
+        if callable(getter):
+            items = getter()
+            if items:
+                return list(items)
+        return list(self._cfg.trading_tickers)
+
+    def max_tickers(self) -> int:
+        return int(getattr(self._cfg, "max_tickers", 6) or 6)
+
+    async def add_watchlist(self, ticker: str) -> str:
+        """Отдать бумагу под автоматическую торговлю (/watch ТИКЕР)."""
+        ticker = (ticker or "").strip().upper()
+        current = self.watchlist()
+        if ticker in current:
+            return f"{ticker} уже в списке: {', '.join(current)}"
+        if len(current) >= self.max_tickers():
+            return (f"❌ Лимит {self.max_tickers()} бумаг исчерпан - сначала "
+                    f"уберите одну: /unwatch ТИКЕР. Сейчас торгую: "
+                    f"{', '.join(current)}")
+        if hasattr(self._client, "ensure_instrument") and \
+                not self._client.ensure_instrument(ticker):
+            return (f"❌ Тикер {ticker} не найден на Мосбирже "
+                    f"(проверьте написание, например SBER, GAZP, LKOH).")
+        current.append(ticker)
+        self._save_watchlist(current)
+        log.info("Watchlist обновлён (+%s): %s", ticker, ", ".join(current))
+        return (f"✅ {ticker} взят под управление - теперь торгую "
+                f"{len(current)} бумаг(и): {', '.join(current)}")
+
+    async def remove_watchlist(self, ticker: str) -> str:
+        """Убрать бумагу из автоматической торговли (/unwatch ТИКЕР)."""
+        ticker = (ticker or "").strip().upper()
+        current = self.watchlist()
+        if ticker not in current:
+            return f"{ticker} и так не в списке. Торгую: {', '.join(current)}"
+        if ticker in self._state.positions:
+            return (f"❌ По {ticker} открыта позиция - сначала закройте её: "
+                    f"/sell {ticker} (или дождитесь стопа/тейка).")
+        if len(current) <= 1:
+            return "❌ Список не может опустеть совсем - оставьте хотя бы одну бумагу."
+        current.remove(ticker)
+        self._save_watchlist(current)
+        log.info("Watchlist обновлён (-%s): %s", ticker, ", ".join(current))
+        return f"✅ {ticker} убран из торговли. Осталось: {', '.join(current)}"
+
+    def _save_watchlist(self, items: List[str]) -> None:
+        self._watchlist_override = list(items)
+        setter = getattr(self._state, "set_watchlist", None)
+        if callable(setter):
+            try:
+                setter(items)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Не удалось сохранить watchlist в state: %s", exc)
 
     # ------------------------------------------------------------------- вход
     async def _evaluate_entry(self, ticker: str, price: float) -> None:
@@ -511,6 +610,9 @@ class TradingEngine:
             f"Мнение ИИ-трейдера (уверенность {decision['confidence']:.0%}):\n"
             f"«{decision['reason']}»\n\n"
             f"План выхода - сделаю сам:\n"
+            f"• умная фиксация прибыли: чем выше пик роста, тем меньший откат "
+            f"терплю ({_fmt_tiers(getattr(self._cfg, 'harvest_tiers', None) or ())}) - "
+            f"при большом росте продам уже при маленьком падении;\n"
             f"• трейлинг-стоп: если прибыль дорастёт до "
             f"+{self._cfg.trailing_activate_pct:.1f}%, а потом откатится на "
             f"{self._cfg.trailing_drop_pct:.1f}% - зафиксирую заработанное «на спаде»\n"
@@ -571,6 +673,23 @@ class TradingEngine:
             await self._sell(ticker, price, position, "тейк-профит", profit_pct,
                              "достигнута цель по прибыли")
             return
+
+        # 2.5) Умная фиксация прибыли (HARVEST_TIERS): чем выше был пик,
+        # тем меньший откат от него терпим - при сильном росте продаём
+        # уже при крошечном падении (вето ИИ тут НЕ работает: это защита
+        # заработанного, а не убыток).
+        tier = harvest_signal(max_profit, profit_pct,
+                              getattr(self._cfg, "harvest_tiers", None) or ())
+        if tier is not None:
+            drop_pp, peak_cap = tier
+            giveback = max_profit - profit_pct
+            if giveback >= drop_pp:
+                await self._sell(
+                    ticker, price, position, "фиксация прибыли", profit_pct,
+                    f"пик прибыли +{max_profit:.1f}% (порог {peak_cap:.0f}%), "
+                    f"откат {giveback:.2f} п.п. при допуске {drop_pp:.2f} п.п. "
+                    f"- фиксирую, пока заработанное не растаяло")
+                return
 
         # 3) Трейлинг-стоп: фиксируем большую часть заработанного.
         if (self._cfg.trailing_activate_pct > 0
@@ -764,6 +883,10 @@ class TradingEngine:
             reason_human = ("прибыль уже поднималась заметно выше, но цена "
                             "поехала обратно - фиксирую оставшуюся прибыль, "
                             "пока откат не съел её целиком")
+        elif reason == "фиксация прибыли":
+            reason_human = ("рост был сильным, и при высоком пике я продаю "
+                            "уже при крошечном откате - лучше забрать "
+                            "заработанное сейчас, чем смотреть, как оно тает")
         else:
             reason_human = f"ИИ-трейдер предложил закрыть позицию заранее: {detail}"
         emoji = "💰" if pnl >= 0 else "🩹"
@@ -779,7 +902,211 @@ class TradingEngine:
         )
         await self._safe_notify(friendly)
 
-    # ------------------------------------------------------------------ LLM
+    # --------------------------------------------------------- ручные сделки
+    async def force_buy(self, ticker: str, units: int) -> str:
+        """Ручная покупка по приказу владельца (/buy ТИКЕР ШТ).
+
+        Обходит сигналы индикаторов и ИИ (это явное указание человека),
+        но НЕ обходит деньги: проверяются свободные средства, лимит на
+        сделку и общий лимит вложенности. Возвращает текст для ответа.
+        """
+        ticker = (ticker or "").strip().upper()
+        if hasattr(self._client, "ensure_instrument") and \
+                not self._client.ensure_instrument(ticker):
+            return (f"❌ Тикер {ticker} не найден на Мосбирже "
+                    f"(проверьте написание, например SBER, GAZP, LKOH).")
+        if ticker in self._state.positions:
+            pos = self._state.positions[ticker]
+            return (f"❌ По {ticker} уже открыта позиция "
+                    f"({pos.get('lots')} лот(а) по {pos.get('entry_price')} ₽). "
+                    f"Сначала закройте её: /sell {ticker}")
+        try:
+            units = int(units)
+        except (TypeError, ValueError):
+            return "❌ Количество должно быть целым числом штук: /buy ТИКЕР ШТ"
+        if units <= 0:
+            return "❌ Количество должно быть больше нуля: /buy ТИКЕР ШТ"
+        lot_size = self._client.get_lot_size(ticker) or 1
+        lots = units // lot_size
+        if lots < 1:
+            return (f"❌ {ticker}: 1 лот = {lot_size} шт, поэтому {units} шт "
+                    f"не хватает даже на один лот. Пример: /buy {ticker} {lot_size}")
+
+        async with self._trade_lock:
+            price = await self._client.get_price(ticker)
+            if not price or price <= 0:
+                return f"❌ {ticker}: не удалось получить цену - сделка отменена."
+            try:
+                portfolio = await self._client.get_portfolio_summary()
+            except Exception as exc:  # noqa: BLE001
+                return f"❌ Счёт недоступен ({exc}) - сделка отменена."
+            cost = lots * lot_size * price
+            cash = float(portfolio.get("cash", 0) or 0)
+            if cost > cash + 0.01:
+                return (f"❌ Не хватает денег: нужно ≈{_fmt_rub(cost)} ₽, "
+                        f"свободно {_fmt_rub(cash)} ₽.")
+            single_cap = cash * self._cfg.max_position_pct / 100.0
+            if cost > single_cap * 2 + 0.01:
+                return (f"❌ Слишком крупная сделка: ≈{_fmt_rub(cost)} ₽ при "
+                        f"лимите {self._cfg.max_position_pct:.0f}% свободных "
+                        f"(≈{_fmt_rub(single_cap)} ₽; вручную разрешаю максимум "
+                        f"два таких лимита). Уменьшите количество.")
+            invested = 0.0
+            for t, pos in self._state.positions.items():
+                sz = self._client.get_lot_size(t) or 1
+                invested += int(pos.get("lots", 0) or 0) * sz * \
+                    float(pos.get("entry_price", 0) or 0)
+            total_money = cash + invested
+            room = total_money * self._state.max_invested_pct() / 100.0 - invested
+            if cost > room + 0.01:
+                return (f"❌ Лимит вложенности {self._state.max_invested_pct()}%: "
+                        f"в акциях уже ≈{_fmt_rub(invested)} ₽ из "
+                        f"{_fmt_rub(total_money)} ₽, запас {_fmt_rub(max(room, 0.0))} ₽. "
+                        f"Поднять лимит: /set_invested N.")
+            try:
+                result = await self._client.buy(ticker, lots, price=price)
+            except Exception as exc:  # noqa: BLE001
+                return f"❌ Брокер не принял ордер: {exc}"
+            self._state.set_position(ticker, {
+                "lots": lots,
+                "entry_price": round(price, 4),
+                "entry_ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "order_id": result.get("order_id", ""),
+                "max_profit_pct": 0.0,
+                "sl_confirm": 0,
+                "source": "manual",
+            })
+            self._state.set_last_buy_ts(ticker, time.time())
+
+        shares = lots * lot_size
+        short = (f"Купил вручную {ticker}: {lots} лот(а) = {shares} шт "
+                 f"по {price:.2f} ₽")
+        self._state.record_action(short)
+        log.info("%s, ордер %s", short, result.get("order_id"))
+        stop_price = price * (1.0 - self._cfg.stop_loss_pct / 100.0)
+        return (f"✅ РУЧНАЯ ПОКУПКА {ticker}: {lots} лот(а) = {shares} шт "
+                f"по ~{price:.2f} ₽ (≈{_fmt_rub(cost)} ₽).\n"
+                f"Позиция взята под присмотр: аварийный стоп "
+                f"−{self._cfg.stop_loss_pct * self._cfg.hard_sl_mult:.1f}%, "
+                f"стоп-лосс {stop_price:.2f} ₽, тейк-профит "
+                f"+{self._cfg.take_profit_pct:.0f}%, умная фиксация прибыли "
+                f"и трейлинг работают как обычно.")
+
+    async def force_sell(self, ticker: str, units: Optional[int] = None) -> str:
+        """Ручная продажа по приказу владельца (/sell ТИКЕР [ШТ]).
+
+        ШТ не указана - продаём всё. Если у бота позиции нет, пробуем продать
+        бумагу с брокерского счёта (купленную вне бота). Частичная продажа
+        поддерживается. Возвращает текст для ответа.
+        """
+        ticker = (ticker or "").strip().upper()
+        if hasattr(self._client, "ensure_instrument") and \
+                not self._client.ensure_instrument(ticker):
+            return (f"❌ Тикер {ticker} не найден на Мосбирже "
+                    f"(проверьте написание, например SBER, GAZP, LKOH).")
+        try:
+            units = int(units) if units is not None else None
+        except (TypeError, ValueError):
+            return "❌ Количество должно быть целым числом штук: /sell ТИКЕР ШТ"
+        if units is not None and units <= 0:
+            return "❌ Количество должно быть больше нуля (или опустите его, чтобы продать всё)."
+        lot_size = self._client.get_lot_size(ticker) or 1
+
+        async with self._trade_lock:
+            price = await self._client.get_price(ticker)
+            if not price or price <= 0:
+                return f"❌ {ticker}: не удалось получить цену - сделка отменена."
+            position = self._state.positions.get(ticker)
+            if position:
+                pos_lots = int(position.get("lots", 0) or 0)
+                if units is None:
+                    lots = pos_lots
+                else:
+                    lots = units // lot_size
+                    if lots < 1:
+                        return (f"❌ {ticker}: 1 лот = {lot_size} шт - "
+                                f"продать {units} шт нельзя. Минимум: "
+                                f"/sell {ticker} {lot_size}")
+                    lots = min(lots, pos_lots)
+                entry = float(position.get("entry_price", 0) or 0)
+                try:
+                    await self._client.sell(ticker, lots, price=price)
+                except Exception as exc:  # noqa: BLE001
+                    return f"❌ Брокер не принял ордер: {exc}"
+                partial = lots < pos_lots
+                if partial:
+                    self._state.set_position(
+                        ticker, {**position, "lots": pos_lots - lots})
+                else:
+                    self._state.drop_position(ticker)
+                profit_pct = ((price / entry) - 1.0) * 100.0 if entry > 0 else 0.0
+                pnl = (price - entry) * lots * lot_size if entry > 0 else 0.0
+                if self._cfg.learning_enabled and self._memory is not None \
+                        and not partial:
+                    try:
+                        self._memory.record(
+                            ticker=ticker, entry_price=entry, exit_price=price,
+                            lots=lots, lot_size=lot_size,
+                            reason="приказ владельца (вручную)",
+                            profit_pct=profit_pct,
+                            entry_ts_str=str(position.get("entry_ts", "")))
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("%s: сделка не записана в память: %s", ticker, exc)
+                self._state.record_action(
+                    f"Продал вручную {ticker}: {lots} лот(а) по {price:.2f} ₽ "
+                    f"({pnl:+.0f} ₽)")
+                text = (f"✅ РУЧНАЯ ПРОДАЖА {ticker}: {lots} лот(а) = "
+                        f"{lots * lot_size} шт по ~{price:.2f} ₽ → "
+                        f"{profit_pct:+.2f}% "
+                        f"({'+' if pnl >= 0 else '−'}{_fmt_rub(abs(pnl))} ₽).")
+                if partial:
+                    text += (f"\nОсталось в позиции: {pos_lots - lots} лот(а) - "
+                             f"продолжаю охранять.")
+                elif entry > 0:
+                    text += "\nСделка записана в память (/memory) - выводы учтены."
+                return text
+
+            # Позиции у бота нет - пробуем продать с брокерского счёта.
+            try:
+                portfolio = await self._client.get_portfolio_summary()
+            except Exception as exc:  # noqa: BLE001
+                return f"❌ Портфель недоступен ({exc})."
+            held = next((p for p in portfolio.get("positions", [])
+                         if p.get("ticker") == ticker), None)
+            if not held:
+                return (f"❌ {ticker}: нет ни позиции бота, ни бумаги на счёте - "
+                        f"продавать нечего.")
+            avail_units = int(float(held.get("quantity", 0) or 0))
+            want_units = units if units is not None else avail_units
+            lots = min(want_units // lot_size, avail_units // lot_size)
+            if lots < 1:
+                return (f"❌ {ticker}: на счёте {avail_units} шт (лот "
+                        f"{lot_size} шт) - продать {want_units} шт нельзя.")
+            try:
+                await self._client.sell(ticker, lots, price=price)
+            except Exception as exc:  # noqa: BLE001
+                return f"❌ Брокер не принял ордер: {exc}"
+            avg = float(held.get("avg_price", 0) or 0)
+            profit_pct = ((price / avg) - 1.0) * 100.0 if avg > 0 else 0.0
+            pnl = (price - avg) * lots * lot_size if avg > 0 else 0.0
+            if self._cfg.learning_enabled and self._memory is not None and avg > 0:
+                try:
+                    self._memory.record(
+                        ticker=ticker, entry_price=avg, exit_price=price,
+                        lots=lots, lot_size=lot_size,
+                        reason="приказ владельца (вне бота)",
+                        profit_pct=profit_pct)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("%s: сделка не записана в память: %s", ticker, exc)
+            self._state.record_action(
+                f"Продал вручную {ticker} (вне позиций бота): {lots} лот(а) "
+                f"по {price:.2f} ₽")
+            text = (f"✅ Продал {ticker} со счёта: {lots} лот(а) = "
+                    f"{lots * lot_size} шт по ~{price:.2f} ₽.")
+            if avg > 0:
+                text += (f" Средняя покупки {avg:.2f} ₽ → {profit_pct:+.2f}% "
+                         f"({'+' if pnl >= 0 else '−'}{_fmt_rub(abs(pnl))} ₽).")
+            return text
     def _build_brief(self, ticker: str, price: float,
                      summary: Dict[str, Optional[float]], sentiment: float,
                      position: Optional[Dict[str, Any]] = None,
@@ -999,7 +1326,7 @@ class TradingEngine:
         else:
             lines.append("Открытых позиций нет.")
 
-        for ticker in self._cfg.trading_tickers:
+        for ticker in self.watchlist():
             try:
                 price = await self._client.get_price(ticker)
                 if not price or price <= 0:

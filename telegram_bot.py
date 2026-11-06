@@ -4,8 +4,15 @@ telegram_bot.py - Telegram-интерфейс управления (aiogram 3.x)
 Команды (принимаются ТОЛЬКО от администратора из TELEGRAM_ADMIN_ID):
   /start           - сводный статус бота простыми словами;
   /status          - позиции, баланс и последние действия;
-  /stats [часов]   - статистика по отслеживаемым акциям за N часов
-                     (по умолчанию 6) + график-картинка;
+  /positions       - открытые позиции и их текущий результат;
+  /stats [часов]   - статистика по бумагам за N часов + график-картинка;
+  /charts [часов]  - графики ВСЕХ бумаг под управлением (2 фото по 3 графика);
+  /scan            - запустить сканер рынка прямо сейчас (топ кандидатов);
+  /buy ТИКЕР ШТ    - ручная покупка (обходит сигналы ИИ, не обходит деньги);
+  /sell ТИКЕР [ШТ] - ручная продажа (без числа - продать всё);
+  /watchlist       - бумаги под автоматической торговлей (до 6);
+  /watch ТИКЕР     - добавить бумагу под управление;
+  /unwatch ТИКЕР   - убрать бумагу из управления;
   /toggle_trading  - включить/выключить автоматическую торговлю;
   /toggle_sandbox  - переключить песочница <-> реальный счёт
                      (переход в реал требует подтверждения "/toggle_sandbox confirm");
@@ -34,16 +41,25 @@ from aiogram import Bot, Dispatcher, Router
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import BufferedInputFile, Message
 
+import charts
+
 log = logging.getLogger("telegram")
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 
 HELP_TEXT = (
     "Команды:\n"
     "/start - что бот сейчас делает (кратко)\n"
     "/status - деньги, позиции и последние события\n"
+    "/positions - открытые позиции и их текущий результат\n"
     "/stats - статистика и график по акциям за 6 часов\n"
     "/stats 12 - то же за 12 часов (можно 1-48)\n"
+    "/charts - графики всех моих бумаг (2 фото, по 3 графика)\n"
+    "/scan - сканер рынка прямо сейчас: топ кандидатов на покупку\n"
+    "/buy SBER 100 - купить вручную (тикер и штуки, не лоты)\n"
+    "/sell GAZP 30 - продать вручную (без числа - продать всё)\n"
+    "/watchlist - бумаги под автоматической торговлей (до 6)\n"
+    "/watch MTSS - добавить бумагу, /unwatch MTSS - убрать\n"
     "/memory - что бот выучил из своих сделок (винрейт, уроки, плохие часы)\n"
     "/reset_memory - забыть всю память сделок (начать учиться заново)\n"
     "/toggle_trading - вкл/выкл автоматическую торговлю\n"
@@ -59,7 +75,16 @@ HELP_TEXT = (
     "/help - эта справка\n\n"
     "📖 Словарик (чтобы всё было понятно):\n"
     "• Лот - акции продаются не по одной, а пачками. Например, "
-    "1 лот Сбера = 10 акций. «Купил 3 лота» = 30 акций.\n"
+    "1 лот Сбера = 10 акций. «Купил 3 лота» = 30 акций. В /buy и /sell "
+    "указывайте штуки - бот сам пересчитает в лоты.\n"
+    "• Сканер рынка - раз в 10 минут бот просматривает почти весь рынок "
+    "Мосбиржи (ликвидные бумаги с оборотом от десятков миллионов) и "
+    "присылает топ кандидатов на покупку с графиками и вердиктом ИИ. "
+    "Сам он их НЕ покупает: /buy - купить сразу, /watch - отдать под "
+    "автоторговлю.\n"
+    "• Умная фиксация прибыли - если бумага сильно выросла, бот продаёт "
+    "её уже при крошечном падении от пика: чем выше пик, тем меньше "
+    "допуск (пик ≥3% - откат 0.7 п.п., ≥5% - 0.4 п.п., ≥8% - 0.25 п.п.).\n"
     "• Рабочая средняя (SMA) - средняя цена за период, который выбрал бот "
     "через /set_activity (от 1 часа до суток). Стратегия: покупать, когда "
     "цена НИЖЕ этой средней (бумага подешевела), продавать - когда "
@@ -103,6 +128,7 @@ class AppContext:
     auditor: object           # AIAuditor
     bot: Bot
     memory: object = None     # TradeMemory - память о завершённых сделках
+    scanner: object = None    # MarketScanner - фоновый сканер рынка (/scan)
     started_monotonic: float = 0.0
     # Событие остановки: /shutdown его выставляет, main.py видит и глушит бота.
     shutdown_event: object = field(default=None)
@@ -473,6 +499,204 @@ def create_router(ctx: AppContext) -> Router:
             "из них. Дальше снова будет учиться с чистого листа "
             "(запоминать каждую закрытую сделку).")
 
+    # ------------------------------------------------------------------- /buy
+    @router.message(Command("buy"))
+    async def cmd_buy(message: Message,
+                      command: Optional[CommandObject] = None) -> None:
+        """Ручная покупка: /buy SBER 100 (тикер + количество в штуках)."""
+        if not is_admin(message):
+            return
+        ticker, units, err = _parse_ticker_qty(command)
+        if err:
+            await message.answer(err)
+            return
+        wait = await message.answer(
+            f"🛒 Покупаю {ticker} ({units} шт) маркет-ордером...")
+        try:
+            text = await ctx.engine.force_buy(ticker, units)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Ручная покупка /buy не удалась")
+            text = f"❌ Ошибка: {exc}"
+        await wait.edit_text(text)
+
+    # ------------------------------------------------------------------ /sell
+    @router.message(Command("sell"))
+    async def cmd_sell(message: Message,
+                       command: Optional[CommandObject] = None) -> None:
+        """Ручная продажа: /sell GAZP 30 или /sell GAZP (продать всё)."""
+        if not is_admin(message):
+            return
+        ticker, units, err = _parse_ticker_qty(command, allow_empty=True)
+        if err:
+            await message.answer(err)
+            return
+        qty_txt = f"{units} шт" if units else "всё, что есть"
+        wait = await message.answer(f"💸 Продаю {ticker} ({qty_txt})...")
+        try:
+            text = await ctx.engine.force_sell(ticker, units)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Ручная продажа /sell не удалась")
+            text = f"❌ Ошибка: {exc}"
+        await wait.edit_text(text)
+
+    # ------------------------------------------------------------- /positions
+    @router.message(Command("positions"))
+    async def cmd_positions(message: Message) -> None:
+        """Открытые позиции бота с текущим результатом по каждой."""
+        if not is_admin(message):
+            return
+        positions = ctx.state.positions
+        if not positions:
+            await message.answer(
+                "📂 Открытых позиций нет - все деньги свободны. "
+                "Общая картина счёта: /status")
+            return
+        parts = [f"📂 Открытые позиции ({len(positions)}):"]
+        for ticker, pos in positions.items():
+            line = (f"• {ticker}: {pos.get('lots')} лот(а), куплено "
+                    f"{pos.get('entry_ts')} по {pos.get('entry_price')} ₽")
+            line += await _position_pnl_line(ctx, ticker, pos)
+            parts.append(line)
+        parts.append("Закрыть вручную: /sell ТИКЕР ШТ "
+                     "(без числа - продаст всё, что есть).")
+        await message.answer("\n".join(parts))
+
+    # ---------------------------------------------------------------- /charts
+    @router.message(Command("charts"))
+    async def cmd_charts(message: Message,
+                         command: Optional[CommandObject] = None) -> None:
+        """Графики всех бумаг под управлением: 2 фото по 3 графика."""
+        if not is_admin(message):
+            return
+        hours = 24.0
+        if command and command.args:
+            try:
+                hours = float(command.args.strip().rstrip("ч").strip())
+            except ValueError:
+                hours = 24.0
+        hours = max(2.0, min(48.0, hours))
+        tickers = (ctx.engine.watchlist() if ctx.engine is not None
+                   else list(ctx.config.trading_tickers))
+        wait = await message.answer(
+            f"🖼 Строю графики ({', '.join(tickers)}) за {hours:.0f} ч...")
+        histories: Dict[str, list] = {}
+        subtitles: Dict[str, str] = {}
+        for ticker in tickers:
+            try:
+                hist = await ctx.client.get_hourly_history(ticker, hours)
+                live = await ctx.client.get_price(ticker)
+            except Exception as exc:  # noqa: BLE001 - бумага без данных не решает
+                log.info("%s: график недоступен (%s)", ticker, exc)
+                hist, live = [], None
+            # Живая точка "сейчас", чтобы график доходил до текущей цены.
+            if live and (not hist or time.time() - hist[-1][0] > 900):
+                hist = hist + [(time.time(), float(live))]
+            if len(hist) >= 2:
+                prices = [p for _, p in hist]
+                chg = (prices[-1] / prices[0] - 1.0) * 100.0 if prices[0] else 0.0
+                histories[ticker] = hist
+                subtitles[ticker] = f"{chg:+.1f}% за {hours:.0f} ч"
+        if not histories:
+            await wait.edit_text(
+                "Данных для графиков пока нет (биржа не отдала свечи). "
+                "Попробуйте позже или посмотрите цифры: /stats")
+            return
+        items = charts.build_chart_items(histories, sma_period=6,
+                                         subtitles=subtitles)
+        pngs = charts.render_group_pngs(
+            items, per_photo=3,
+            suptitle=(f"Бумаги под управлением, {hours:.0f} ч "
+                      "(оранжевый пунктир - средняя 6 ч, "
+                      "красный - цена покупки)"),
+            positions=dict(ctx.state.positions))
+        if not pngs:
+            await wait.edit_text(
+                "matplotlib не установлен - графики недоступны. "
+                "Цифры по-прежнему работают: /stats")
+            return
+        try:
+            await wait.delete()
+            for i, png in enumerate(pngs):
+                await message.answer_photo(
+                    BufferedInputFile(png, filename=f"charts-{i + 1}.png"))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Не удалось отправить графики: %s", exc)
+            await message.answer(
+                "Не получилось отправить картинки - попробуйте ещё раз.")
+
+    # ------------------------------------------------------------------ /scan
+    @router.message(Command("scan"))
+    async def cmd_scan(message: Message) -> None:
+        """Сканер рынка прямо сейчас: снимок всей биржи + топ кандидатов."""
+        if not is_admin(message):
+            return
+        if ctx.scanner is None:
+            await message.answer(
+                "Сканер не запущен (SCAN_ENABLED=False в настройках "
+                "или модуль не подключён).")
+            return
+        wait = await message.answer(
+            "🔎 Сканирую рынок: снимок всей биржи, свечи по пулу бумаг, "
+            "вердикты ИИ. Обычно до минуты - отчёт придёт следующим "
+            "сообщением с двумя картинками.")
+        try:
+            text = await ctx.scanner.scan_once(manual=True)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Ручной скан /scan не удался")
+            await wait.edit_text(f"❌ Скан не удался: {exc}")
+            return
+        if text.startswith("⏳"):
+            await wait.edit_text(text)
+        else:
+            await wait.edit_text("✅ Готово - отчёт и графики выше.")
+
+    # ------------------------------------------------------------- /watchlist
+    @router.message(Command("watchlist"))
+    async def cmd_watchlist(message: Message) -> None:
+        """Какие бумаги бот ведёт под автоматической торговлей."""
+        if not is_admin(message):
+            return
+        tickers = ctx.engine.watchlist()
+        positions = ctx.state.positions
+        cap = ctx.engine.max_tickers()
+        lines = [f"📋 Под управлением ({len(tickers)}/{cap}):"]
+        for ticker in tickers:
+            mark = " - есть позиция" if ticker in positions else ""
+            lines.append(f"• {ticker}{mark}")
+        lines.append("Добавить: /watch ТИКЕР • убрать: /unwatch ТИКЕР • "
+                     "кандидатов ищет сканер: /scan")
+        await message.answer("\n".join(lines))
+
+    # ----------------------------------------------------------------- /watch
+    @router.message(Command("watch"))
+    async def cmd_watch(message: Message,
+                        command: Optional[CommandObject] = None) -> None:
+        """Отдать бумагу под автоматическую торговлю: /watch MTSS."""
+        if not is_admin(message):
+            return
+        ticker = (command.args or "").strip().upper() if command else ""
+        if not ticker:
+            await message.answer(
+                "Укажите тикер: /watch MTSS\n"
+                "Список сейчас: /watchlist")
+            return
+        await message.answer(await ctx.engine.add_watchlist(ticker))
+
+    # --------------------------------------------------------------- /unwatch
+    @router.message(Command("unwatch"))
+    async def cmd_unwatch(message: Message,
+                          command: Optional[CommandObject] = None) -> None:
+        """Убрать бумагу из автоматической торговли: /unwatch MTSS."""
+        if not is_admin(message):
+            return
+        ticker = (command.args or "").strip().upper() if command else ""
+        if not ticker:
+            await message.answer(
+                "Укажите тикер: /unwatch MTSS\n"
+                "Список сейчас: /watchlist")
+            return
+        await message.answer(await ctx.engine.remove_watchlist(ticker))
+
     # ----------------------------------------------------------------- /ask
     @router.message(Command("ask"))
     async def cmd_ask(message: Message,
@@ -745,6 +969,38 @@ def _render_chart(series: List[Tuple[str, list]], hours: float,
 # ---------------------------------------------------------------------------
 # Вспомогательные функции.
 # ---------------------------------------------------------------------------
+def _parse_ticker_qty(command: Optional[CommandObject], *,
+                      allow_empty: bool = False
+                      ) -> Tuple[Optional[str], Optional[int], Optional[str]]:
+    """
+    Парсит "ТИКЕР ШТ" из аргументов /buy и /sell.
+
+    Возвращает (ticker, units, error): error не None - показать её текст.
+    allow_empty=True (для /sell) разрешает опустить количество (продать всё).
+    """
+    args = (command.args or "").strip() if command else ""
+    if not args:
+        return None, None, (
+            "Укажите тикер и количество штук, например:\n"
+            "/buy SBER 100\n"
+            "/sell GAZP 30\n\n"
+            "Количество - в ШТУКАХ, бот сам пересчитает в лоты "
+            "(1 лот SBER = 10 шт). Для /sell можно опустить количество - "
+            "продаст всё, что есть.")
+    parts = args.split()
+    ticker = parts[0].upper()
+    if len(parts) < 2:
+        if allow_empty:
+            return ticker, None, None
+        return None, None, (
+            f"Укажите ещё количество штук: /buy {ticker} 100")
+    if not parts[1].isdigit():
+        return None, None, (
+            "Количество должно быть целым числом штук: "
+            f"/buy {ticker} 100")
+    return ticker, int(parts[1]), None
+
+
 async def _do_switch(ctx: AppContext, message: Message, *, use_sandbox: bool) -> None:
     """Само переключение режима с пересозданием API-клиента."""
     await message.answer("Переключаю режим, это займёт несколько секунд...")

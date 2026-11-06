@@ -33,6 +33,7 @@ import cleanup
 from ai_auditor import AIAuditor
 from ai_analyst import AIAnalyst, set_default_analyst
 from config import BotConfig, ConfigError, StateStore, load_config
+from scanner import MarketScanner
 from telegram_bot import AppContext, VERSION, build_dispatcher, send_admin_message
 from tinkoff_client import TinkoffClient
 from trade_memory import TradeMemory
@@ -98,24 +99,30 @@ def setup_logging(config: BotConfig) -> None:
 
 def _print_banner(config: BotConfig, state: StateStore) -> None:
     mode = "ПЕСОЧНИЦА" if state.use_sandbox else "РЕАЛЬНЫЙ СЧЁТ"
+    tickers = config.trading_tickers
     log.info("=" * 60)
     log.info("MOEX Trading Bot v%s стартует", VERSION)
     log.info("Режим: %s | торговля: %s | аудитор: %s", mode,
              "вкл" if state.trading_enabled else "выкл",
              "вкл" if state.auditor_enabled else "выкл")
-    log.info("Тикеры (%d): %s | опрос %d сек",
-             len(config.trading_tickers), ", ".join(config.trading_tickers),
-             config.poll_interval_sec)
+    log.info("Тикеры (до %d): %s | опрос %d сек | сканер рынка: %s (каждые %d мин)",
+             config.max_tickers, ", ".join(tickers),
+             config.poll_interval_sec,
+             "вкл" if config.scan_enabled else "выкл",
+             config.scan_interval_min)
     log.info("Агрессивность %d/100 | активность %d/100 "
              "(масштаб времени задаётся в Telegram: /set_activity)",
              state.aggressiveness(), state.activity())
     log.info("SL %.1f%% / TP %.1f%% | позиция <= %.1f%% свободных средств",
              config.stop_loss_pct, config.take_profit_pct, config.max_position_pct)
+    tiers_txt = ", ".join(f">={p:g}%:{d:g}п.п." for p, d in config.harvest_tiers) \
+        if config.harvest_tiers else "выкл"
+    log.info("Умная фиксация прибыли (HARVEST_TIERS): %s | SL подтверждение %d цикл(а)",
+             tiers_txt, config.sl_confirm_cycles)
     log.info("Обучение на ошибках: %s | дневной лимит убытка %.1f%% | "
-             "пауза бумаге после 3 убытков %.1f ч | SL подтверждение %d цикл(а)",
+             "пауза бумаге после 3 убытков %.1f ч",
              "вкл" if config.learning_enabled else "выкл",
-             config.daily_loss_limit_pct, config.loss_streak_pause_h,
-             config.sl_confirm_cycles)
+             config.daily_loss_limit_pct, config.loss_streak_pause_h)
     log.info("Groq-модель: %s | аудит каждые %d сек",
              config.groq_model, config.audit_interval_sec)
     log.info("=" * 60)
@@ -152,6 +159,21 @@ async def async_main() -> int:
                            memory=memory)
     auditor = AIAuditor(config, state, analyst, notify_admin)
 
+    async def send_admin_photos(caption: str, pngs: list) -> None:
+        """Отправка картинок админу (сканер: топ кандидатов, 2 фото)."""
+        from aiogram.types import BufferedInputFile
+        for i, png in enumerate(pngs):
+            await bot.send_photo(
+                chat_id=config.telegram_admin_id,
+                photo=BufferedInputFile(png, filename=f"scan-{i + 1}.png"),
+                caption=caption[:1024] if i == 0 else None,
+            )
+
+    # Сканер рынка: раз в SCAN_INTERVAL_MIN минут ищет кандидаты по всему
+    # рынку TQBR и присылает топ с графиками. Сам НЕ торгует - подсказывает.
+    scanner = MarketScanner(config, state, client, analyst, engine,
+                            notify_admin, send_admin_photos)
+
     # TELEGRAM_API_BASE: если api.telegram.org недоступен с VPS (блокировка
     # хостера), укажите здесь адрес реверс-прокси (например, Cloudflare Worker):
     #   TELEGRAM_API_BASE=https://<ваш-worker>.workers.dev
@@ -169,6 +191,7 @@ async def async_main() -> int:
     ctx = AppContext(
         config=config, state=state, client=client, analyst=analyst,
         engine=engine, auditor=auditor, bot=bot, memory=memory,
+        scanner=scanner,
         started_monotonic=time.monotonic(),
         shutdown_event=None,  # присвоим ниже, после создания события
     )
@@ -184,6 +207,7 @@ async def async_main() -> int:
         stop_event.set()
         engine.request_stop()
         auditor.request_stop()
+        scanner.request_stop()
 
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -204,16 +228,21 @@ async def async_main() -> int:
         background_tasks.append(asyncio.create_task(engine.run(), name="engine"))
         background_tasks.append(asyncio.create_task(auditor.run(), name="auditor"))
         background_tasks.append(
+            asyncio.create_task(scanner.run(), name="scanner"))
+        background_tasks.append(
             asyncio.create_task(cleanup.periodic_cleanup(config, stop_event),
                                 name="cleanup"))
 
         # Первое сообщение о старте - админу сразу видно, что бот жив.
         try:
             mode = "Sandbox" if state.use_sandbox else "РЕАЛЬНЫЙ режим"
+            scan_txt = (f"сканер рынка каждые {config.scan_interval_min} мин"
+                        if config.scan_enabled else "сканер выключен")
             await notify_admin(
                 f"Бот запущен (v{VERSION}). Режим: {mode}. "
-                f"Тикеры: {', '.join(config.trading_tickers)}. "
+                f"Тикеры: {', '.join(engine.watchlist())}. "
                 f"Торговля: {'вкл' if state.trading_enabled else 'выкл'}. "
+                f"{scan_txt}. "
                 f"Проверить логи вручную: /audit. Статистика: /stats.")
         except Exception as exc:  # noqa: BLE001 - Telegram мог быть недоступен
             log.warning("Приветствие в Telegram не отправлено: %s", exc)
@@ -262,6 +291,7 @@ async def async_main() -> int:
         stop_event.set()
         engine.request_stop()
         auditor.request_stop()
+        scanner.request_stop()
 
         async def _limited(label: str, coro, timeout: float = 8.0) -> None:
             """Закрытие ресурса с жёстким таймаутом: зависший сокет/канал

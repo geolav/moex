@@ -22,7 +22,7 @@ import asyncio
 import json
 import logging
 import re
-from typing import Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from groq import (
     APIConnectionError,
@@ -93,6 +93,19 @@ _ASK_SYSTEM_PROMPT = (
 )
 
 _NUM_RE = re.compile(r"-?\d+(?:[.,]\d+)?")
+
+# Промпт "скаута рынка" (scanner.py): один запрос на весь список кандидатов.
+_SCAN_SYSTEM_PROMPT = (
+    "Ты - скаут фондового рынка Мосбиржи. Тебе дают таблицу акций-кандидатов: "
+    "цена, индикаторный сигнал от -1 до +1 (чем выше, тем сильнее аргумент за "
+    "отскок после отката), RSI, изменение за день, отклонение от рабочей "
+    "средней, суточный оборот. Для КАЖДОГО тикера дай короткий вердикт по-русски "
+    "(до 12 слов): стоит ли рассматривать покупку сейчас или лучше пропустить "
+    "и почему (перепроданность и затухание падения - за; перекупленность, "
+    "падение продолжается - против). Опирайся ТОЛЬКО на таблицу, не выдумывай "
+    "фактов. ОТВЕТ - СТРОГО один JSON-объект вида "
+    '{"TICKER1": "вердикт", "TICKER2": "вердикт"} без пояснений.'
+)
 
 # Промпт "трейдера" (скиллы по мотивам AI-Trader/TradingAgents и классических
 # трейдинг-скиллов: теханализ, риск-менеджмент, дисциплина; мини-дебаты
@@ -373,6 +386,44 @@ class AIAnalyst:
         reason = str(decision.get("reason", ""))[:300]
         return {"action": action, "confidence": confidence, "reason": reason}
 
+    async def scan_verdicts(self, rows: List[Dict[str, Any]]) -> Dict[str, str]:
+        """
+        Короткие вердикты ИИ по кандидатам сканера рынка (ОДНИМ запросом).
+
+        rows: [{ticker, price, score, rsi, day_chg_pct, vs_sma_pct, turnover_txt}].
+        Возвращает {ticker: вердикт}. Любая ошибка/нечитаемый ответ -> {}
+        (сканер просто опустит комментарии - торговля не зависит от ИИ).
+        """
+        if not rows:
+            return {}
+        lines = []
+        for r in rows:
+            lines.append(
+                f"{r.get('ticker')}: цена {float(r.get('price') or 0):.2f} ₽, "
+                f"сигнал {float(r.get('score') or 0):+.2f}, "
+                f"RSI {float(r.get('rsi') or 0):.0f}, "
+                f"за день {float(r.get('day_chg_pct') or 0):+.1f}%, "
+                f"к средней {float(r.get('vs_sma_pct') or 0):+.1f}%, "
+                f"оборот {r.get('turnover_txt', '?')}")
+        raw = await self._chat(
+            _SCAN_SYSTEM_PROMPT,
+            "Таблица кандидатов:\n" + "\n".join(lines),
+            max_tokens=700,
+            temperature=0.2,
+        )
+        start, end = raw.find("{"), raw.rfind("}")
+        if start < 0 or end <= start:
+            log.warning("Сканер: ИИ ответил без JSON - комментарии пропущены")
+            return {}
+        try:
+            data = json.loads(raw[start:end + 1])
+        except json.JSONDecodeError:
+            log.warning("Сканер: ИИ вернул нечитаемый JSON - комментарии пропущены")
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return {str(k).strip().upper(): str(v).strip()[:120]
+                for k, v in data.items() if str(v).strip()}
 
     async def answer_question(self, question: str, context: str) -> str:
         """

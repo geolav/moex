@@ -33,7 +33,8 @@ log = logging.getLogger("config")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 #: Максимум тикеров - жёсткое требование по памяти и лимитам API.
-MAX_TICKERS = 5
+#: v1.6.0: поднято с 5 до 6 - движок ведёт до шести бумаг одновременно.
+MAX_TICKERS = 6
 
 _TRUE_VALUES = {"1", "true", "yes", "on", "y", "t", "да"}
 
@@ -89,6 +90,33 @@ def _env_list(name: str, default: Tuple[str, ...]) -> Tuple[str, ...]:
     # (порядок важен: тикеры обрабатываются строго последовательно).
     items = tuple(dict.fromkeys(part.strip().upper() for part in raw.split(",") if part.strip()))
     return items or default
+
+
+def parse_harvest_tiers(raw: str) -> Tuple[Tuple[float, float], ...]:
+    """Парсит HARVEST_TIERS вида "3.0:0.7,5.0:0.4,8.0:0.25".
+
+    Формат пары: пик_прибыли_в_процентах : допустимый_откат_в_пунктах.
+    Чем выше пик, тем меньший откат терпим - при сильном росте продаём
+    уже при крошечном минусе. Пары сортируются по убыванию пика.
+    """
+    tiers: List[Tuple[float, float]] = []
+    for part in (raw or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            peak_s, drop_s = part.split(":", 1)
+            peak = float(peak_s.strip().replace(",", "."))
+            drop = float(drop_s.strip().replace(",", "."))
+        except ValueError:
+            log.warning("HARVEST_TIERS: не понял пару %r - пропускаю", part)
+            continue
+        if peak <= 0 or drop <= 0:
+            log.warning("HARVEST_TIERS: пара %r должна быть > 0 - пропускаю", part)
+            continue
+        tiers.append((peak, drop))
+    tiers.sort(key=lambda t: t[0], reverse=True)
+    return tuple(tiers)
 
 
 def _env_urls(name: str, default: Tuple[str, ...]) -> Tuple[str, ...]:
@@ -150,6 +178,18 @@ class BotConfig:
     trailing_activate_pct: float  # с какой прибыли включается трейлинг-стоп
     trailing_drop_pct: float      # откат от максимума прибыли для продажи
     llm_early_sell_min_profit_pct: float  # ИИ продаёт досрочно только в плюс
+    # --- Умная фиксация прибыли (HARVEST_TIERS) -------------------------------
+    # Чем выше был пик прибыли, тем меньший откат от него терпим:
+    # (пик %, допуск отката в пунктах). Пары отсортированы по убыванию пика.
+    harvest_tiers: Tuple[Tuple[float, float], ...]
+    # --- Сканер рынка (scanner.py) -------------------------------------------
+    scan_enabled: bool            # фоновый поиск кандидатов раз в N минут
+    scan_interval_min: int        # период сканирования рынка, минут
+    scan_min_turnover: float      # мин. суточный оборот бумаги, млн руб
+    scan_min_price: float         # отсечь «копеечные» бумаги, руб
+    scan_deep_n: int              # сколько бумаг глубоко считать по свечам
+    scan_report_top: int          # сколько кандидатов присылать в отчёте
+    scan_llm: bool                # ИИ-комментарий по кандидатам (1 запрос)
 
     # --- Инфраструктура ---
     rate_limit_rpm: int
@@ -243,6 +283,16 @@ def load_config() -> BotConfig:
                                      low=0.1, high=100.0),
         llm_early_sell_min_profit_pct=_env_float("LLM_EARLY_SELL_MIN_PROFIT", 0.5,
                                                  low=0.0, high=100.0),
+        harvest_tiers=parse_harvest_tiers(
+            _env_str("HARVEST_TIERS", "3.0:0.7,5.0:0.4,8.0:0.25")),
+        scan_enabled=_env_bool("SCAN_ENABLED", True),
+        scan_interval_min=_env_int("SCAN_INTERVAL_MIN", 10, low=5, high=1440),
+        scan_min_turnover=_env_float("SCAN_MIN_TURNOVER_MLN", 50.0,
+                                     low=0.0, high=1e12),
+        scan_min_price=_env_float("SCAN_MIN_PRICE", 5.0, low=0.0, high=1e9),
+        scan_deep_n=_env_int("SCAN_DEEP_N", 20, low=5, high=60),
+        scan_report_top=_env_int("SCAN_REPORT_TOP", 6, low=3, high=10),
+        scan_llm=_env_bool("SCAN_LLM", True),
         rate_limit_rpm=_env_int("RATE_LIMIT_RPM", 90, low=5, high=250),
         news_rss_urls=_env_urls(
             "NEWS_RSS_URLS",
@@ -288,6 +338,7 @@ class StateStore:
         "decision_log": [],       # последние решения трейдера (память для LLM)
         "last_buy_ts": {},        # ticker -> unix-ts последней покупки (кулдаун)
         "daily_buys": {"date": "", "count": 0},  # покупки за сегодня
+        "watchlist": [],          # тикеры под управлением бота (до 6)
     }
 
     def __init__(self, path: str, initial_overrides: Optional[Dict[str, Any]] = None):
@@ -462,6 +513,21 @@ class StateStore:
 
     def decision_log(self) -> List[Dict[str, Any]]:
         return list(self._data.get("decision_log", []))
+
+    # --- список тикеров под управлением (/watch, /unwatch) ---------------------
+    def watchlist(self) -> List[str]:
+        """Сохранённый список тикеров (пустой = использовать TRADING_TICKERS)."""
+        try:
+            raw = self._data.get("watchlist") or []
+        except (TypeError, ValueError):
+            return []
+        return [str(t).strip().upper() for t in raw if str(t).strip()]
+
+    def set_watchlist(self, items: List[str]) -> None:
+        """Сохраняет список тикеров (без дублей, верхний регистр)."""
+        clean = [str(t).strip().upper() for t in items if str(t).strip()]
+        self._data["watchlist"] = list(dict.fromkeys(clean))
+        self.save()
 
     # --- кулдаун и дневной лимит покупок ------------------------------------------
     def last_buy_ts(self, ticker: str) -> float:
