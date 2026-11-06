@@ -208,6 +208,16 @@ class BotConfig:
     def log_file(self) -> str:
         return os.path.join(self.logs_dir, "bot.log")
 
+    @property
+    def max_tickers(self) -> int:
+        """Сколько бумаг бот может вести одновременно (сканер/движок/баннер).
+
+        Единая точка истины: и усечение TRADING_TICKERS, и лимит watchlist
+        в движке смотрят сюда, так что рассинхрон «константа vs поле»
+        исключён (v1.6.0: из-за него падал баннер при старте).
+        """
+        return MAX_TICKERS
+
 
 def load_config() -> BotConfig:
     """
