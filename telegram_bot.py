@@ -28,12 +28,12 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
 from aiogram import Bot, Dispatcher, Router
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import BufferedInputFile, Message
 
 log = logging.getLogger("telegram")
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 
 HELP_TEXT = (
     "Команды:\n"
@@ -44,6 +44,8 @@ HELP_TEXT = (
     "/toggle_trading - вкл/выкл автоматическую торговлю\n"
     "/toggle_sandbox - переключить песочница/реальный счёт\n"
     "/toggle_auditor - вкл/выкл ИИ-аудитора логов\n"
+    "/audit - ИИ-проверка логов прямо сейчас\n"
+    "/audit 150 - то же, но по последним 150 строкам (10-200)\n"
     "/set_aggressiveness 70 - активность торговли 0-100\n"
     "/set_invested 30 - максимум % ВСЕХ денег в акциях (5-100)\n"
     "/shutdown - выключить бота\n"
@@ -324,6 +326,33 @@ def create_router(ctx: AppContext) -> Router:
             await message.answer(
                 "⏸ ИИ-аудитор ВЫКЛЮЧЕН (расходы на Groq прекратятся). "
                 "Сам бот продолжит работать как раньше.")
+
+    # --------------------------------------------------------------- /audit
+    @router.message(Command("audit"))
+    async def cmd_audit(message: Message,
+                        command: Optional[CommandObject] = None) -> None:
+        """Ручная ИИ-проверка логов: всё ли нормально, исправились ли ошибки."""
+        if not is_admin(message):
+            return
+        lines = ctx.config.audit_log_lines
+        if command and command.args and command.args.strip().isdigit():
+            lines = max(10, min(200, int(command.args.strip())))
+        wait = await message.answer(
+            f"🔎 Запускаю ИИ-проверку логов (последние {lines} строк)...\n"
+            f"Обычно занимает 10-30 секунд.")
+        try:
+            verdict = await ctx.auditor.run_once(
+                force=True, notify=False, lines=lines)
+        except Exception as exc:  # noqa: BLE001 - покажем ошибку пользователю
+            log.exception("Ручной аудит /audit не удался")
+            await wait.edit_text(
+                f"❌ Аудит не удался: {exc}\n"
+                f"Попробуйте ещё раз через пару минут.")
+            return
+        if not verdict:
+            verdict = "Все ОК"
+        header = time.strftime("[Аудит логов %d.%m %H:%M]")
+        await wait.edit_text(f"{header} {verdict}"[:4000])
 
     # -------------------------------------------------------- /toggle_sandbox
     @router.message(Command("toggle_sandbox"))

@@ -33,7 +33,7 @@ import cleanup
 from ai_auditor import AIAuditor
 from ai_analyst import AIAnalyst, set_default_analyst
 from config import BotConfig, ConfigError, StateStore, load_config
-from telegram_bot import AppContext, build_dispatcher, send_admin_message
+from telegram_bot import AppContext, VERSION, build_dispatcher, send_admin_message
 from tinkoff_client import TinkoffClient
 from trading_engine import TradingEngine
 
@@ -97,7 +97,7 @@ def setup_logging(config: BotConfig) -> None:
 def _print_banner(config: BotConfig, state: StateStore) -> None:
     mode = "ПЕСОЧНИЦА" if state.use_sandbox else "РЕАЛЬНЫЙ СЧЁТ"
     log.info("=" * 60)
-    log.info("MOEX Trading Bot v1.2.0 стартует")
+    log.info("MOEX Trading Bot v%s стартует", VERSION)
     log.info("Режим: %s | торговля: %s | аудитор: %s", mode,
              "вкл" if state.trading_enabled else "выкл",
              "вкл" if state.auditor_enabled else "выкл")
@@ -199,7 +199,8 @@ async def async_main() -> int:
                 f"Бот запущен (v1.2.0). Режим: {mode}. "
                 f"Тикеры: {', '.join(config.trading_tickers)}. "
                 f"Торговля: {'вкл' if state.trading_enabled else 'выкл'}. "
-                f"Новые: /stats (график), /shutdown, /set_aggressiveness (активность).")
+                f"Новые: /stats (график), /shutdown, /set_aggressiveness (активность)."
+                f"Проверить логи вручную: /audit. Статистика: /stats.")
         except Exception as exc:  # noqa: BLE001 - Telegram мог быть недоступен
             log.warning("Приветствие в Telegram не отправлено: %s", exc)
 

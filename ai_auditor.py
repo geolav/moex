@@ -87,15 +87,21 @@ class AIAuditor:
         log.info("ИИ-аудитор остановлен (проверок выполнено: %d)", self._checks_done)
 
     # --------------------------------------------------------------- проверка
-    async def run_once(self, *, force: bool = False) -> Optional[str]:
+    async def run_once(self, *, force: bool = False, notify: bool = True,
+                       lines: Optional[int] = None) -> Optional[str]:
         """
         Одна проверка логов. Возвращает вердикт (или None, если нечего проверять).
-        force=True - выполнить даже при выключенном флаге (для ручного запроса).
+        force=True   - выполнить даже при выключенном флаге (ручной запрос /audit);
+        notify=False - самому не слать сообщение админу (вердикт вернётся
+                       вызывающему коду - так работает команда /audit);
+        lines=N      - сколько последних строк лога проверить (по умолчанию -
+                       из конфига, AUDIT_LOG_LINES).
         """
         if not force and not self._state.auditor_enabled:
             return None
 
-        log_text = tail_lines(self._cfg.log_file, self._cfg.audit_log_lines)
+        count = max(10, min(200, int(lines))) if lines else self._cfg.audit_log_lines
+        log_text = tail_lines(self._cfg.log_file, count)
         if not log_text.strip():
             verdict = "Лог-файл пуст - бот ещё не писал логов."
             log.info("Аудит: лог пуст, пропускаю запрос к Groq")
@@ -104,11 +110,12 @@ class AIAuditor:
             verdict = await self._analyst.audit_logs(log_text)
 
         self._state.set_audit_result(verdict)
-        header = time.strftime("[Аудит логов %d.%m %H:%M]")
-        message = f"{header} {verdict}"
-        try:
-            await self._send(message)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Не удалось отправить результат аудита в Telegram: %s", exc)
+        if notify:
+            header = time.strftime("[Аудит логов %d.%m %H:%M]")
+            message = f"{header} {verdict}"
+            try:
+                await self._send(message)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Не удалось отправить результат аудита в Telegram: %s", exc)
         log.info("Аудит выполнен: %.200s", verdict)
         return verdict
