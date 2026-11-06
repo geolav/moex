@@ -36,7 +36,7 @@ from aiogram.types import BufferedInputFile, Message
 
 log = logging.getLogger("telegram")
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 
 HELP_TEXT = (
     "Команды:\n"
@@ -44,6 +44,8 @@ HELP_TEXT = (
     "/status - деньги, позиции и последние события\n"
     "/stats - статистика и график по акциям за 6 часов\n"
     "/stats 12 - то же за 12 часов (можно 1-48)\n"
+    "/memory - что бот выучил из своих сделок (винрейт, уроки, плохие часы)\n"
+    "/reset_memory - забыть всю память сделок (начать учиться заново)\n"
     "/toggle_trading - вкл/выкл автоматическую торговлю\n"
     "/toggle_sandbox - переключить песочница/реальный счёт\n"
     "/toggle_auditor - вкл/выкл ИИ-аудитора логов\n"
@@ -70,8 +72,16 @@ HELP_TEXT = (
     "сильный сигнал нужен для покупки.\n"
     "• Сентимент - «настроение» новостей, оценка от −1 (плохие новости) "
     "до +1 (хорошие). Бот покупает, только если новостей нет плохих.\n"
-    "• Стоп-лосс - автоматическая продажа, если цена упала слишком низко, "
-    "чтобы не терять ещё больше (у бота это −3%).\n"
+    "• Память сделок - бот запоминает каждую закрытую сделку и делает "
+    "выводы: после серии убытков по бумаге берёт паузу, поднимает к ней "
+    "требования, не покупает в «плохие» часы дня и при достижении дневного "
+    "лимита убытка останавливает новые покупки до завтра. Посмотреть: /memory.\n"
+    "• Трейлинг-стоп - защита прибыли: если цена выросла больше +2%, а потом "
+    "поехала обратно, бот продаёт, как только откат съест 1.5% - так рост "
+    "не успевает превратиться в убыток.\n"
+    "• Стоп-лосс - продажа при падении до −3%: первый раз бот уточнит у ИИ, "
+    "не ложный ли прокол, и максимум через 2 проверки продаст (а при −4.5% "
+    "продаёт сразу).\n"
     "• Тейк-профит - автоматическая продажа с прибылью, когда цена "
     "выросла до цели (у бота это +5%).\n"
     "• Песочница - тренировочный счёт с виртуальными деньгами. "
@@ -92,6 +102,7 @@ class AppContext:
     engine: object            # TradingEngine
     auditor: object           # AIAuditor
     bot: Bot
+    memory: object = None     # TradeMemory - память о завершённых сделках
     started_monotonic: float = 0.0
     # Событие остановки: /shutdown его выставляет, main.py видит и глушит бота.
     shutdown_event: object = field(default=None)
@@ -198,6 +209,12 @@ def create_router(ctx: AppContext) -> Router:
                 parts.append(
                     f"• {d.get('ts')} {d.get('ticker')}: {d.get('action')} "
                     f"(уверенность {d.get('confidence')}) — {d.get('reason')}")
+
+        if ctx.memory is not None:
+            try:
+                parts.append(f"\n🧠 Память сделок: {ctx.memory.short_line()}.")
+            except Exception:  # noqa: BLE001
+                pass
 
         settings = (f"\n⚙️ Настройки: агрессивность {ctx.state.aggressiveness()}/100, "
                     f"активность {ctx.state.activity()}/100 "
@@ -427,6 +444,34 @@ def create_router(ctx: AppContext) -> Router:
             verdict = "Все ОК"
         header = time.strftime("[Аудит логов %d.%m %H:%M]")
         await wait.edit_text(f"{header} {verdict}"[:4000])
+
+    # --------------------------------------------------------------- /memory
+    @router.message(Command("memory"))
+    async def cmd_memory(message: Message) -> None:
+        """Что бот выучил из своих сделок: винрейт, серии убытков, часы."""
+        if not is_admin(message):
+            return
+        if ctx.memory is None:
+            await message.answer(
+                "Память сделок не подключена (LEARNING=False в настройках).")
+            return
+        await message.answer(ctx.memory.summary_text())
+
+    # --------------------------------------------------------- /reset_memory
+    @router.message(Command("reset_memory"))
+    async def cmd_reset_memory(message: Message) -> None:
+        """Забыть всю память сделок (например, после смены стратегии)."""
+        if not is_admin(message):
+            return
+        if ctx.memory is None:
+            await message.answer(
+                "Память сделок не подключена (LEARNING=False в настройках).")
+            return
+        ctx.memory.clear()
+        await message.answer(
+            "🧽 Память сделок очищена: бот забыл все прошлые сделки и выводы "
+            "из них. Дальше снова будет учиться с чистого листа "
+            "(запоминать каждую закрытую сделку).")
 
     # ----------------------------------------------------------------- /ask
     @router.message(Command("ask"))
