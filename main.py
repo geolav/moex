@@ -234,13 +234,21 @@ async def async_main() -> int:
         polling_task.cancel()
         try:
             await asyncio.wait_for(polling_task, timeout=8.0)
-        except (asyncio.TimeoutError, asyncio.CancelledError):
+        except asyncio.TimeoutError:
             log.warning("Telegram-polling не завершился за 8 c - принудительно пропускаю")
+        except asyncio.CancelledError:
+            log.info("Telegram-polling остановлен")
         except Exception:  # noqa: BLE001
             # polling упал сам (например, Conflict от второго экземпляра):
             # выводим ошибку - наружу, чтобы systemd перезапустил бота.
             polling_task.result()
+        # Аккуратно прибираем задачу-наблюдателя остановки, иначе при
+        # закрытии цикла появится шум 'Task was destroyed but it is pending'.
         shutdown_watch.cancel()
+        try:
+            await shutdown_watch
+        except asyncio.CancelledError:
+            pass
 
     except ConfigError:
         raise
@@ -257,12 +265,24 @@ async def async_main() -> int:
 
         async def _limited(label: str, coro, timeout: float = 8.0) -> None:
             """Закрытие ресурса с жёстким таймаутом: зависший сокет/канал
-            не должен задерживать остановку процесса больше 8 секунд."""
+            не должен задерживать остановку процесса больше 8 секунд.
+
+            ВАЖНО: CancelledError в Python 3.8+ наследуется от BaseException,
+            а НЕ от Exception. Фоновые задачи мы останавливаем КАК РАЗ
+            отменой - без отдельной ветки отмена вылетала отсюда наружу,
+            обрывала всю дальнейшую уборку (сессии оставались открытыми,
+            'Unclosed client session') и печатала ложный трейсбек.
+            Здесь отмена - ШТАТНЫЙ исход: пропускаем и продолжаем уборку."""
             try:
                 await asyncio.wait_for(coro, timeout=timeout)
-            except Exception:  # noqa: BLE001 - включая TimeoutError и CancelledError
+            except asyncio.TimeoutError:
                 log.warning("%s: не завершилось за %.0f c - принудительно пропускаю",
                             label, timeout)
+            except asyncio.CancelledError:
+                pass  # штатная остановка задачи - это не ошибка
+            except Exception as exc:  # noqa: BLE001 - уборка не должна падать
+                log.warning("%s: при остановке ошибка (%s) - продолжаю уборку",
+                            label, exc)
 
         for task in background_tasks:
             task.cancel()
