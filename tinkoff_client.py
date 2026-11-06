@@ -78,6 +78,23 @@ except ImportError as exc:  # pragma: no cover - путь только для dr
     sdk_now = None  # type: ignore[assignment]
     quotation_to_decimal = lambda value: Decimal(0)  # type: ignore  # noqa: E731
 
+# ---------------------------------------------------------------------------
+# Отключение телеметрии SDK (T-Bank error-hub / Sentry).
+# SDK жёстко инициализирует sentry_sdk на error-hub.tbank.ru (выключателя
+# нет), TLS до этого хоста с VPS не проверяется -> SSL-шум в логе.
+# На торговлю не влияет - глушим отправку, подменяя init-функции на пустые.
+# ---------------------------------------------------------------------------
+if SDK_AVAILABLE:
+    import t_tech.invest.clients as _tt_clients
+
+    def _no_error_hub(_client: Any) -> None:  # вместо init_error_hub
+        return None
+
+    async def _no_async_error_hub(_client: Any) -> None:  # вместо async_init_error_hub
+        return None
+
+    _tt_clients.init_error_hub = _no_error_hub
+    _tt_clients.async_init_error_hub = _no_async_error_hub
 log = logging.getLogger("tinkoff")
 
 # Коды gRPC, при которых повтор запроса имеет смысл.
