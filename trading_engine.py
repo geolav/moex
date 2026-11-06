@@ -528,6 +528,105 @@ class TradingEngine:
         self._sentiment_cache[ticker] = (time.monotonic(), score)
         return score
 
+    async def situation_brief(self) -> str:
+        """
+        Сводка о счёте и бумагах для ручных вопросов владельца (/ask).
+
+        Собирается по требованию (одна команда - один сбор). LLM-запросов
+        не делает: берёт кэш сентимента и кэш вердиктов, цены и свечи - с API.
+        Ошибка по одной бумаге не ломает всю сводку.
+        """
+        aggr = self._state.aggressiveness()
+        lines: list[str] = [
+            f"Настройки: агрессивность {aggr}/100, порог сигнала "
+            f"{self._score_threshold():.2f}, требуемая уверенность LLM "
+            f"{self._required_confidence():.2f}, потолок вложенности "
+            f"{self._state.max_invested_pct()}% всех денег, на одну сделку "
+            f"<={self._cfg.max_position_pct:.0f}% свободных, покупок сегодня "
+            f"{self._state.buys_today()}/{self._max_buys_today()}, "
+            f"кулдаун после покупки {self._cooldown_sec() / 60:.0f} мин, "
+            f"автотрейдинг "
+            f"{'ВКЛ' if self._state.trading_enabled else 'ВЫКЛ'}.",
+        ]
+
+        try:
+            portfolio = await self._client.get_portfolio_summary()
+            lines.append(
+                f"Счёт: всего {portfolio['total']:.0f} ₽, свободно "
+                f"{portfolio['cash']:.0f} ₽.")
+        except Exception as exc:  # noqa: BLE001
+            lines.append(f"Счёт: узнать не удалось ({exc}).")
+
+        positions = self._state.positions
+        if positions:
+            parts = []
+            for t, pos in positions.items():
+                parts.append(f"{t}: {pos.get('lots')} лот(а) по "
+                             f"{pos.get('entry_price')} ₽ (куплено {pos.get('entry_ts')})")
+            lines.append("Открытые позиции: " + "; ".join(parts) + ".")
+        else:
+            lines.append("Открытых позиций нет.")
+
+        for ticker in self._cfg.trading_tickers:
+            try:
+                price = await self._client.get_price(ticker)
+                if not price or price <= 0:
+                    lines.append(f"{ticker}: цена недоступна.")
+                    continue
+                line = f"{ticker}: сейчас {price:.2f} ₽."
+                history = await self._client.get_hourly_history(ticker, 72)
+                closes = [p for _, p in history]
+                if len(closes) >= 30:
+                    summary = indicators.summarize(closes, price)
+                    score = indicators.build_score(summary)
+                    needed = self._score_threshold()
+                    line += (f" Оценка сигнала {score:+.2f} при пороге "
+                             f"{needed:.2f} -> "
+                             f"{'сигнал на покупку ЕСТЬ' if score >= needed else 'сигнала нет'}"
+                             f". RSI {summary.get('rsi14') or 0:.0f}")
+                    sma24 = summary.get("sma24")
+                    if sma24:
+                        line += (f", цена {'ниже' if price < sma24 else 'выше'} "
+                                 f"SMA-24 {sma24:.2f} ₽ на "
+                                 f"{abs(price / sma24 - 1.0) * 100:.1f}%")
+                    line += "."
+                else:
+                    line += f" Часовых свечей мало ({len(closes)}) - индикаторы не построить."
+                # Сентимент из кэша (без похода в Groq), если он ещё свежий.
+                cached = self._sentiment_cache.get(ticker)
+                if cached and (time.monotonic() - cached[0]) < self._cfg.sentiment_ttl_sec:
+                    limit = self._sentiment_limit()
+                    line += (f" Сентимент новостей {cached[1]:+.2f} "
+                             f"(допуск для покупки {limit:+.2f}).")
+                # Последний вердикт трейдера-LLM из кэша (без похода в Groq).
+                verdict = self._llm_cache.get(ticker)
+                if verdict and (time.monotonic() - verdict[0]) < _LLM_CACHE_TTL_SEC \
+                        and verdict[1]:
+                    line += (f" Последний вердикт ИИ-трейдера: "
+                             f"{verdict[1]['action']} "
+                             f"(уверенность {verdict[1]['confidence']:.2f}): "
+                             f"{verdict[1]['reason']}")
+                if ticker in positions:
+                    line += " По этой бумаге уже есть позиция - докупать её бот не будет."
+                if self._cooldown_active(ticker):
+                    left = self._cooldown_sec() - (time.time()
+                                                   - self._state.last_buy_ts(ticker))
+                    line += f" Кулдаун после покупки: ещё ~{left / 60:.0f} мин."
+                lines.append(line)
+            except Exception as exc:  # noqa: BLE001 - бумага без данных - не беда
+                lines.append(f"{ticker}: данные недоступны ({exc}).")
+
+        decisions = self._state.decision_log()
+        if decisions:
+            lines.append("Журнал моих последних решений:")
+            for d in decisions[-6:]:
+                lines.append(f"- {d.get('ts')} {d.get('ticker')}: "
+                             f"{d.get('action')} (уверенность {d.get('confidence')}) "
+                             f"по {d.get('price')} ₽ - {d.get('reason')}")
+        else:
+            lines.append("Журнал решений пуст: сигналов, доходивших до ИИ, ещё не было.")
+        return "\n".join(lines)
+
     # ------------------------------------------------------------------ прочее
     async def _safe_notify(self, text: str) -> None:
         try:

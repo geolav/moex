@@ -33,7 +33,7 @@ from aiogram.types import BufferedInputFile, Message
 
 log = logging.getLogger("telegram")
 
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 
 HELP_TEXT = (
     "Команды:\n"
@@ -45,6 +45,7 @@ HELP_TEXT = (
     "/toggle_sandbox - переключить песочница/реальный счёт\n"
     "/toggle_auditor - вкл/выкл ИИ-аудитора логов\n"
     "/audit - ИИ-проверка логов прямо сейчас\n"
+    "/ask почему не покупаешь GAZP? - вопрос ИИ-трейдеру\n"
     "/audit 150 - то же, но по последним 150 строкам (10-200)\n"
     "/set_aggressiveness 70 - активность торговли 0-100\n"
     "/set_invested 30 - максимум % ВСЕХ денег в акциях (5-100)\n"
@@ -175,6 +176,14 @@ def create_router(ctx: AppContext) -> Router:
             parts.extend(f"• {action}" for action in actions[-3:])
         else:
             parts.append("\nПоследние события: пока ничего не происходило.")
+
+        decisions = ctx.state.decision_log()
+        if decisions:
+            parts.append("\nНедавние решения ИИ-трейдера:")
+            for d in decisions[-3:]:
+                parts.append(
+                    f"• {d.get('ts')} {d.get('ticker')}: {d.get('action')} "
+                    f"(уверенность {d.get('confidence')}) — {d.get('reason')}")
 
         settings = (f"\n⚙️ Настройки: агрессивность {ctx.state.aggressiveness()}/100, "
                     f"максимум в акциях: {ctx.state.max_invested_pct()}% всех денег "
@@ -353,6 +362,43 @@ def create_router(ctx: AppContext) -> Router:
             verdict = "Все ОК"
         header = time.strftime("[Аудит логов %d.%m %H:%M]")
         await wait.edit_text(f"{header} {verdict}"[:4000])
+
+    # ----------------------------------------------------------------- /ask
+    @router.message(Command("ask"))
+    async def cmd_ask(message: Message,
+                      command: Optional[CommandObject] = None) -> None:
+        """Короткий вопрос ИИ-трейдеру: почему купил / не купил и т.п."""
+        if not is_admin(message):
+            return
+        question = (command.args or "").strip() if command else ""
+        if not question:
+            await message.answer(
+                "Напиши вопрос после команды, например:\n"
+                "/ask почему не покупаешь GAZP?\n"
+                "/ask почему купил Сбер?\n"
+                "/ask что будешь делать дальше?\n\n"
+                "Я соберу сводку (цены, сигналы индикаторов, мои последние "
+                "решения, лимиты) и передам её ИИ-трейдеру вместе с твоим "
+                "вопросом. Ответ займёт 10-30 секунд.")
+            return
+        wait = await message.answer(
+            "🤔 Собираю сводку по рынку и спрашиваю ИИ-трейдера...\n"
+            "Обычно занимает 10-30 секунд.")
+        try:
+            context = await ctx.engine.situation_brief()
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Сводка для /ask не собралась")
+            await wait.edit_text(f"Не смог собрать сводку по рынку: {exc}")
+            return
+        try:
+            answer = await ctx.analyst.answer_question(question, context)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("ИИ-трейдер не ответил на вопрос")
+            await wait.edit_text(
+                f"❌ ИИ-трейдер не ответил: {exc}\n"
+                f"Попробуй ещё раз через пару минут.")
+            return
+        await wait.edit_text(f"💬 «{question[:200]}»\n\n{answer}"[:4000])
 
     # -------------------------------------------------------- /toggle_sandbox
     @router.message(Command("toggle_sandbox"))
