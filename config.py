@@ -253,6 +253,7 @@ class StateStore:
         "sandbox_confirm_ts": 0,  # время выдачи подтверждения перехода в реал
         "price_history": {},      # ticker -> [[ts, price], ...] для /stats
         "aggressiveness": 50,     # 0..100 - активность торговли (/set_aggressiveness)
+        "max_invested_pct": 30,  # потолок доли ВСЕХ денег в акциях (/set_invested)
         "decision_log": [],       # последние решения трейдера (память для LLM)
         "last_buy_ts": {},        # ticker -> unix-ts последней покупки (кулдаун)
         "daily_buys": {"date": "", "count": 0},  # покупки за сегодня
@@ -388,6 +389,19 @@ class StateStore:
 
     def set_aggressiveness(self, value: int) -> None:
         self._data["aggressiveness"] = max(0, min(100, int(value)))
+        self.save()
+
+    # --- потолок общей вложенности ------------------------------------------------
+    def max_invested_pct(self) -> int:
+        """Сколько процентов ВСЕХ денег (кэш + позиции) максимум может
+        одновременно находиться в акциях."""
+        try:
+            return int(self._data.get("max_invested_pct", 30))
+        except (TypeError, ValueError):
+            return 30
+
+    def set_max_invested_pct(self, value: int) -> None:
+        self._data["max_invested_pct"] = max(5, min(100, int(value)))
         self.save()
 
     # --- журнал решений трейдера (память для LLM) --------------------------------

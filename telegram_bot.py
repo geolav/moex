@@ -33,7 +33,7 @@ from aiogram.types import BufferedInputFile, Message
 
 log = logging.getLogger("telegram")
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 HELP_TEXT = (
     "Команды:\n"
@@ -45,6 +45,7 @@ HELP_TEXT = (
     "/toggle_sandbox - переключить песочница/реальный счёт\n"
     "/toggle_auditor - вкл/выкл ИИ-аудитора логов\n"
     "/set_aggressiveness 70 - активность торговли 0-100\n"
+    "/set_invested 30 - максимум % ВСЕХ денег в акциях (5-100)\n"
     "/shutdown - выключить бота\n"
     "/help - эта справка\n\n"
     "📖 Словарик (чтобы всё было понятно):\n"
@@ -129,6 +130,9 @@ def create_router(ctx: AppContext) -> Router:
 
         balance_line = await _balance_line(ctx)
         parts.append(balance_line)
+        # Текущая вложенность: сколько % всех денег сейчас в акциях
+        # (считается по факту счёта ниже, в блоке сверки с брокером).
+        invested_share: Optional[float] = None
 
         positions = ctx.state.positions
         if positions:
@@ -145,6 +149,12 @@ def create_router(ctx: AppContext) -> Router:
         try:
             summary = await ctx.client.get_portfolio_summary()
             broker_positions = summary.get("positions", [])
+            total = float(summary.get("total", 0) or 0)
+            invested_value = sum(float(p.get("quantity", 0) or 0)
+                                 * float(p.get("price", 0) or 0)
+                                 for p in broker_positions)
+            if total > 0:
+                invested_share = invested_value / total * 100.0
             if broker_positions:
                 parts.append("Что фактически лежит на счёте (сверка с брокером):")
                 for pos in broker_positions:
@@ -164,6 +174,14 @@ def create_router(ctx: AppContext) -> Router:
         else:
             parts.append("\nПоследние события: пока ничего не происходило.")
 
+        settings = (f"\n⚙️ Настройки: агрессивность {ctx.state.aggressiveness()}/100, "
+                    f"максимум в акциях: {ctx.state.max_invested_pct()}% всех денег "
+                    f"(меняется командой /set_invested)")
+        if invested_share is not None:
+            settings += f", сейчас вложено {invested_share:.0f}%"
+        settings += f".\nНа одну сделку: не больше " \
+                    f"{ctx.config.max_position_pct:.0f}% свободных средств."
+        parts.append(settings)
         parts.append(f"\nДвижок: {ctx.engine.describe()}")
         audit = ctx.state.last_audit_result
         if audit:
@@ -239,6 +257,33 @@ def create_router(ctx: AppContext) -> Router:
             f"• лимит покупок в сутки: {min(ctx.config.max_buys_per_day, 2 + value // 5)}.\n\n"
             f"Страховки прежние: стоп-лосс −{ctx.config.stop_loss_pct:.0f}%, "
             f"тейк-профит +{ctx.config.take_profit_pct:.0f}%.")
+
+    # ------------------------------------------------ /set_invested
+    @router.message(Command("set_invested"))
+    async def cmd_set_invested(message: Message,
+                               command: Optional[CommandObject] = None) -> None:
+        """Лимит доли ВСЕХ денег, которая может одновременно быть в акциях."""
+        if not is_admin(message):
+            return
+        arg = command.args.strip().rstrip("%").strip() if (command and command.args) else ""
+        if not arg.isdigit():
+            await message.answer(
+                "Укажи процент, например: /set_invested 30\n\n"
+                "Это потолок того, какая доля ВСЕХ денег счёта (кэш + купленные "
+                "акции) может одновременно находиться в акциях. От 5 до 100.\n"
+                "• 20-30 - консервативно: большая часть денег в кэше;\n"
+                "• 50 - сбалансировано;\n"
+                "• 80-100 - почти всё в акциях (риск выше).\n"
+                "Когда вложенность подбирается к лимиту, покупки автоматически "
+                "урезаются, а сверх лимита - не совершаются.")
+            return
+        value = max(5, min(100, int(arg)))
+        ctx.state.set_max_invested_pct(value)
+        await message.answer(
+            f"✅ Максимум в акциях: {value}% всех денег счёта.\n"
+            f"На одну сделку по-прежнему не больше "
+            f"{ctx.config.max_position_pct:.0f}% свободных средств. "
+            f"Посмотреть текущую вложенность: /status.")
 
     # -------------------------------------------------------- /toggle_trading
     @router.message(Command("toggle_trading"))

@@ -263,12 +263,28 @@ class TradingEngine:
             return
 
         budget = portfolio["cash"] * self._cfg.max_position_pct / 100.0
+        # Потолок общей вложенности: сколько процентов ВСЕХ денег (кэш +
+        # позиции) может одновременно быть в акциях. Если уже вложено много -
+        # новую покупку урезаю или пропускаю.
+        invested = 0.0
+        for t, pos in self._state.positions.items():
+            sz = self._client.get_lot_size(t) or 1
+            invested += int(pos.get("lots", 0) or 0) * sz * \
+                        float(pos.get("entry_price", 0) or 0)
+        total_money = portfolio["cash"] + invested
+        room = total_money * self._state.max_invested_pct() / 100.0 - invested
+        if room < budget:
+            log.info("%s: лимит вложенности %d%% - бюджет урезан с %.0f до %.0f ₽ "
+                     "(вложено %.0f из %.0f ₽)", ticker,
+                     self._state.max_invested_pct(), budget, max(room, 0.0),
+                     invested, total_money)
+            budget = max(room, 0.0)
         lot_size = self._client.get_lot_size(ticker)
         lot_cost = price * lot_size
         lots = int(budget // lot_cost) if lot_cost > 0 else 0
         if lots < 1:
-            log.info("%s: недостаточно средств (бюджет %.2f, лот %.2f) - пропуск",
-                     ticker, budget, lot_cost)
+            log.info("%s: недостаточно средств или лимит вложенности "
+                     "(бюджет %.2f, лот %.2f) - пропуск", ticker, budget, lot_cost)
             return
 
         result = await self._client.buy(ticker, lots, price=price)
@@ -294,7 +310,8 @@ class TradingEngine:
             f"🛒 ПОКУПКА {ticker}" + (f" ({name})" if name else "") + "\n"
             f"Купил {lots} лот(а) = {shares} шт по ~{price:.2f} ₽, "
             f"потратил ≈{_fmt_rub(cost)} ₽ "
-            f"(лимит: {self._cfg.max_position_pct:.0f}% свободных денег).\n\n"
+            f"(лимит на сделку: {self._cfg.max_position_pct:.0f}% свободных, "
+            f"лимит вложенности: {self._state.max_invested_pct()}% всех денег).\n\n"
             f"Что видят индикаторы:\n"
             f"• {indicators.describe_for_human(summary)}.\n"
             f"• Комплексная оценка сигнала: {score:+.2f} "
