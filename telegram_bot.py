@@ -13,6 +13,18 @@ v1.7.1:
   • новая команда /autobuy - включить/выключить автопокупку кандидатов
     сканера (бот сам покупает лучших, прогоняя их через все проверки).
 
+v1.7.2:
+  • /stats и /positions видят ВСЕ бумаги под управлением (а не только
+    тикеры из .env): списки берутся из движка + открытых позиций;
+  • новая команда /predict ТИКЕР [часов] - график и текст прогноза цены
+    (стат. модель: инерция + возврат к средней + конус неопределённости);
+    тот же прогноз вшит в сводку ИИ-трейдера перед каждой сделкой;
+  • в отчёте сканера в конце - короткий совет ИИ простыми словами
+    (что покупать и в каких количествах), разбор ответа ИИ стал устойчивее;
+  • при старте бот вспоминает, чем торговал: все известные тикеры
+    (список + открытые позиции) подключаются к работе сразу, без ожидания
+    сканера - позиции под охраной с первой минуты.
+
 Команды (принимаются ТОЛЬКО от администратора из TELEGRAM_ADMIN_ID):
   /start           - сводный статус бота простыми словами;
   /status          - позиции, баланс и последние действия;
@@ -58,10 +70,11 @@ from aiogram.types import (BufferedInputFile, CallbackQuery, InlineKeyboardButto
                            ReplyKeyboardMarkup)
 
 import charts
+import predictor
 
 log = logging.getLogger("telegram")
 
-VERSION = "1.7.1"
+VERSION = "1.7.2"
 
 HELP_TEXT = (
     "Команды (можно не печатать - жмите кнопки на клавиатуре ниже чата):\n"
@@ -71,6 +84,7 @@ HELP_TEXT = (
     "/stats - статистика и график по акциям за 6 часов\n"
     "/stats 12 - то же за 12 часов (можно 1-48)\n"
     "/scan - сканер рынка прямо сейчас: топ кандидатов на покупку\n"
+    "/predict SBER 6 - прогноз цены на 6 ч: график + текст (можно 1-24 ч)\n"
     "/buy SBER 100 - купить вручную (тикер и штуки, не лоты)\n"
     "/sell GAZP 30 - продать вручную (без числа - продать всё)\n"
     "/watchlist - бумаги под автоматической торговлей\n"
@@ -143,6 +157,11 @@ HELP_TEXT = (
     "продаёт сразу).\n"
     "• Тейк-профит - автоматическая продажа с прибылью, когда цена "
     "выросла до цели (у бота это +5%).\n"
+    "• Прогноз цены (/predict) - статистическая оценка, куда пойдёт цена "
+    "в ближайшие часы: инерция движения + притяжение к средней + разброс "
+    "из-за волатильности (конус 80%). Тот же прогноз видит ИИ-трейдер "
+    "перед каждой сделкой. Это оценка, не гарантия: внезапные новости "
+    "она не учитывает.\n"
     "• Песочница - тренировочный счёт с виртуальными деньгами. "
     "Реальный счёт - настоящие деньги и настоящие сделки."
 )
@@ -154,7 +173,7 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
         [KeyboardButton(text="/status"), KeyboardButton(text="/positions"),
          KeyboardButton(text="/charts")],
         [KeyboardButton(text="/scan"), KeyboardButton(text="/watchlist"),
-         KeyboardButton(text="/stats")],
+         KeyboardButton(text="/stats"), KeyboardButton(text="/predict")],
         [KeyboardButton(text="/scalp"), KeyboardButton(text="/autobuy"),
          KeyboardButton(text="/toggle_trading")],
         [KeyboardButton(text="/memory"), KeyboardButton(text="/ask "),
@@ -171,6 +190,7 @@ BOT_COMMANDS = [
     ("positions", "открытые позиции с кнопками продажи"),
     ("charts", "графики всех бумаг под управлением"),
     ("stats", "статистика и график за часы"),
+    ("predict", "прогноз цены: /predict SBER 6"),
     ("scan", "сканер рынка: топ кандидатов"),
     ("autobuy", "автопокупка кандидатов сканера: вкл/выкл"),
     ("buy", "купить: /buy SBER 100 (штуки)"),
@@ -383,6 +403,86 @@ def create_router(ctx: AppContext) -> Router:
         except Exception as exc:  # noqa: BLE001 - картинка не прошла, шлём текст
             log.warning("Не удалось отправить график: %s", exc)
             await message.answer(text)
+
+    # --------------------------------------------------------------- /predict
+    @router.message(Command("predict"))
+    async def cmd_predict(message: Message,
+                          command: Optional[CommandObject] = None) -> None:
+        """Прогноз цены (v1.7.2): /predict [ТИКЕР [часов]].
+
+        Статистическая модель (predictor.py): инерция движения + притяжение
+        к средней + конус неопределённости из EWMA-волатильности. Тот же
+        прогноз видит ИИ-трейдер перед каждой сделкой.
+        """
+        if not is_admin(message):
+            return
+        known = list(dict.fromkeys(
+            (ctx.engine.watchlist() if ctx.engine is not None else [])
+            + list(ctx.state.positions)))
+        if not known:
+            known = list(ctx.config.trading_tickers)
+        hours, ticker = 6.0, known[0]
+        if command and command.args:
+            known_set = {t.upper() for t in known}
+            ticker_taken = False
+            for token in command.args.replace(",", " ").split():
+                clean = token.strip().rstrip("ч").strip()
+                if clean.replace(".", "", 1).isdigit():
+                    try:
+                        hours = float(clean)
+                    except ValueError:
+                        pass
+                elif clean.upper() in known_set:
+                    ticker = clean.upper()
+                elif (not ticker_taken and clean.isalpha()
+                      and clean.isascii() and 2 <= len(clean) <= 6):
+                    ticker = clean.upper()   # неизвестный тикер - проверит ensure
+                    ticker_taken = True
+        hours = max(1.0, min(24.0, hours))
+        if not ctx.client.ensure_instrument(ticker):
+            await message.answer(
+                f"Тикер {ticker} не найден на Мосбирже. Доступные примеры: "
+                f"SBER, GAZP, LKOH. Сейчас под управлением: "
+                f"{', '.join(known)}.")
+            return
+        wait = await message.answer(
+            f"🔮 Считаю прогноз {ticker} на {hours:g} ч: свечи, дрожание цены, "
+            f"конус разброса...")
+        try:
+            hist = await ctx.client.get_candles_history(
+                ticker, max(26.0, hours * 2.0), 0.25)
+            live = await ctx.client.get_price(ticker)
+        except Exception as exc:  # noqa: BLE001
+            await wait.edit_text(
+                f"❌ Не удалось получить данные по {ticker}: {exc}")
+            return
+        closes = [p for _, p in hist if p]
+        if len(closes) < predictor.MIN_POINTS:
+            await wait.edit_text(
+                f"По {ticker} слишком мало свечей ({len(closes)}) для "
+                f"прогноза - попробуйте позже.")
+            return
+        price = float(live) if live else closes[-1]
+        ts_last = hist[-1][0] if hist else None
+        fc = predictor.forecast(closes, 0.25, hours, price=price,
+                                ts_last=ts_last)
+        if not fc:
+            await wait.edit_text(
+                "Прогноз не сошёлся (странные данные) - попробуйте позже.")
+            return
+        text = predictor.describe(fc, ticker)
+        try:
+            png = charts.render_forecast_png(hist, fc, ticker)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("График прогноза не построился: %s", exc)
+            png = None
+        await wait.delete()
+        if png:
+            await message.answer_photo(BufferedInputFile(png,
+                                     filename=f"predict-{ticker}.png"),
+                                     caption=text[:1024])
+        else:
+            await _answer_long(message, text)
 
     # ------------------------------------------------ /set_aggressiveness
     @router.message(Command("set_aggressiveness"))
@@ -1069,8 +1169,13 @@ def create_router(ctx: AppContext) -> Router:
 # ---------------------------------------------------------------------------
 # Статистика (/stats): текст + график.
 # ---------------------------------------------------------------------------
-async def _stats_text(ctx: AppContext, hours: float) -> Tuple[str, List[Tuple[str, list]]]:
-    """Готовит текст статистики и набор данных для графика."""
+async def _stats_text(ctx: AppContext, hours: float) -> Tuple[str, list]:
+    """Готовит текст статистики и набор данных для графика.
+
+    v1.7.2: обходим ВСЕ бумаги под управлением (список движка + открытые
+    позиции), а не только тикеры из .env - раньше автоподключённые бумаги
+    (CNRU, VKCO и т.п.) в /stats не попадали.
+    """
     series: List[Tuple[str, list]] = []
     lines: List[str] = []
     since = datetime.now().strftime("%d.%m %H:%M")
@@ -1078,10 +1183,20 @@ async def _stats_text(ctx: AppContext, hours: float) -> Tuple[str, List[Tuple[st
     lines.append(f"📈 Статистика за {hours:.0f} ч "
                  f"(с {dt_from.strftime('%d.%m %H:%M')} до {since})")
 
+    if ctx.engine is not None:
+        tickers = list(ctx.engine.watchlist())
+    else:
+        tickers = list(ctx.config.trading_tickers)
+    for ticker in ctx.state.positions:
+        if ticker not in tickers:
+            tickers.append(ticker)
+    if not tickers:
+        tickers = list(ctx.config.trading_tickers)
+
     trades_in_window = _count_trades_in_window(ctx, hours)
     have_any = False
 
-    for ticker in ctx.config.trading_tickers:
+    for ticker in tickers:
         hist = ctx.state.price_history(ticker, hours)
         # Достраиваю историю часовыми свечами с биржи всегда: мои замеры
         # живут максимум ~8 ч (100 точек по 5 мин) и теряются при рестарте.
@@ -1304,9 +1419,23 @@ async def _balance_line(ctx: AppContext) -> str:
 
 
 async def _position_pnl_line(ctx: AppContext, ticker: str, pos: dict) -> str:
-    """Для /status: '+0.9% (+129 ₽)' по позиции, если цену удалось узнать."""
+    """Для /positions и /status: '+0.9% (+129 ₽)' по позиции.
+
+    v1.7.2: если живой цены нет (тикер ещё не подключён к работе), берём
+    последнюю сохранённую точку из своей истории цен - раньше у таких бумаг
+    строка результата молча пропадала, и казалось, что бот не следит за
+    позицией.
+    """
     try:
-        price = await ctx.client.get_price(ticker)
+        price = None
+        try:
+            price = await ctx.client.get_price(ticker)
+        except Exception:  # noqa: BLE001 - попробуем свою историю
+            price = None
+        if not price:
+            hist = ctx.state.price_history(ticker, 24.0)
+            if hist:
+                price = hist[-1][1]
         entry = float(pos.get("entry_price", 0) or 0)
         if not price or entry <= 0:
             return ""

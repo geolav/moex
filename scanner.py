@@ -273,8 +273,8 @@ class MarketScanner:
                     "(рынок без перекосов или свечей не хватило) - "
                     "попробую в следующий раз."), [], []
 
-        verdicts = await self._ai_verdicts(top)
-        text = self._build_report(top, verdicts, scalp_note)
+        verdicts, advice = await self._ai_verdicts(top)
+        text = self._build_report(top, verdicts, scalp_note, advice=advice)
         photos = self._render_photos(top)
         return text, photos, top
 
@@ -349,10 +349,17 @@ class MarketScanner:
                  len(scored), len(pool))
         return scored
 
-    async def _ai_verdicts(self, top: List[Dict[str, Any]]) -> Dict[str, str]:
-        """Короткий ИИ-комментарий по кандидатам - ОДНИМ запросом к Groq."""
+    async def _ai_verdicts(self, top: List[Dict[str, Any]]
+                           ) -> Tuple[Dict[str, str], str]:
+        """ИИ-комментарий по кандидатам - ОДНИМ запросом к Groq.
+
+        v1.7.2: возвращает (вердикты, совет). Совет - короткое резюме
+        простыми словами для конца отчёта (что советует покупать и в каких
+        количествах). Старые аналитики (тесты/фолбэк) без нового метода
+        дают только вердикты без совета.
+        """
         if not (self._cfg.scan_llm and top and self._analyst is not None):
-            return {}
+            return {}, ""
         rows = []
         for r in top:
             s = r["summary"]
@@ -367,20 +374,32 @@ class MarketScanner:
                 "vs_sma_pct": vs_sma,
                 "turnover_txt": _fmt_turnover(r["turnover"]),
             })
+        method = getattr(self._analyst, "scan_verdicts_with_advice", None)
+        if method is not None:
+            try:
+                verdicts, advice = await method(rows)
+                return dict(verdicts or {}), str(advice or "")
+            except Exception as exc:  # noqa: BLE001 - ИИ не обязателен
+                log.info("Сканер: ИИ-комментарии недоступны (%s)", exc)
+                return {}, ""
+        legacy = getattr(self._analyst, "scan_verdicts", None)
+        if legacy is None:
+            return {}, ""
         try:
-            return await self._analyst.scan_verdicts(rows)
-        except Exception as exc:  # noqa: BLE001 - ИИ не обязателен
+            return dict(await legacy(rows) or {}), ""
+        except Exception as exc:  # noqa: BLE001
             log.info("Сканер: ИИ-комментарии недоступны (%s)", exc)
-            return {}
+            return {}, ""
 
     # ------------------------------------------------------------------ вывод
     def _build_report(self, top: List[Dict[str, Any]],
                       verdicts: Dict[str, str],
-                      scalp_note: str = "") -> str:
+                      scalp_note: str = "",
+                      advice: str = "") -> str:
         cfg = self._cfg
         stamp = time.strftime("%d.%m %H:%M")
         lines = [f"🔎 Сканер рынка {stamp} - топ {len(top)} кандидатов "
-                 f"на покупку:"]
+                 f"на покупку (сортировка - от более интересных к менее):"]
         for i, row in enumerate(top, 1):
             s = row["summary"]
             name = self._client.instrument_name(row["ticker"])
@@ -399,6 +418,10 @@ class MarketScanner:
             lines.append("Сильных сигналов на рынке сейчас нет - "
                          "это лучшие из доступных.")
         lines.append("")
+        # v1.7.2: короткий совет ИИ простыми словами - в КОНЦЕ списка.
+        if advice:
+            lines.append(f"🤖 Совет ИИ простыми словами: {advice}")
+            lines.append("")
         if scalp_note:
             lines.append(scalp_note.strip())
         lines.append("Кнопки: «Купить ТИКЕР» - сразу 1 лот своими руками; "

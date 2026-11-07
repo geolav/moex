@@ -128,3 +128,57 @@ def build_chart_items(history_by_ticker: Dict[str, Sequence[Tuple[float, float]]
             item["subtitle"] = sub
         items.append(item)
     return items
+
+
+def render_forecast_png(history: Sequence[Tuple[float, float]],
+                        fc: Dict[str, Any], ticker: str,
+                        subtitle: str = "") -> Optional[bytes]:
+    """
+    График прогноза (v1.7.2, команда /predict): история цены + медианный
+    путь прогноза (оранжевый пунктир) + конус 80% (заливка) на горизонте.
+
+    history - [(ts, price)] прошлые свечи; fc - словарь из predictor.forecast
+    (ключи path/band_low/band_high). matplotlib недоступен -> None.
+    """
+    pts = [(float(ts), float(p)) for ts, p in history if p]
+    path = fc.get("path") or []
+    low = fc.get("band_low") or []
+    high = fc.get("band_high") or []
+    if len(pts) < 2 or len(path) < 3:
+        return None
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as exc:  # noqa: BLE001
+        log.warning("matplotlib недоступен, график прогноза не строю: %s", exc)
+        return None
+
+    fig, ax = plt.subplots(figsize=(7.2, 4.2), constrained_layout=True)
+    xs = [datetime.fromtimestamp(ts) for ts, _ in pts]
+    ax.plot(xs, [p for _, p in pts], lw=1.5, color="#1f77b4", label="цена (факт)")
+    fx = [datetime.fromtimestamp(ts) for ts, _ in path]
+    if len(low) == len(path) and len(high) == len(path):
+        ax.fill_between(fx, [p for _, p in low], [p for _, p in high],
+                        color="#2ca02c", alpha=0.18,
+                        label="конус 80% (куда попадёт цена)")
+    ax.plot(fx, [p for _, p in path], lw=1.7, ls="--", color="#2ca02c",
+            label="прогноз (среднее ожидание)")
+    ax.axvline(fx[0], lw=0.9, color="#888888", alpha=0.6)
+    title = f"{ticker} - прогноз на {fc.get('horizon_h', 0):g} ч"
+    if subtitle:
+        title += f"  {subtitle}"
+    ax.set_title(title, fontsize=10, loc="left")
+    ax.set_ylabel("цена, ₽", fontsize=8)
+    ax.grid(alpha=0.3)
+    ax.tick_params(labelsize=8)
+    for label in ax.get_xticklabels():
+        label.set_rotation(20)
+        label.set_ha("right")
+    ax.legend(fontsize=8, loc="best")
+    buf = io.BytesIO()
+    try:
+        fig.savefig(buf, format="png", dpi=100)
+    finally:
+        plt.close(fig)
+    return buf.getvalue()

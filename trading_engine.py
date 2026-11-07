@@ -59,6 +59,7 @@ import time
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 import indicators
+import predictor
 import sessions
 
 log = logging.getLogger("engine")
@@ -1515,6 +1516,16 @@ class TradingEngine:
                 text += (f" Средняя покупки {avg:.2f} ₽ → {profit_pct:+.2f}% "
                          f"({'+' if pnl >= 0 else '−'}{_fmt_rub(abs(pnl))} ₽).")
             return text
+
+    def _forecast_horizon_h(self) -> float:
+        """Горизонт прогноза цены (v1.7.2) - согласован со стилем торговли:
+        активный/скальп-режим смотрит на 1-2 ч, спокойный - до 12 ч.
+        """
+        base = self._sma_hours() * 1.5
+        if self.scalp_mode():
+            return min(3.0, max(1.0, base))
+        return min(12.0, max(2.0, base))
+
     def _build_brief(self, ticker: str, price: float,
                      summary: Dict[str, Optional[float]], sentiment: float,
                      position: Optional[Dict[str, Any]] = None,
@@ -1563,6 +1574,21 @@ class TradingEngine:
             vol = summary.get("volatility")
             if vol is not None:
                 lines.append(f"Волатильность: {vol:.2f}% в час")
+
+        # v1.7.2: статистический прогноз цены (predictor.py) - ещё один
+        # аргумент для ИИ-трейдера. Считается по уже загруженным свечам,
+        # лишних запросов к API не делает.
+        if history and summary:
+            step_h = float(summary.get("step_h") or 0.0)
+            if step_h > 0 and len(history) >= predictor.MIN_POINTS:
+                try:
+                    fc = predictor.forecast([p for _, p in history], step_h,
+                                            self._forecast_horizon_h(),
+                                            price=price)
+                except Exception:  # noqa: BLE001 - прогноз не обязателен
+                    fc = None
+                if fc:
+                    lines.append(predictor.brief_line(fc))
 
         # v1.7.0: положение цены в локальном диапазоне - чтобы модель не
         # советовала покупать вплотную к локальному максимуму (кейс LKOH).

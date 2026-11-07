@@ -26,6 +26,7 @@ import os
 import signal
 import sys
 import time
+from typing import List
 
 from aiogram import Bot
 
@@ -144,6 +145,40 @@ def _print_banner(config: BotConfig, state: StateStore) -> None:
     log.info("=" * 60)
 
 
+def remember_traded_tickers(client: TinkoffClient, engine: TradingEngine,
+                            state: StateStore) -> None:
+    """v1.7.2: помним, чем торгуем - подключаем ВСЕ известные тикеры сразу.
+
+    После рестарта у клиента в кэше только тикеры из .env, а бумаги,
+    добавленные на ходу (автоподключение из вселенной TQBR, /watch,
+    ручные покупки), пропадали: движок их помнил, но цену взять было
+    неоткуда ('не в кэше инструментов'), и позиции оставались без охраны,
+    пока сканер случайно не встречал бумагу среди кандидатов. Теперь все
+    известные тикеры (список бумаг + открытые позиции) подключаются из
+    вселенной TQBR СРАЗУ после старта, без ожидания сканера.
+    """
+    known: List[str] = []
+    for src in (list(engine.watchlist()), list(state.positions)):
+        for raw in src:
+            ticker = (raw or "").strip().upper()
+            if ticker and ticker not in known:
+                known.append(ticker)
+    if not known:
+        return
+    ok, missing = [], []
+    for ticker in known:
+        if client.ensure_instrument(ticker):
+            ok.append(ticker)
+        else:
+            missing.append(ticker)
+    if ok:
+        log.info("Помню, чем торгуем (%d бумаг, позиции + список): %s",
+                 len(ok), ", ".join(ok))
+    if missing:
+        log.warning("Не смог подключить тикеры (нет во вселенной TQBR): %s "
+                    "- попробую через сканер", ", ".join(missing))
+
+
 async def async_main() -> int:
     config = load_config()
     setup_logging(config)
@@ -242,6 +277,9 @@ async def async_main() -> int:
     exit_code = 0
     try:
         await client.start()
+        # v1.7.2: сразу вспоминаем, чем торгуем (позиции под охраной с
+        # первой минуты, а не когда сканер случайно встретит бумагу).
+        remember_traded_tickers(client, engine, state)
         await analyst.start()
         log.info("Все компоненты инициализированы, запускаю фоновые задачи")
 
