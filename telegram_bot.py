@@ -1,18 +1,25 @@
 """
 telegram_bot.py - Telegram-интерфейс управления (aiogram 3.x).
 
+v1.7.0: команды можно не печатать - есть кнопки:
+  • reply-клавиатура под чатом (/status, /scan, /scalp и др.);
+  • синяя кнопка «Меню» с описаниями команд (set_my_commands в main.py);
+  • inline-кнопки: «Купить»/«Веду» в отчётах сканера и «Продать» в /positions.
+
 Команды (принимаются ТОЛЬКО от администратора из TELEGRAM_ADMIN_ID):
   /start           - сводный статус бота простыми словами;
   /status          - позиции, баланс и последние действия;
-  /positions       - открытые позиции и их текущий результат;
+  /positions       - открытые позиции, текущий результат и кнопки продажи;
   /stats [часов]   - статистика по бумагам за N часов + график-картинка;
   /charts [часов]  - графики ВСЕХ бумаг под управлением (2 фото по 3 графика);
   /scan            - запустить сканер рынка прямо сейчас (топ кандидатов);
   /buy ТИКЕР ШТ    - ручная покупка (обходит сигналы ИИ, не обходит деньги);
   /sell ТИКЕР [ШТ] - ручная продажа (без числа - продать всё);
-  /watchlist       - бумаги под автоматической торговлей (до 6);
+  /watchlist       - бумаги под автоматической торговлей;
   /watch ТИКЕР     - добавить бумагу под управление;
   /unwatch ТИКЕР   - убрать бумагу из управления;
+  /scalp [on|off]  - СКАЛЬП-РЕЖИМ: сканер сам ведёт до 10 бумаг всего рынка,
+                     решения каждые 5 мин, выход при остановке роста;
   /toggle_trading  - включить/выключить автоматическую торговлю;
   /toggle_sandbox  - переключить песочница <-> реальный счёт
                      (переход в реал требует подтверждения "/toggle_sandbox confirm");
@@ -37,29 +44,31 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
-from aiogram import Bot, Dispatcher, Router
+from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandObject, CommandStart
-from aiogram.types import BufferedInputFile, Message
+from aiogram.types import (BufferedInputFile, CallbackQuery, InlineKeyboardButton,
+                           InlineKeyboardMarkup, KeyboardButton, Message,
+                           ReplyKeyboardMarkup)
 
 import charts
 
 log = logging.getLogger("telegram")
 
-VERSION = "1.6.1"
+VERSION = "1.7.0"
 
 HELP_TEXT = (
-    "Команды:\n"
-    "/start - что бот сейчас делает (кратко)\n"
+    "Команды (можно не печатать - жмите кнопки на клавиатуре ниже чата):\n"
     "/status - деньги, позиции и последние события\n"
-    "/positions - открытые позиции и их текущий результат\n"
+    "/positions - открытые позиции + кнопка «Продать» у каждой\n"
+    "/charts - графики всех моих бумаг (2 фото, по 3 графика)\n"
     "/stats - статистика и график по акциям за 6 часов\n"
     "/stats 12 - то же за 12 часов (можно 1-48)\n"
-    "/charts - графики всех моих бумаг (2 фото, по 3 графика)\n"
     "/scan - сканер рынка прямо сейчас: топ кандидатов на покупку\n"
     "/buy SBER 100 - купить вручную (тикер и штуки, не лоты)\n"
     "/sell GAZP 30 - продать вручную (без числа - продать всё)\n"
-    "/watchlist - бумаги под автоматической торговлей (до 6)\n"
+    "/watchlist - бумаги под автоматической торговлей\n"
     "/watch MTSS - добавить бумагу, /unwatch MTSS - убрать\n"
+    "/scalp - СКАЛЬП-РЕЖИМ: весь рынок сам, до 10 бумаг, сделки по 5 мин\n"
     "/memory - что бот выучил из своих сделок (винрейт, уроки, плохие часы)\n"
     "/reset_memory - забыть всю память сделок (начать учиться заново)\n"
     "/toggle_trading - вкл/выкл автоматическую торговлю\n"
@@ -69,7 +78,7 @@ HELP_TEXT = (
     "/audit 150 - то же, но по последним 150 строкам (10-200)\n"
     "/ask почему не покупаешь GAZP? - вопрос ИИ-трейдеру\n"
     "/set_aggressiveness 70 - решительность торговли 0-100\n"
-    "/set_activity 80 - режим активности 0-100: какие движения цены следить\n"
+    "/set_activity 80 - режим активности 0-100: за какими движениями следить\n"
     "/set_invested 30 - максимум % ВСЕХ денег в акциях (5-100)\n"
     "/shutdown - выключить бота\n"
     "/help - эта справка\n\n"
@@ -79,12 +88,24 @@ HELP_TEXT = (
     "указывайте штуки - бот сам пересчитает в лоты.\n"
     "• Сканер рынка - раз в 10 минут бот просматривает почти весь рынок "
     "Мосбиржи (ликвидные бумаги с оборотом от десятков миллионов) и "
-    "присылает топ кандидатов на покупку с графиками и вердиктом ИИ. "
-    "Сам он их НЕ покупает: /buy - купить сразу, /watch - отдать под "
-    "автоторговлю.\n"
-    "• Умная фиксация прибыли - если бумага сильно выросла, бот продаёт "
-    "её уже при крошечном падении от пика: чем выше пик, тем меньше "
-    "допуск (пик ≥3% - откат 0.7 п.п., ≥5% - 0.4 п.п., ≥8% - 0.25 п.п.).\n"
+    "присылает топ кандидатов на покупку с графиками, вердиктом ИИ и "
+    "кнопками. Сам он их НЕ покупает: /buy - купить сразу, /watch - отдать "
+    "под автоторговлю.\n"
+    "• Скальп-режим (/scalp) - отдельный режим для многих мелких сделок: "
+    "сканер сам отбирает лучшие бумаги всего рынка (до 10 одновременно), "
+    "решения о сделках - каждые 5 минут, охрана позиций - каждые 2.5 мин, "
+    "позиция закрывается, как только цена перестала расти.\n"
+    "• Радар разворота (защита прибыли) - если бумага сильно выросла "
+    "(от +3%), бот продаёт её при ПЕРВОМ признаке разворота: импульс "
+    "затух, цена ушла под среднюю, две свечи подряд вниз - всё, фиксируем.\n"
+    "• Анти-погоня - бот не покупает, когда цена уже вплотную к локальному "
+    "максимуму или отскок от минимума уже отыгран: так не бывает «дешёвой "
+    "покупки на хаю» (виновник той самой сделки по LKOH).\n"
+    "• Умная фиксация прибыли - чем выше пик роста, тем меньший откат "
+    "терпит бот (пик ≥3% - откат 0.7 п.п., ≥5% - 0.4 п.п., ≥8% - 0.25 п.п.).\n"
+    "• Утренний якорь - с 10:00 до ~13:00 бот не опирается на «ночной "
+    "график» (торгов-то не было): средняя считается по вчерашней основной "
+    "сессии, а ИИ видит, как бумага двигалась вчера утром.\n"
     "• Рабочая средняя (SMA) - средняя цена за период, который выбрал бот "
     "через /set_activity (от 1 часа до суток). Стратегия: покупать, когда "
     "цена НИЖЕ этой средней (бумага подешевела), продавать - когда "
@@ -112,6 +133,41 @@ HELP_TEXT = (
     "• Песочница - тренировочный счёт с виртуальными деньгами. "
     "Реальный счёт - настоящие деньги и настоящие сделки."
 )
+
+#: Кнопки под чатом: команды в один тап (v1.7.0).
+#: ВАЖНО: aiogram 3 - это pydantic-модели, ТОЛЬКО именованные аргументы.
+MAIN_KEYBOARD = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="/status"), KeyboardButton(text="/positions"),
+         KeyboardButton(text="/charts")],
+        [KeyboardButton(text="/scan"), KeyboardButton(text="/watchlist"),
+         KeyboardButton(text="/stats")],
+        [KeyboardButton(text="/scalp"), KeyboardButton(text="/toggle_trading"),
+         KeyboardButton(text="/memory")],
+        [KeyboardButton(text="/ask "), KeyboardButton(text="/help")],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+    input_field_placeholder="Команда или вопрос…",
+)
+
+#: Меню команд (синяя кнопка «Меню» в Telegram). Заполняется при старте.
+BOT_COMMANDS = [
+    ("status", "деньги, позиции, последние события"),
+    ("positions", "открытые позиции с кнопками продажи"),
+    ("charts", "графики всех бумаг под управлением"),
+    ("stats", "статистика и график за часы"),
+    ("scan", "сканер рынка: топ кандидатов"),
+    ("buy", "купить: /buy SBER 100 (штуки)"),
+    ("sell", "продать: /sell GAZP 30 (или всё)"),
+    ("watchlist", "список бумаг под автоторговлей"),
+    ("scalp", "скальп-режим: весь рынок, до 10 бумаг"),
+    ("memory", "что бот выучил из сделок"),
+    ("toggle_trading", "вкл/выкл автоторговлю"),
+    ("toggle_sandbox", "песочница ↔ реальный счёт"),
+    ("ask", "вопрос ИИ-трейдеру"),
+    ("help", "полная справка"),
+]
 
 #: Максимум точек истории цен в state.json (часов * 2 точки при опросе 5 мин).
 STATS_MAX_HOURS = 48
@@ -163,15 +219,23 @@ def create_router(ctx: AppContext) -> Router:
                    if ctx.state.auditor_enabled else "выключен")
         balance_line = await _balance_line(ctx)
         uptime = _uptime(ctx.started_monotonic)
+        scalp = ("⚡ Скальп-режим ВКЛЮЧЁН (весь рынок, до "
+                 f"{ctx.config.scalp_max_positions} бумаг)\n"
+                 if ctx.state.scalp_mode else "")
         await message.answer(
             f"🤖 Бот-трейдер для Мосбиржи (v{VERSION})\n"
             f"Режим: {mode}\n"
             f"Автотрейдинг: {trading}\n"
+            f"{scalp}"
             f"ИИ-аудитор: {auditor}\n"
             f"{balance_line}\n"
-            f"Слежу за: {', '.join(ctx.config.trading_tickers)} "
+            f"Слежу за: {', '.join(ctx.engine.watchlist())} "
             f"(проверка каждые {ctx.config.poll_interval_sec // 60} мин)\n"
-            f"Работаю уже: {uptime}\n\n{HELP_TEXT}"
+            f"Работаю уже: {uptime}\n\n"
+            "Команды можно не печатать - жмите кнопки на клавиатуре ниже "
+            "или синюю кнопку «Меню» слева от поля ввода.\n\n"
+            f"{HELP_TEXT}",
+            reply_markup=MAIN_KEYBOARD,
         )
 
     # --------------------------------------------------------------- /status
@@ -542,7 +606,7 @@ def create_router(ctx: AppContext) -> Router:
     # ------------------------------------------------------------- /positions
     @router.message(Command("positions"))
     async def cmd_positions(message: Message) -> None:
-        """Открытые позиции бота с текущим результатом по каждой."""
+        """Открытые позиции бота с текущим результатом и кнопками продажи."""
         if not is_admin(message):
             return
         positions = ctx.state.positions
@@ -552,14 +616,18 @@ def create_router(ctx: AppContext) -> Router:
                 "Общая картина счёта: /status")
             return
         parts = [f"📂 Открытые позиции ({len(positions)}):"]
+        rows = []
         for ticker, pos in positions.items():
             line = (f"• {ticker}: {pos.get('lots')} лот(а), куплено "
                     f"{pos.get('entry_ts')} по {pos.get('entry_price')} ₽")
             line += await _position_pnl_line(ctx, ticker, pos)
             parts.append(line)
-        parts.append("Закрыть вручную: /sell ТИКЕР ШТ "
-                     "(без числа - продаст всё, что есть).")
-        await message.answer("\n".join(parts))
+            rows.append([InlineKeyboardButton(
+                text=f"💸 Продать {ticker}", callback_data=f"sell:{ticker}")])
+        parts.append("Продать можно кнопкой под этим сообщением или "
+                     "командой /sell ТИКЕР ШТ (без числа - продаст всё).")
+        await message.answer("\n".join(parts),
+                             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
     # ---------------------------------------------------------------- /charts
     @router.message(Command("charts"))
@@ -795,7 +863,128 @@ def create_router(ctx: AppContext) -> Router:
     async def cmd_help(message: Message) -> None:
         if not is_admin(message):
             return
-        await message.answer(HELP_TEXT)
+        await message.answer(HELP_TEXT, reply_markup=MAIN_KEYBOARD)
+
+    # ------------------------------------------------------------------- /scalp
+    @router.message(Command("scalp"))
+    async def cmd_scalp(message: Message,
+                        command: Optional[CommandObject] = None) -> None:
+        """Скальп-режим: весь рынок сам, до 10 бумаг, много мелких сделок."""
+        if not is_admin(message):
+            return
+        args = (command.args or "").strip().lower() if command else ""
+        current = ctx.state.scalp_mode
+        if args in ("on", "вкл", "включить"):
+            new_value = True
+        elif args in ("off", "выкл", "выключить"):
+            new_value = False
+        elif args == "":
+            new_value = not current
+        else:
+            await message.answer(
+                "Не понял аргумент. Варианты:\n"
+                "/scalp - переключить\n"
+                "/scalp on - включить\n"
+                "/scalp off - выключить")
+            return
+        ctx.state.set_scalp_mode(new_value)
+        if not new_value:
+            await message.answer(
+                "⏹ Скальп-режим ВЫКЛЮЧЕН.\n"
+                f"• Список бумаг больше не меняется автоматически "
+                f"(текущий: {', '.join(ctx.engine.watchlist())}) - "
+                f"лишние уберите: /unwatch ТИКЕР.\n"
+                f"• Открытые позиции продолжаю охранять до закрытия "
+                f"(стопы/тейки/фиксация прибыли работают).\n"
+                f"• Интервалы снова обычные: цикл каждые "
+                f"{ctx.config.poll_interval_sec // 60} мин.")
+            return
+        # Включаем: 10 бумаг не уместятся в дефолтные 30% вложенности -
+        # поднимаем лимит (и честно говорим об этом владельцу).
+        cap_note = ""
+        if ctx.state.max_invested_pct() < 70:
+            old = ctx.state.max_invested_pct()
+            ctx.state.set_max_invested_pct(70)
+            cap_note = (f"• Лимит вложенности поднят с {old}% до 70% "
+                        f"- иначе 10 бумаг физически не поместятся "
+                        f"(вернуть: /set_invested 30).\n")
+        await message.answer(
+            "⚡ СКАЛЬП-РЕЖИМ ВКЛЮЧЁН - много мелких сделок по всему рынку:\n"
+            f"• каждые {ctx.config.scan_interval_min} мин сканер смотрит ВСЮ "
+            f"Мосбиржу и сам обновляет список бумаг (до "
+            f"{ctx.config.scalp_max_positions} одновременно);\n"
+            f"• решения о покупках/продажах - каждые "
+            f"{ctx.config.scalp_poll_sec // 60} мин;\n"
+            f"• охрана открытых позиций - каждые "
+            f"{ctx.config.scalp_exit_poll_sec // 60} мин: сделка закрывается "
+            f"сразу, как только цена перестала расти (радар разворота от "
+            f"+{ctx.config.scalp_surge_from_pct:.1f}% прибыли);\n"
+            f"• стопы короче: −{ctx.config.scalp_stop_loss_pct:.0f}% "
+            f"(аварийный −{ctx.config.scalp_stop_loss_pct * ctx.config.hard_sl_mult:.1f}%), "
+            f"фиксация прибыли туже: "
+            f"{', '.join(f'≥{p:g}%:{d:g}п.п.' for p, d in ctx.config.scalp_harvest_tiers)};\n"
+            f"{cap_note}"
+            f"• бюджет на одну бумагу - равная доля лимита вложенности "
+            f"({70 if ctx.state.max_invested_pct() >= 70 else ctx.state.max_invested_pct()}% "
+            f"/ {ctx.config.scalp_max_positions} бумаг).\n\n"
+            "Первое обновление списка придёт с ближайшим отчётом сканера "
+            "(до 10 минут). Если сделок станет не хватать по дневному лимиту - "
+            "поднимите MAX_BUYS_PER_DAY в .env. Выключить: /scalp off")
+
+    # ------------------------------------------------- кнопки под сообщениями
+    @router.callback_query(F.data.startswith("buy:"))
+    async def cb_buy(callback: CallbackQuery) -> None:
+        """Кнопка «Купить ТИКЕР» в отчёте сканера: покупка 1 лота."""
+        user = getattr(callback, "from_user", None)
+        if getattr(user, "id", None) != admin_id:
+            await callback.answer("Только для администратора", show_alert=True)
+            return
+        ticker = (callback.data or "").split(":", 1)[1].strip().upper()
+        lot = ctx.client.get_lot_size(ticker) or 1
+        await callback.answer(f"Покупаю {ticker} ({lot} шт)...")
+        try:
+            text = await ctx.engine.force_buy(ticker, lot)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Кнопочная покупка %s не удалась", ticker)
+            text = f"❌ Ошибка: {exc}"
+        try:
+            await callback.message.answer(text[:4000])
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Не удалось отправить результат покупки: %s", exc)
+
+    @router.callback_query(F.data.startswith("sell:"))
+    async def cb_sell(callback: CallbackQuery) -> None:
+        """Кнопка «Продать ТИКЕР» в /positions: продаёт всё по бумаге."""
+        user = getattr(callback, "from_user", None)
+        if getattr(user, "id", None) != admin_id:
+            await callback.answer("Только для администратора", show_alert=True)
+            return
+        ticker = (callback.data or "").split(":", 1)[1].strip().upper()
+        await callback.answer(f"Продаю {ticker}...")
+        try:
+            text = await ctx.engine.force_sell(ticker, None)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Кнопочная продажа %s не удалась", ticker)
+            text = f"❌ Ошибка: {exc}"
+        try:
+            await callback.message.answer(text[:4000])
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Не удалось отправить результат продажи: %s", exc)
+
+    @router.callback_query(F.data.startswith("watch:"))
+    async def cb_watch(callback: CallbackQuery) -> None:
+        """Кнопка «Веду ТИКЕР» в отчёте сканера: отдать под автоторговлю."""
+        user = getattr(callback, "from_user", None)
+        if getattr(user, "id", None) != admin_id:
+            await callback.answer("Только для администратора", show_alert=True)
+            return
+        ticker = (callback.data or "").split(":", 1)[1].strip().upper()
+        try:
+            text = await ctx.engine.add_watchlist(ticker)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Кнопочное /watch %s не удалось", ticker)
+            text = f"❌ Ошибка: {exc}"
+        await callback.answer(text[:200], show_alert=True)
 
     return router
 
@@ -1061,9 +1250,16 @@ def _uptime(started_monotonic: float) -> str:
     return f"{hours} ч {minutes} мин"
 
 
-async def send_admin_message(bot: Bot, admin_id: int, text: str) -> None:
-    """Отправка уведомления администратору (движок, аудитор)."""
-    await bot.send_message(chat_id=admin_id, text=text)
+async def send_admin_message(bot: Bot, admin_id: int, text: str,
+                             reply_markup=None) -> None:
+    """Отправка уведомления администратору (движок, аудитор, сканер).
+
+    reply_markup - необязательная клавиатура (кнопки отчёта сканера)."""
+    if reply_markup is not None:
+        await bot.send_message(chat_id=admin_id, text=text,
+                               reply_markup=reply_markup)
+    else:
+        await bot.send_message(chat_id=admin_id, text=text)
 
 
 def build_dispatcher(ctx: AppContext) -> Dispatcher:

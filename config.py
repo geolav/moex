@@ -32,8 +32,9 @@ log = logging.getLogger("config")
 # Базовый каталог проекта = папка, где лежит этот файл.
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-#: Максимум тикеров - жёсткое требование по памяти и лимитам API.
-#: v1.6.0: поднято с 5 до 6 - движок ведёт до шести бумаг одновременно.
+#: Максимум тикеров ОБЫЧНОГО режима - жёсткое требование по памяти и лимитам
+#: API. v1.6.0: поднято с 5 до 6 - движок ведёт до шести бумаг одновременно.
+#: (В скальп-режиме лимит другой: SCALP_MAX_POSITIONS, по умолчанию 10.)
 MAX_TICKERS = 6
 
 _TRUE_VALUES = {"1", "true", "yes", "on", "y", "t", "да"}
@@ -182,6 +183,22 @@ class BotConfig:
     # Чем выше был пик прибыли, тем меньший откат от него терпим:
     # (пик %, допуск отката в пунктах). Пары отсортированы по убыванию пика.
     harvest_tiers: Tuple[Tuple[float, float], ...]
+    # --- Защита прибыли при взлёте и дисциплина входа (v1.7.0) ----------------
+    surge_sense_from_pct: float    # с какой прибыли включён "радар разворота"
+    chase_guard_pct: float         # не покупать ближе X% к локальному максимуму (0 = выкл)
+    chase_bounce_pct: float        # не покупать, если отскок от минимума окна уже >= X%
+    morning_anchor_until: int      # до скольки часов утренний якорь на вчерашний день
+    # --- Скальп-режим (v1.7.0): /scalp в Telegram -----------------------------
+    scalp_max_positions: int       # сколько бумаг вести одновременно (10)
+    scalp_poll_sec: int            # период полных циклов с решениями (5 мин)
+    scalp_exit_poll_sec: int       # период быстрой охраны позиций между циклами
+    scalp_cooldown_min: int        # кулдаун повторной покупки бумаги, мин
+    scalp_harvest_tiers: Tuple[Tuple[float, float], ...]
+    scalp_stop_loss_pct: float
+    scalp_take_profit_pct: float
+    scalp_trailing_activate_pct: float
+    scalp_trailing_drop_pct: float
+    scalp_surge_from_pct: float    # радар разворота агрессивнее, чем в обычном режиме
     # --- Сканер рынка (scanner.py) -------------------------------------------
     scan_enabled: bool            # фоновый поиск кандидатов раз в N минут
     scan_interval_min: int        # период сканирования рынка, минут
@@ -215,6 +232,9 @@ class BotConfig:
         Единая точка истины: и усечение TRADING_TICKERS, и лимит watchlist
         в движке смотрят сюда, так что рассинхрон «константа vs поле»
         исключён (v1.6.0: из-за него падал баннер при старте).
+
+        ВНИМАНИЕ (v1.7.0): это лимит ОБЫЧНОГО режима. В скальп-режиме
+        движок берёт scalp_max_positions - см. TradingEngine.max_tickers().
         """
         return MAX_TICKERS
 
@@ -265,7 +285,8 @@ def load_config() -> BotConfig:
         auditor_enabled_default=_env_bool("AUDITOR_ENABLED", True),
         trading_tickers=tickers,
         sma_period=_env_int("SMA_PERIOD", 24, low=2, high=500),
-        poll_interval_sec=_env_int("POLL_INTERVAL_SEC", 300, low=30, high=3600),
+        # v1.7.0: 300 -> 180 сек - бот смотрит акции чаще (правка владельца).
+        poll_interval_sec=_env_int("POLL_INTERVAL_SEC", 180, low=30, high=3600),
         max_position_pct=_env_float("MAX_POSITION_PCT", 10.0, low=0.5, high=100.0),
         stop_loss_pct=_env_float("STOP_LOSS_PCT", 3.0, low=0.1, high=50.0),
         take_profit_pct=_env_float("TAKE_PROFIT_PCT", 5.0, low=0.1, high=100.0),
@@ -295,6 +316,33 @@ def load_config() -> BotConfig:
                                                  low=0.0, high=100.0),
         harvest_tiers=parse_harvest_tiers(
             _env_str("HARVEST_TIERS", "3.0:0.7,5.0:0.4,8.0:0.25")),
+        surge_sense_from_pct=_env_float("SURGE_SENSE_FROM_PCT", 3.0,
+                                        low=0.5, high=100.0),
+        chase_guard_pct=_env_float("CHASE_GUARD_PCT", 0.5,
+                                   low=0.0, high=10.0),
+        chase_bounce_pct=_env_float("CHASE_BOUNCE_PCT", 1.2,
+                                    low=0.0, high=50.0),
+        morning_anchor_until=_env_int("MORNING_ANCHOR_UNTIL", 13,
+                                      low=10, high=17),
+        scalp_max_positions=_env_int("SCALP_MAX_POSITIONS", 10,
+                                     low=2, high=20),
+        scalp_poll_sec=_env_int("SCALP_POLL_SEC", 300, low=60, high=3600),
+        scalp_exit_poll_sec=_env_int("SCALP_EXIT_POLL_SEC", 150,
+                                     low=60, high=1800),
+        scalp_cooldown_min=_env_int("SCALP_COOLDOWN_MIN", 20,
+                                    low=0, high=600),
+        scalp_harvest_tiers=parse_harvest_tiers(
+            _env_str("SCALP_HARVEST_TIERS", "2.0:0.4,3.0:0.25,5.0:0.15")),
+        scalp_stop_loss_pct=_env_float("SCALP_STOP_LOSS_PCT", 2.0,
+                                       low=0.1, high=50.0),
+        scalp_take_profit_pct=_env_float("SCALP_TAKE_PROFIT_PCT", 3.0,
+                                         low=0.1, high=100.0),
+        scalp_trailing_activate_pct=_env_float("SCALP_TRAILING_ACTIVATE", 1.0,
+                                               low=0.0, high=100.0),
+        scalp_trailing_drop_pct=_env_float("SCALP_TRAILING_DROP", 0.5,
+                                           low=0.1, high=100.0),
+        scalp_surge_from_pct=_env_float("SCALP_SURGE_FROM_PCT", 1.5,
+                                        low=0.3, high=100.0),
         scan_enabled=_env_bool("SCAN_ENABLED", True),
         scan_interval_min=_env_int("SCAN_INTERVAL_MIN", 10, low=5, high=1440),
         scan_min_turnover=_env_float("SCAN_MIN_TURNOVER_MLN", 50.0,
@@ -348,7 +396,8 @@ class StateStore:
         "decision_log": [],       # последние решения трейдера (память для LLM)
         "last_buy_ts": {},        # ticker -> unix-ts последней покупки (кулдаун)
         "daily_buys": {"date": "", "count": 0},  # покупки за сегодня
-        "watchlist": [],          # тикеры под управлением бота (до 6)
+        "watchlist": [],          # тикеры под управлением бота (до 6/10)
+        "scalp_mode": False,      # v1.7.0: скальп-режим (/scalp в Telegram)
     }
 
     def __init__(self, path: str, initial_overrides: Optional[Dict[str, Any]] = None):
@@ -537,6 +586,16 @@ class StateStore:
         """Сохраняет список тикеров (без дублей, верхний регистр)."""
         clean = [str(t).strip().upper() for t in items if str(t).strip()]
         self._data["watchlist"] = list(dict.fromkeys(clean))
+        self.save()
+
+    # --- скальп-режим (v1.7.0) --------------------------------------------------
+    @property
+    def scalp_mode(self) -> bool:
+        """Включён ли скальп-режим (много мелких сделок, 10 бумаг)."""
+        return bool(self._data.get("scalp_mode", False))
+
+    def set_scalp_mode(self, value: bool) -> None:
+        self._data["scalp_mode"] = bool(value)
         self.save()
 
     # --- кулдаун и дневной лимит покупок ------------------------------------------

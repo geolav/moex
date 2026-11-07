@@ -264,6 +264,72 @@ def build_score(summary: Dict[str, Optional[float]]) -> float:
     return max(-1.0, min(1.0, round(score, 3)))
 
 
+# ---------------------------------------------------------------------------
+# v1.7.0: локальный диапазон и признаки разворота после сильного роста.
+# ---------------------------------------------------------------------------
+def range_position(closes: Sequence[float], lookback: int = 12,
+                   price: Optional[float] = None) -> Dict[str, Optional[float]]:
+    """
+    Где находится цена внутри своего ЛОКАЛЬНОГО диапазона (v1.7.0).
+
+    Нужна, чтобы не покупать "в погоню": если цена уже вплотную к локальному
+    максимуму или уже отскочила от минимума на заметный процент - сигнал
+    "отскока" по факту отыгран, и вход превращается в покупку на хае.
+
+    lookback - сколько последних свечей считать локальным окном;
+    возвращает: dist_to_high_pct (сколько % до максимума окна; отрицательное,
+    если цена ВЫШЕ максимума), bounce_from_low_pct (насколько % цена выросла
+    от минимума окна), pos_in_range (0..1 - положение внутри диапазона).
+    """
+    if not closes:
+        return {"dist_to_high_pct": None, "bounce_from_low_pct": None,
+                "pos_in_range": None}
+    window = list(closes[-max(2, lookback):]) if lookback else list(closes)
+    hi, lo = max(window), min(window)
+    p = float(price) if price else float(window[-1])
+    dist_high = (hi / p - 1.0) * 100.0 if p else None
+    bounce = (p / lo - 1.0) * 100.0 if lo else None
+    rng = hi - lo
+    pos = (p - lo) / rng if rng > 0 else 0.5
+    return {"dist_to_high_pct": dist_high, "bounce_from_low_pct": bounce,
+            "pos_in_range": pos}
+
+
+def surge_fall_hints(summary: Dict[str, Optional[float]],
+                     closes: Sequence[float] = ()) -> List[str]:
+    """
+    "Малейшие намёки", что цена после сильного взлёта может упасть (v1.7.0).
+
+    Пользовательская правка: если бумага сильно выросла, продаём при ПЕРВОМ
+    же признаке разворота - прибыль дороже ожидания. Каждый намёк - короткая
+    человеческая формулировка для уведомления. Пустой список = признаков нет.
+    """
+    hints: List[str] = []
+    macd_d = summary.get("macd")
+    if macd_d:
+        hist = macd_d.get("histogram") or 0.0
+        prev = macd_d.get("histogram_prev") or 0.0
+        if hist < prev:
+            hints.append("импульс вверх затухает")
+    sma_fast = summary.get("sma_fast")
+    price = summary.get("price") or 0.0
+    if sma_fast and price and price < sma_fast:
+        hints.append("цена ушла под рабочую среднюю")
+    rsi14 = summary.get("rsi14")
+    if rsi14 is not None and rsi14 >= 70:
+        hints.append(f"RSI {rsi14:.0f} - рост перегрет")
+    bb = summary.get("bollinger")
+    if bb and bb.get("pct_b") is not None and bb["pct_b"] >= 0.85:
+        hints.append("цена у верхней границы своего коридора")
+    chg_1h = summary.get("chg_1h")
+    if chg_1h is not None and chg_1h <= -0.2:
+        hints.append(f"последний час {chg_1h:+.1f}% - цену уже повело вниз")
+    # Две закрытые свечи падения подряд - локальный разворот.
+    if len(closes) >= 3 and closes[-1] < closes[-2] < closes[-3]:
+        hints.append("две свечи падения подряд")
+    return hints
+
+
 def describe_for_human(summary: Dict[str, Optional[float]]) -> str:
     """Индикаторы человеческими словами (для Telegram-сообщений)."""
     parts: List[str] = []

@@ -75,6 +75,17 @@ def make_test_config(tmp: str) -> BotConfig:
         hard_sl_mult=1.5, trailing_activate_pct=2.0, trailing_drop_pct=1.5,
         llm_early_sell_min_profit_pct=0.5,
         harvest_tiers=((8.0, 0.25), (5.0, 0.4), (3.0, 0.7)),
+        # v1.7.0: радар разворота / анти-погоня / утренний якорь / скальп.
+        # (make_test_config заполняет ВСЕ поля BotConfig, включая новые - и
+        # None вместо числа ломал вход: None > 0 в анти-погоне и др.)
+        surge_sense_from_pct=3.0, chase_guard_pct=0.5, chase_bounce_pct=1.2,
+        morning_anchor_until=13,
+        scalp_max_positions=10, scalp_poll_sec=300, scalp_exit_poll_sec=150,
+        scalp_cooldown_min=20,
+        scalp_harvest_tiers=((5.0, 0.15), (3.0, 0.25), (2.0, 0.4)),
+        scalp_stop_loss_pct=2.0, scalp_take_profit_pct=3.0,
+        scalp_trailing_activate_pct=1.0, scalp_trailing_drop_pct=0.5,
+        scalp_surge_from_pct=1.5,
         scan_enabled=False, scan_interval_min=10, scan_min_turnover=50.0,
         scan_min_price=5.0, scan_deep_n=20, scan_report_top=6, scan_llm=False,
         rate_limit_rpm=90,

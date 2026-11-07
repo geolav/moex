@@ -34,7 +34,8 @@ from ai_auditor import AIAuditor
 from ai_analyst import AIAnalyst, set_default_analyst
 from config import BotConfig, ConfigError, StateStore, load_config
 from scanner import MarketScanner
-from telegram_bot import AppContext, VERSION, build_dispatcher, send_admin_message
+from telegram_bot import (AppContext, BOT_COMMANDS, VERSION, build_dispatcher,
+                         send_admin_message)
 from tinkoff_client import TinkoffClient
 from trade_memory import TradeMemory
 from trading_engine import TradingEngine
@@ -102,19 +103,30 @@ def _print_banner(config: BotConfig, state: StateStore) -> None:
     tickers = config.trading_tickers
     log.info("=" * 60)
     log.info("MOEX Trading Bot v%s стартует", VERSION)
-    log.info("Режим: %s | торговля: %s | аудитор: %s", mode,
+    log.info("Режим: %s | торговля: %s | аудитор: %s | скальп-режим: %s",
+             mode,
              "вкл" if state.trading_enabled else "выкл",
-             "вкл" if state.auditor_enabled else "выкл")
-    log.info("Тикеры (до %d): %s | опрос %d сек | сканер рынка: %s (каждые %d мин)",
-             config.max_tickers, ", ".join(tickers),
+             "вкл" if state.auditor_enabled else "выкл",
+             "ВКЛ (/scalp)" if state.scalp_mode else "выкл")
+    log.info("Тикеры (до %d, скальп: до %d): %s | опрос %d сек | "
+             "сканер рынка: %s (каждые %d мин)",
+             config.max_tickers, config.scalp_max_positions, ", ".join(tickers),
              config.poll_interval_sec,
              "вкл" if config.scan_enabled else "выкл",
              config.scan_interval_min)
+    if state.scalp_mode:
+        log.info("Скальп: полные циклы каждые %d сек, охрана позиций каждые "
+                 "%d сек, кулдаун %d мин", config.scalp_poll_sec,
+                 config.scalp_exit_poll_sec, config.scalp_cooldown_min)
     log.info("Агрессивность %d/100 | активность %d/100 "
              "(масштаб времени задаётся в Telegram: /set_activity)",
              state.aggressiveness(), state.activity())
-    log.info("SL %.1f%% / TP %.1f%% | позиция <= %.1f%% свободных средств",
-             config.stop_loss_pct, config.take_profit_pct, config.max_position_pct)
+    log.info("SL %.1f%% / TP %.1f%% | позиция <= %.1f%% свободных средств | "
+             "радар разворота с +%.1f%% | анти-погоня %.2f%%/%.1f%% | "
+             "утренний якорь до %d:00",
+             config.stop_loss_pct, config.take_profit_pct, config.max_position_pct,
+             config.surge_sense_from_pct, config.chase_guard_pct,
+             config.chase_bounce_pct, config.morning_anchor_until)
     tiers_txt = ", ".join(f">={p:g}%:{d:g}п.п." for p, d in config.harvest_tiers) \
         if config.harvest_tiers else "выкл"
     log.info("Умная фиксация прибыли (HARVEST_TIERS): %s | SL подтверждение %d цикл(а)",
@@ -152,14 +164,16 @@ async def async_main() -> int:
     memory = TradeMemory(os.path.join(config.data_dir, "trade_memory.json"),
                          max_trades=config.memory_max_trades)
 
-    async def notify_admin(text: str) -> None:
-        await send_admin_message(bot, config.telegram_admin_id, text)
+    async def notify_admin(text: str, reply_markup=None) -> None:
+        await send_admin_message(bot, config.telegram_admin_id, text,
+                                 reply_markup=reply_markup)
 
     engine = TradingEngine(config, state, client, analyst, notify_admin,
                            memory=memory)
     auditor = AIAuditor(config, state, analyst, notify_admin)
 
-    async def send_admin_photos(caption: str, pngs: list) -> None:
+    async def send_admin_photos(caption: str, pngs: list,
+                                reply_markup=None) -> None:
         """Отправка картинок админу (сканер: топ кандидатов, 2 фото)."""
         from aiogram.types import BufferedInputFile
         for i, png in enumerate(pngs):
@@ -167,6 +181,7 @@ async def async_main() -> int:
                 chat_id=config.telegram_admin_id,
                 photo=BufferedInputFile(png, filename=f"scan-{i + 1}.png"),
                 caption=caption[:1024] if i == 0 else None,
+                reply_markup=reply_markup if i == 0 else None,
             )
 
     # Сканер рынка: раз в SCAN_INTERVAL_MIN минут ищет кандидаты по всему
@@ -224,6 +239,18 @@ async def async_main() -> int:
         await analyst.start()
         log.info("Все компоненты инициализированы, запускаю фоновые задачи")
 
+        # Меню команд в Telegram (синяя кнопка «Меню»): подсказки команд,
+        # чтобы не печатать их вручную (v1.7.0).
+        try:
+            from aiogram.types import BotCommand
+            await bot.set_my_commands(
+                [BotCommand(command=name, description=desc)
+                 for name, desc in BOT_COMMANDS])
+            log.info("Меню команд Telegram обновлено (%d команд)",
+                     len(BOT_COMMANDS))
+        except Exception as exc:  # noqa: BLE001 - меню не критично
+            log.warning("Не удалось обновить меню команд Telegram: %s", exc)
+
         # create_task, а НЕ gather: задачи живут в общем цикле последовательно.
         background_tasks.append(asyncio.create_task(engine.run(), name="engine"))
         background_tasks.append(asyncio.create_task(auditor.run(), name="auditor"))
@@ -238,12 +265,14 @@ async def async_main() -> int:
             mode = "Sandbox" if state.use_sandbox else "РЕАЛЬНЫЙ режим"
             scan_txt = (f"сканер рынка каждые {config.scan_interval_min} мин"
                         if config.scan_enabled else "сканер выключен")
+            scalp_txt = (" Скальп-режим ВКЛ (/scalp)." if state.scalp_mode
+                         else "")
             await notify_admin(
                 f"Бот запущен (v{VERSION}). Режим: {mode}. "
                 f"Тикеры: {', '.join(engine.watchlist())}. "
                 f"Торговля: {'вкл' if state.trading_enabled else 'выкл'}. "
-                f"{scan_txt}. "
-                f"Проверить логи вручную: /audit. Статистика: /stats.")
+                f"{scan_txt}.{scalp_txt} "
+                f"Команды теперь есть кнопками: /help.")
         except Exception as exc:  # noqa: BLE001 - Telegram мог быть недоступен
             log.warning("Приветствие в Telegram не отправлено: %s", exc)
 

@@ -3,22 +3,36 @@ scanner.py - сканер рынка Мосбиржи: раз в SCAN_INTERVAL_M
 почти всех акций биржи кандидатов "что хорошо бы купить".
 
 Как работает (дёшево по лимитам и памяти):
-  1. ОДИН открытый HTTP-запрос к MOEX ISS -> весь режим TQBR (~250 бумаг):
-     цена, изменение за день, оборот в рублях. Без ключей и без лимитов.
+  1. ОДИН открытый HTTP-запрос к MOEX ISS -> весь режим TQBR (~510 бумаг):
+     цена, изменение за день, оборот в рублях (блок marketdata, v1.7.0).
+     Без ключей и без лимитов.
   2. Отсекаем неликвид: оборот < SCAN_MIN_TURNOVER_MLN млн руб/день,
      цена < SCAN_MIN_PRICE руб. (Остаётся "почти весь" ликвидный рынок.)
   3. Собираем пул для глубокого анализа: топ по обороту (ядро рынка) +
      самые упавшие за день + самые выросшие (dedup, до SCAN_DEEP_N бумаг).
-     Бумаги, которыми бот уже торгует или держит, пропускаем.
+     Бумаги с открытыми позициями пропускаем.
   4. По каждой бумаге пул - свечи 15 мин за ~26 ч через T-Invest API и ТОТ ЖЕ
      индикаторный score, что и у торгового движка (indicators.build_score):
      сканер ищет кандидатов в стиле стратегии - откат с шансом на отскок.
   5. Топ SCAN_REPORT_TOP кандидатов - в Telegram: текст-отчёт + 2 фото
      графиков (3 графика на фото) + короткий вердикт ИИ одним общим
-     запросом (SCAN_LLM).
+     запросом (SCAN_LLM) + КНОПКИ "купить"/"под управление" (v1.7.0).
 
-ВАЖНО: сканер сам НЕ торгует. Он подсказывает: "купить сразу" - /buy,
-"отдать боту под автоматическую торговлю" - /watch (всего до 6 бумаг).
+СКАЛЬП-РЕЖИМ (v1.7.0): если он включён (/scalp), сканер сам обновляет список
+бумаг под управлением движка: тикеры с открытыми позициями остаются, свободные
+слоты занимают лучшие кандидаты (до 10 бумаг) - так бот торгует весь рынок,
+а не только ручной список.
+
+История бага v1.6.x (исправлено в v1.7.0): живые обороты читались из блока
+securities, где их НЕТ (они в marketdata), поэтому сканер всегда видел нули и
+писал "рынок не торгуется" даже в разгар торгового дня. Теперь:
+  - обороты живые; сообщение "торгов нет" приходит только когда биржа
+    РЕАЛЬНО не отдаёт оборотов, с точным временем и днём недели;
+  - такое сообщение в автоматическом режиме приходит не чаще одного раза
+    в 3 часа (раньше оно повторялось каждые 10 минут и заспамивало владельца).
+
+ВАЖНО: сканер сам НЕ торгует (кроме авто-подбора списка в скальп-режиме):
+"купить сразу" - /buy или кнопка, "отдать боту" - /watch или кнопка.
 """
 from __future__ import annotations
 
@@ -29,11 +43,12 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 import indicators
 import charts
+import sessions
 
 log = logging.getLogger("scanner")
 
-Notifier = Callable[[str], Awaitable[None]]
-PhotosSender = Callable[[str, List[bytes]], Awaitable[None]]
+Notifier = Callable[..., Awaitable[None]]
+PhotosSender = Callable[..., Awaitable[None]]
 
 #: Свечи сканера: 15 минут (0.25 ч). Рабочая средняя кандидата: SMA-16 = 4 ч.
 _SCAN_STEP_H = 0.25
@@ -42,6 +57,34 @@ _SCAN_FAST_N = 16
 _SCAN_HISTORY_H = 26.0
 #: Минимум свечей для полного набора индикаторов (как в движке: max(2*16,35)+3).
 _MIN_CANDLES = 38
+
+#: "Рынок не торгуется": не чаще одного сообщения за столько секунд
+#: (3 часа), чтобы не спамить владельца каждые 10 минут.
+_CLOSED_NOTIFY_TTL_SEC = 3 * 3600
+
+
+def _report_keyboard(top: List[Dict[str, Any]]):
+    """Кнопки под отчётом сканера: купить / отдать под управление (v1.7.0).
+
+    aiogram может быть недоступен в тестах - тогда вернём None (без кнопок).
+    """
+    if not top:
+        return None
+    try:
+        from aiogram.types import (InlineKeyboardButton,
+                                   InlineKeyboardMarkup)
+    except Exception:  # noqa: BLE001 - тесты без aiogram
+        return None
+    rows = []
+    for row in top[:4]:
+        ticker = row["ticker"]
+        rows.append([
+            InlineKeyboardButton(text=f"🛒 Купить {ticker}",
+                                 callback_data=f"buy:{ticker}"),
+            InlineKeyboardButton(text=f"👁 Веду {ticker}",
+                                 callback_data=f"watch:{ticker}"),
+        ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 class MarketScanner:
@@ -53,12 +96,17 @@ class MarketScanner:
         self._state = state
         self._client = client
         self._analyst = analyst
-        self._engine = engine          # нужен engine.watchlist()
+        self._engine = engine          # нужен engine.watchlist()/scalp_mode()
         self._notify = notify
         self._send_photos = send_photos
         self._stop_event = asyncio.Event()
         # Защита от наложения ручного /scan на фоновый проход.
         self._busy = asyncio.Lock()
+        # Когда последний раз отправляли сообщение "рынок не торгуется"
+        # (анти-спам: не чаще раза в 3 часа; на ручной /scan не влияет).
+        # -1e12 вместо 0.0: time.monotonic() на свежем сервере может быть
+        # меньше 3 часов, и нулевая заглушка задавила бы ПЕРВОЕ сообщение.
+        self._last_closed_notify: float = -1e12
 
     # -------------------------------------------------------------- жизненный цикл
     def request_stop(self) -> None:
@@ -71,9 +119,10 @@ class MarketScanner:
             return
         log.info("Сканер рынка запущен: каждые %d мин ищу кандидатов среди "
                  "ликвидных бумаг TQBR (топ %d в отчёте, %d бумаг считаю "
-                 "глубоко по свечам)",
+                 "глубоко по свечам%s)",
                  self._cfg.scan_interval_min, self._cfg.scan_report_top,
-                 self._cfg.scan_deep_n)
+                 self._cfg.scan_deep_n,
+                 "; скальп: сам обновляю список бумаг" if self._engine_scalp() else "")
         while not self._stop_event.is_set():
             try:
                 await self.scan_once()
@@ -89,49 +138,76 @@ class MarketScanner:
                 pass
         log.info("Сканер рынка остановлен")
 
+    def _engine_scalp(self) -> bool:
+        value = getattr(self._engine, "scalp_mode", None)
+        if callable(value):
+            try:
+                value = value()
+            except Exception:  # noqa: BLE001
+                return False
+        return bool(value) if value is not None else False
+
     # ------------------------------------------------------------------ проход
     async def scan_once(self, *, manual: bool = False) -> str:
         """
         Один проход сканера: отчёт + фото уходят в Telegram, текст возвращается.
 
         manual=True (команда /scan): то же самое, но занятый сканер отвечает
-        вежливым отказом вместо молчаливого пропуска.
+        вежливым отказом вместо молчаливого пропуска, а сообщение "торгов
+        нет" приходит без анти-спам-подавления.
         """
         if self._busy.locked():
             if manual:
                 return "⏳ Сканер уже работает - подождите минуту."
             return ""
         async with self._busy:
-            text, photos = await self._scan_and_render()
-            await self._deliver(text, photos)
+            text, photos, top = await self._scan_and_render()
+            # Ночной/праздничный "рынок не торгуется" в авто-режиме шлём
+            # не чаще раза в 3 часа (правка v1.7.0: не спамить каждые 10 мин).
+            if (not manual and text.startswith("😴")
+                    and (time.monotonic() - self._last_closed_notify)
+                    < _CLOSED_NOTIFY_TTL_SEC):
+                log.info("Сканер: рынок не торгуется - отчёт подавлен "
+                         "(недавно уже сообщал)")
+                return text
+            await self._deliver(text, photos, top)
+            if text.startswith("😴"):
+                self._last_closed_notify = time.monotonic()
             return text
 
     # ------------------------------------------------------------------ анализ
-    async def _scan_and_render(self) -> Tuple[str, List[bytes]]:
+    async def _scan_and_render(self
+                               ) -> Tuple[str, List[bytes], List[Dict[str, Any]]]:
         cfg = self._cfg
-        managed = set(self._engine.watchlist()) | set(self._state.positions)
+        # В скальп-режиме пул кандидатов НЕ режем по старому watchlist:
+        # сканер сам решает, чем бот будет торговать, а позиции всегда
+        # остаются под охраной. В обычном режиме - как раньше.
+        managed = set(self._state.positions)
+        if not self._engine_scalp():
+            managed |= set(self._engine.watchlist())
         try:
             snapshot = await self._client.get_market_snapshot()
         except Exception as exc:  # noqa: BLE001
             log.warning("Сканер: рынок недоступен (%s) - пропуск", exc)
             return (f"🔎 Сканер рынка: сейчас не удалось получить данные рынка "
-                    f"({exc}) - попробую в следующий раз."), []
+                    f"({exc}) - попробую в следующий раз."), [], []
 
         liquid = [row for row in snapshot
                   if row["price"] >= cfg.scan_min_price
                   and row["turnover"] >= cfg.scan_min_turnover * 1e6]
         log.info("Сканер: %d бумаг на рынке, %d прошло фильтр ликвидности",
                  len(snapshot), len(liquid))
-        # Ночью и в выходные MOEX ISS отдаёт бумаги с обнулённым оборотом:
-        # это не «строгий фильтр», а закрытая сессия - сообщаем прямо.
+        # Биржа не отдаёт обороты = торгов сейчас реально нет. v1.7.0:
+        # честная диагностика с точным временем (раньше это сообщение
+        # приходило и днём - из-за бага чтения оборотов, см. docstring).
         if sum(float(row.get("turnover", 0) or 0) for row in snapshot) < 1.0:
             log.info("Сканер: рынок не торгуется (обороты обнулены) - пауза")
-            return ("😴 Рынок сейчас не торгуется (сессия закрыта) - сканер "
-                    "поищет кандидатов после открытия. Основная сессия: "
-                    "10:00-18:40 МСК, вечерняя: 19:05-23:50."), []
+            return ("😴 По данным Мосбиржи обороты сейчас нулевые - торгов нет, "
+                    "сканер поищет кандидатов после открытия. "
+                    + sessions.session_hint()), [], []
         if not liquid:
             return ("🔎 Сканер рынка: подходящих бумаг не нашёл "
-                    "(фильтр ликвидности слишком строгий или рынок спит)."), []
+                    "(фильтр ликвидности слишком строгий или рынок спит)."), [], []
 
         by_turnover = sorted(liquid, key=lambda r: r["turnover"], reverse=True)
         fallers = sorted(liquid, key=lambda r: r["day_chg_pct"])[:5]
@@ -152,14 +228,31 @@ class MarketScanner:
         scored.sort(key=lambda r: r["score"], reverse=True)
         top = scored[:cfg.scan_report_top]
 
+        # Скальп-режим: лучшие кандидаты автоматически занимают свободные
+        # слоты под управлением движка (позиции остаются под охраной).
+        scalp_note = ""
+        if self._engine_scalp() and scored:
+            cap = self._engine.max_tickers()
+            keep = [t for t in self._engine.watchlist()
+                    if t in self._state.positions]
+            free = max(0, cap - len(keep))
+            picks = [r["ticker"] for r in scored
+                     if r["ticker"] not in keep][:free]
+            new_list = await self._engine.auto_set_watchlist(keep + picks)
+            scalp_note = (f"⚡ Скальп-режим: обновил список бумаг по итогам "
+                          f"скана ({len(new_list)}/{cap}): "
+                          f"{', '.join(new_list)}.\n")
+
         if not top:
-            return ("🔎 Сканер рынка: данных по пулу бумаг не хватило "
-                    "(биржа не отдала свечи) - попробую в следующий раз."), []
+            return (scalp_note
+                    + "🔎 Сканер рынка: кандидатов на покупку сейчас нет "
+                    "(рынок без перекосов или свечей не хватило) - "
+                    "попробую в следующий раз."), [], []
 
         verdicts = await self._ai_verdicts(top)
-        text = self._build_report(top, verdicts)
+        text = self._build_report(top, verdicts, scalp_note)
         photos = self._render_photos(top)
-        return text, photos
+        return text, photos, top
 
     async def _deep_analyze(self, pool: List[Dict[str, Any]]
                             ) -> List[Dict[str, Any]]:
@@ -222,7 +315,8 @@ class MarketScanner:
 
     # ------------------------------------------------------------------ вывод
     def _build_report(self, top: List[Dict[str, Any]],
-                      verdicts: Dict[str, str]) -> str:
+                      verdicts: Dict[str, str],
+                      scalp_note: str = "") -> str:
         cfg = self._cfg
         stamp = time.strftime("%d.%m %H:%M")
         lines = [f"🔎 Сканер рынка {stamp} - топ {len(top)} кандидатов "
@@ -245,8 +339,11 @@ class MarketScanner:
             lines.append("Сильных сигналов на рынке сейчас нет - "
                          "это лучшие из доступных.")
         lines.append("")
-        lines.append("Купить сразу: /buy ТИКЕР ШТ • отдать боту под управление: "
-                     "/watch ТИКЕР • графики моих бумаг: /charts")
+        if scalp_note:
+            lines.append(scalp_note.strip())
+        lines.append("Кнопки под сообщением: купить сразу или отдать боту "
+                     "под управление. Вручную: /buy ТИКЕР ШТ, /watch ТИКЕР • "
+                     "графики моих бумаг: /charts")
         return "\n".join(lines)
 
     def _render_photos(self, top: List[Dict[str, Any]]) -> List[bytes]:
@@ -264,12 +361,25 @@ class MarketScanner:
             suptitle="Топ кандидатов сканера (15-мин свечи, ~26 ч, "
                      "пунктир - рабочая средняя 4 ч)")
 
-    async def _deliver(self, text: str, photos: List[bytes]) -> None:
+    async def _deliver(self, text: str, photos: List[bytes],
+                       top: Optional[List[Dict[str, Any]]] = None) -> None:
+        """Отправка отчёта: фото + текст + кнопки купить/под управление."""
+        markup = _report_keyboard(top or [])
         try:
             if photos and self._send_photos is not None:
-                await self._send_photos(text, photos)
+                await self._send_photos(text, photos, reply_markup=markup)
             else:
-                await self._notify(text)
+                await self._notify(text, reply_markup=markup)
+        except TypeError as exc:
+            # Старая сигнатура колбэков (без reply_markup) - отправим без кнопок.
+            log.debug("Сканер: отправка без кнопок (%s)", exc)
+            try:
+                if photos and self._send_photos is not None:
+                    await self._send_photos(text, photos)
+                else:
+                    await self._notify(text)
+            except Exception as exc2:  # noqa: BLE001
+                log.warning("Сканер: не удалось отправить отчёт: %s", exc2)
         except Exception as exc:  # noqa: BLE001 - Telegram не должен ронять сканер
             log.warning("Сканер: не удалось отправить отчёт: %s", exc)
 

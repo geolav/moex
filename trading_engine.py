@@ -54,6 +54,7 @@ import time
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 import indicators
+import sessions
 
 log = logging.getLogger("engine")
 
@@ -139,38 +140,67 @@ class TradingEngine:
         # Список тикеров, изменённый командами /watch /unwatch (переживает
         # состояние без поддержки watchlist; основной источник - state.json).
         self._watchlist_override: Optional[List[str]] = None
+        # Скальп-режим: когда был последний ПОЛНЫЙ цикл (решения о покупках),
+        # между ними - быстрая охрана позиций каждые SCALP_EXIT_POLL_SEC.
+        self._last_full_cycle = 0.0
 
     # -------------------------------------------------------------- жизненный цикл
     def request_stop(self) -> None:
         self._stop_event.set()
 
     async def run(self) -> None:
-        """Вечный цикл: один проход по всем тикерам, пауза, повтор."""
+        """Вечный цикл: один проход по всем тикерам, пауза, повтор.
+
+        v1.7.0: в скальп-режиме циклов ДВА - полные (решения о покупках и
+        продаже) каждые SCALP_POLL_SEC сек и быстрая ОХРАНА ПОЗИЦИЙ каждые
+        SCALP_EXIT_POLL_SEC сек: позиция закрывается почти сразу после того,
+        как цена перестала расти, не дожидаясь следующего полного цикла.
+        """
         info = self.activity_info()
+        scalp_txt = (f", СКАЛЬП-РЕЖИМ: полные циклы каждые "
+                     f"{self._cfg.scalp_poll_sec // 60} мин, охрана позиций "
+                     f"каждые {self._cfg.scalp_exit_poll_sec // 60} мин, "
+                     f"до {self._cfg.scalp_max_positions} бумаг"
+                     if self.scalp_mode() else "")
         log.info("Торговый движок v2 запущен: тикеры %s, период %d сек, "
                  "стратегия: индикаторы + LLM-трейдер, агрессивность %d, "
-                 "активность %d (средняя ~%.4g ч, свечи %d мин)",
+                 "активность %d (средняя ~%.4g ч, свечи %d мин)%s",
                  ",".join(self.watchlist()),
                  self._cfg.poll_interval_sec, self._state.aggressiveness(),
-                 info["activity"], info["sma_hours"], info["step_min"])
+                 info["activity"], info["sma_hours"], info["step_min"],
+                 scalp_txt)
+        self._last_full_cycle = time.monotonic()
         while not self._stop_event.is_set():
             try:
-                await self.cycle()
+                if self.scalp_mode():
+                    now = time.monotonic()
+                    if now - self._last_full_cycle >= self._cfg.scalp_poll_sec:
+                        self._last_full_cycle = now
+                        await self.cycle()
+                    else:
+                        await self.exit_cycle()
+                    await self._sleep(max(5.0, self._cfg.scalp_exit_poll_sec))
+                else:
+                    await self.cycle()
+                    await self._sleep(self._cfg.poll_interval_sec)
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 - движок обязан пережить ЛЮБОЙ сбой
                 log.exception("Необработанная ошибка торгового цикла")
-            try:
-                await asyncio.wait_for(self._stop_event.wait(),
-                                       timeout=self._cfg.poll_interval_sec)
-            except asyncio.TimeoutError:
-                pass
+                await self._sleep(15.0)
         log.info("Торговый движок остановлен (циклов выполнено: %d)", self._cycles_done)
+
+    async def _sleep(self, seconds: float) -> None:
+        """Пауза между циклами с немедленным пробуждением по остановке."""
+        try:
+            await asyncio.wait_for(self._stop_event.wait(), timeout=seconds)
+        except asyncio.TimeoutError:
+            pass
 
     # ------------------------------------------------------------------- цикл
     async def cycle(self) -> None:
         """
-        Один проход: for по тикерам СТРОГО последовательно.
+        Один ПОЛНЫЙ проход: входы + выходы, for по тикерам СТРОГО последовательно.
         Ошибка по одному тикеру не останавливает остальные.
         """
         self._cycles_done += 1
@@ -190,6 +220,27 @@ class TradingEngine:
                                 "в следующем цикле.", ticker)
                 else:
                     log.error("Ошибка обработки %s: %s", ticker, exc)
+
+    async def exit_cycle(self) -> None:
+        """Быстрая охрана позиций (скальп-режим, v1.7.0): только выходы.
+
+        Между полными циклами каждые SCALP_EXIT_POLL_SEC секунд проверяем
+        открытые позиции: если цена перестала расти (радар разворота,
+        фиксация прибыли, трейлинг) или пробила стоп - продаём сразу,
+        не дожидаясь следующего полного цикла.
+        """
+        for ticker in list(self._state.positions.keys()):
+            if self._stop_event.is_set():
+                break
+            try:
+                await self._process_ticker(ticker, exits_only=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                if "30079" in str(exc) or "недоступен для торгов" in str(exc):
+                    log.info("%s: рынок закрыт - охрана позиций подождёт", ticker)
+                else:
+                    log.error("Охрана позиций %s: %s", ticker, exc)
 
     async def _market_closed(self, ticker: str) -> bool:
         """True - биржа точно закрыта по этой бумаге (пауза до открытия).
@@ -215,7 +266,7 @@ class TradingEngine:
             return True
         return False
 
-    async def _process_ticker(self, ticker: str) -> None:
+    async def _process_ticker(self, ticker: str, *, exits_only: bool = False) -> None:
         # Вне торговой сессии не дёргаем ни цены, ни свечи, ни LLM, ни ордера:
         # всё равно брокер отклонит заявку (30079), а Groq-квота съестся зря.
         if await self._market_closed(ticker):
@@ -236,10 +287,51 @@ class TradingEngine:
             await self._check_exit(ticker, price, position)
             return
 
+        if exits_only:
+            return
         if not self._state.trading_enabled:
             log.debug("%s: сигнал-движок ждёт, торговля выключена", ticker)
             return
         await self._evaluate_entry(ticker, price)
+
+    # ------------------------------------------------------------- скальп-режим
+    def scalp_mode(self) -> bool:
+        """Включён ли скальп-режим (живёт в state.json, читаем каждый цикл:
+        переключение /scalp действует немедленно, без рестарта).
+
+        StateStore.scalp_mode - property (возвращает bool), но подстрахуемся
+        и для callable-варианта: тесты/фейки могут давать метод."""
+        value = getattr(self._state, "scalp_mode", None)
+        if callable(value):
+            try:
+                value = value()
+            except Exception:  # noqa: BLE001
+                return False
+        return bool(value) if value is not None else False
+
+    def _exit_params(self) -> Dict[str, Any]:
+        """Параметры выходов текущего режима: в скальпе - короче стопы,
+        туже фиксация прибыли (позиция живёт минуты-часы, а не сутки)."""
+        if self.scalp_mode():
+            return {
+                "stop_pct": self._cfg.scalp_stop_loss_pct,
+                "take_pct": self._cfg.scalp_take_profit_pct,
+                "hard_mult": self._cfg.hard_sl_mult,
+                "tiers": (self._cfg.scalp_harvest_tiers
+                          or self._cfg.harvest_tiers),
+                "trail_activate": self._cfg.scalp_trailing_activate_pct,
+                "trail_drop": self._cfg.scalp_trailing_drop_pct,
+                "surge_from": self._cfg.scalp_surge_from_pct,
+            }
+        return {
+            "stop_pct": self._cfg.stop_loss_pct,
+            "take_pct": self._cfg.take_profit_pct,
+            "hard_mult": self._cfg.hard_sl_mult,
+            "tiers": self._cfg.harvest_tiers,
+            "trail_activate": self._cfg.trailing_activate_pct,
+            "trail_drop": self._cfg.trailing_drop_pct,
+            "surge_from": self._cfg.surge_sense_from_pct,
+        }
 
     # ------------------------------------------------------------------ пороги
     def _activity(self) -> int:
@@ -266,6 +358,10 @@ class TradingEngine:
         return round(base + (self._state.aggressiveness() - 50) / 100.0 * 0.4, 2)
 
     def _cooldown_sec(self) -> float:
+        # В скальп-режиме кулдаун короткий (SCALP_COOLDOWN_MIN, по умолчанию 20 мин):
+        # бумага после закрытия сделки быстро снова может стать кандидатом.
+        if self.scalp_mode():
+            return self._cfg.scalp_cooldown_min * 60.0
         # При высокой агрессивности кулдаун сокращается (до 0.25x),
         # при высокой активности - ещё вдвое-втрое (итог до ~0.1x).
         factor = (max(0.25, 1.5 - 1.25 * self._state.aggressiveness() / 100.0)
@@ -274,13 +370,21 @@ class TradingEngine:
 
     def _max_buys_today(self) -> int:
         # 2..~32 в зависимости от агрессивности и активности, но не больше env-потолка.
+        # Скальп: сделки мелкие и частые - потолок выше, но env всё равно главнее.
+        if self.scalp_mode():
+            return min(self._cfg.max_buys_per_day,
+                       max(30, 2 + self._cfg.scalp_max_positions * 4))
         return min(self._cfg.max_buys_per_day,
                    2 + self._state.aggressiveness() // 5 + self._activity() // 10)
 
     def _llm_ttl_sec(self) -> float:
         # Кэш вердикта трейдера: 30 мин в спокойном режиме, 10 мин в активном -
         # ИИ пересматривает рынок и открытые позиции по свежим данным.
-        return max(600.0, _LLM_CACHE_TTL_SEC - self._activity() * 12.0)
+        # Скальп: не менее 15 мин на тикер, иначе 10 бумаг съедят квоту Groq.
+        ttl = max(600.0, _LLM_CACHE_TTL_SEC - self._activity() * 12.0)
+        if self.scalp_mode():
+            ttl = max(ttl, 900.0)
+        return ttl
 
     def _cooldown_active(self, ticker: str) -> bool:
         elapsed = time.time() - self._state.last_buy_ts(ticker)
@@ -353,6 +457,9 @@ class TradingEngine:
         return list(self._cfg.trading_tickers)
 
     def max_tickers(self) -> int:
+        """Лимит бумаг под управлением: в скальп-режиме - больше (до 10)."""
+        if self.scalp_mode():
+            return int(getattr(self._cfg, "scalp_max_positions", 10) or 10)
         return int(getattr(self._cfg, "max_tickers", 6) or 6)
 
     async def add_watchlist(self, ticker: str) -> str:
@@ -400,6 +507,35 @@ class TradingEngine:
             except Exception as exc:  # noqa: BLE001
                 log.warning("Не удалось сохранить watchlist в state: %s", exc)
 
+    async def auto_set_watchlist(self, items: List[str]) -> List[str]:
+        """Скальп-режим: сканер сам задаёт список бумаг под управлением (v1.7.0).
+
+        items - итоговый список (тикеры с открытыми позициями + лучшие
+        кандидаты сканера). Неизвестные тикеры отбрасываются, позиции
+        сохраняются гарантированно. Возвращает фактически установленный
+        список (для отчёта в Telegram).
+        """
+        keep: List[str] = []
+        for ticker in items:
+            t = (ticker or "").strip().upper()
+            if not t or t in keep:
+                continue
+            if hasattr(self._client, "ensure_instrument") and \
+                    not self._client.ensure_instrument(t):
+                log.info("Скальп: тикер %s не найден на бирже - пропущен", t)
+                continue
+            keep.append(t)
+        # Бумаги с открытыми позициями не теряем ни при каких условиях.
+        for ticker in self._state.positions:
+            if ticker not in keep and self._client.ensure_instrument(ticker):
+                keep.append(ticker)
+        cap = self.max_tickers()
+        if len(keep) > cap:
+            keep = keep[:cap]
+        self._save_watchlist(keep)
+        log.info("Скальп: список бумаг обновлён сканером: %s", ", ".join(keep))
+        return keep
+
     # ------------------------------------------------------------------- вход
     async def _evaluate_entry(self, ticker: str, price: float) -> None:
         # Шаг 0. Страховки частоты: кулдаун и дневной лимит (вне влияния LLM).
@@ -444,31 +580,65 @@ class TradingEngine:
         # Шаг 1. Скилл "технический аналитик": история цен -> индикаторы -> score.
         # Рабочий таймфрейм зависит от АКТИВНОСТИ: спокойный режим смотрит
         # сутки на часовых свечах, активный - последний час на 5-минутных.
+        # v1.7.0, УТРЕННИЙ ЯКОРЬ: с 10:00 до ~13:00 МСК ночных торгов не было,
+        # вечерняя сессия тонкая и живёт "по другим законам", поэтому среднюю
+        # считаем только по ОСНОВНОЙ сессии вчерашнего дня + сегодняшнему утру
+        # (свечи 15-мин, история с запасом на два торговых дня).
         sma_h = self._sma_hours()
         step_h = self._candle_step_h(sma_h)
         fast_n = self._fast_n(sma_h, step_h)
+        fetch_h = self._fetch_hours(fast_n, step_h)
+        morning_ctx: Dict[str, Any] = {}
+        morning = sessions.is_morning_window(until_hour=self._cfg.morning_anchor_until)
+        if morning:
+            step_h = 0.25
+            fast_n = min(max(fast_n, 12), 24)
+            fetch_h = max(fetch_h, 60.0)
         try:
-            history = await self._client.get_candles_history(
-                ticker, self._fetch_hours(fast_n, step_h), step_h)
+            history = await self._client.get_candles_history(ticker, fetch_h, step_h)
         except Exception as exc:  # noqa: BLE001
             log.warning("%s: история свечей недоступна (%s)", ticker, exc)
             history = []
+        if morning and history:
+            history = sessions.main_session_history(history)
+            morning_ctx = sessions.morning_context(history, price=price)
         closes = [p for _, p in history]
         if len(closes) < self._min_candles(fast_n):
-            log.info("%s: мало рабочих свечей (%d из %d по %.0f мин) - "
+            log.info("%s: мало рабочих свечей (%d из %d по %.0f мин%s) - "
                      "обычный SMA-фолбэк", ticker, len(closes),
-                     self._min_candles(fast_n), step_h * 60)
+                     self._min_candles(fast_n), step_h * 60,
+                     ", утренний якорь" if morning else "")
             await self._entry_fallback_sma(ticker, price, closes, fast_n)
             return
 
         summary = indicators.summarize_generic(closes, price, fast_n, step_h)
         score = indicators.build_score(summary)
         log.info("%s: score %.2f (порог %.2f, агрессивность %d, активность %d, "
-                 "SMA-%.4g ч, свечи %.0f мин) RSI %.0f",
+                 "SMA-%.4g ч, свечи %.0f мин%s) RSI %.0f",
                  ticker, score, needed, self._state.aggressiveness(),
-                 self._activity(), sma_h, step_h * 60,
+                 self._activity(), fast_n * step_h, step_h * 60,
+                 ", утренний якорь на вчера" if morning else "",
                  summary.get("rsi14") or 0.0)
         if score < needed:
+            return
+
+        # Шаг 1.5. Анти-погоня (v1.7.0): не покупать у локального максимума.
+        # Классическая ошибка: бумага весь день росла, средняя догоняла цену,
+        # первый же откат к средней считался "сигналом" - и покупка выходила
+        # на хае (кейс LKOH). Теперь вход запрещён, если цена уже вплотную
+        # к максимуму локального окна или отскок от минимума уже отыгран.
+        chase = self._chase_guard(closes, price)
+        if chase:
+            log.info("%s: анти-погоня - %s. Жду более глубокий откат", ticker, chase)
+            self._state.append_decision({
+                "ts": time.strftime("%d.%m %H:%M"), "ticker": ticker,
+                "action": "skip", "confidence": score,
+                "price": round(price, 2), "reason": "анти-погоня: " + chase,
+            })
+            await self._notify_skip(
+                ticker, score,
+                f"сигнал был ({score:+.2f}), но покупать сейчас нельзя: "
+                f"{chase}. Жду более глубокий откат, а не покупаю на хаю.")
             return
 
         # Шаг 2. Скилл "трейдер-LLM": сводка + новости + память -> вердикт.
@@ -489,7 +659,8 @@ class TradingEngine:
             return
 
         decision = await self._get_llm_decision(ticker, price, summary, score,
-                                                sentiment, history)
+                                                sentiment, history,
+                                                morning_ctx=morning_ctx)
         if decision is None:
             # LLM недоступен -> старое правило (цена ниже средней + не-плохие
             # новости), чтобы бот не вставал полностью.
@@ -522,7 +693,38 @@ class TradingEngine:
                 f"{conf_req:.0%}: {decision['reason']}")
             return
 
-        await self._buy(ticker, price, sentiment, summary, score, decision)
+        await self._buy(ticker, price, sentiment, summary, score, decision,
+                        morning_ctx=morning_ctx)
+
+    def _chase_guard(self, closes: List[float], price: float) -> Optional[str]:
+        """Анти-погоня: причина НЕ покупать сейчас, или None (можно).
+
+        Два правила по локальному окну (последние fast_n свечей):
+        1) цена ближе CHASE_GUARD_PCT% к максимуму окна (и в верхней части
+           диапазона) - покупать значит гнаться за ценой;
+        2) цена уже отскочила от минимума окна на CHASE_BOUNCE_PCT% и больше
+           - отскок по факту отыгран, входить поздно.
+        Настройки можно выключить в .env (CHASE_GUARD_PCT=0 / CHASE_BOUNCE_PCT=0).
+        """
+        if not closes:
+            return None
+        lookback = max(12, min(len(closes), self._fast_n(self._sma_hours(),
+                                                         self._candle_step_h(self._sma_hours()))))
+        rp = indicators.range_position(closes, lookback, price)
+        dist = rp.get("dist_to_high_pct")
+        pos = rp.get("pos_in_range")
+        bounce = rp.get("bounce_from_low_pct")
+        if (self._cfg.chase_guard_pct > 0 and dist is not None
+                and pos is not None
+                and dist <= self._cfg.chase_guard_pct and pos >= 0.8):
+            return (f"цена всего на {max(dist, 0.0):.2f}% ниже максимума "
+                    f"последних ~{lookback} свечей (в верхней части диапазона)")
+        if (self._cfg.chase_bounce_pct > 0 and bounce is not None
+                and pos is not None
+                and bounce >= self._cfg.chase_bounce_pct and pos >= 0.7):
+            return (f"отскок от минимума окна уже {bounce:.1f}% - "
+                    f"дешевле уже не купить")
+        return None
 
     async def _entry_fallback_sma(self, ticker: str, price: float,
                                   closes: Optional[List[float]] = None,
@@ -550,7 +752,8 @@ class TradingEngine:
 
     async def _buy(self, ticker: str, price: float, sentiment: float,
                    summary: Dict[str, Optional[float]], score: float,
-                   decision: dict) -> None:
+                   decision: dict,
+                   morning_ctx: Optional[Dict[str, Any]] = None) -> None:
         try:
             portfolio = await self._client.get_portfolio_summary()
         except Exception as exc:  # noqa: BLE001
@@ -596,6 +799,16 @@ class TradingEngine:
                      self._state.max_invested_pct(), budget, max(room, 0.0),
                      invested, total_money)
             budget = max(room, 0.0)
+        # Скальп-режим: 10 бумаг одновременно - делим разрешённую вложенность
+        # на равные доли, иначе первые 2-3 покупки съедят весь лимит.
+        if self.scalp_mode():
+            share = total_money * self._state.max_invested_pct() / 100.0 \
+                / max(1, self._cfg.scalp_max_positions)
+            if budget > share:
+                log.info("%s: скальп - бюджет урезан с %.0f до %.0f ₽ "
+                         "(равная доля на %d бумаг)", ticker, budget, share,
+                         self._cfg.scalp_max_positions)
+                budget = share
         lot_size = self._client.get_lot_size(ticker)
         lot_cost = price * lot_size
         lots = int(budget // lot_cost) if lot_cost > 0 else 0
@@ -626,6 +839,16 @@ class TradingEngine:
         take_price = price * (1.0 + self._cfg.take_profit_pct / 100.0)
         name = self._client.instrument_name(ticker)
         info = self.activity_info()
+        ep = self._exit_params()
+        morning_line = ""
+        if morning_ctx:
+            txt = sessions.describe_morning_context(morning_ctx)
+            if txt:
+                morning_line = (f"• Утренний якорь: {txt}.\n")
+        scalp_line = ("• Режим СКАЛЬПИНГ: держим недолго - продам при первых "
+                      "признаках остановки роста (охрана позиции каждые "
+                      f"{self._cfg.scalp_exit_poll_sec // 60} мин).\n"
+                      if self.scalp_mode() else "")
         friendly = (
             f"🛒 ПОКУПКА {ticker}" + (f" ({name})" if name else "") + "\n"
             f"Купил {lots} лот(а) = {shares} шт по ~{price:.2f} ₽, "
@@ -641,16 +864,20 @@ class TradingEngine:
             f"• Новости: {_human_sentiment(sentiment)} (оценка {sentiment:+.2f}).\n"
             f"• Режим: активность {info['activity']}/100 - работаю на средних "
             f"~{info['sma_hours']:g} ч (свечи {info['step_min']} мин), ИИ смотрел "
-            f"последние ~{info['ai_window_hours']:g} ч графика.\n\n"
+            f"последние ~{info['ai_window_hours']:g} ч графика.\n"
+            f"{morning_line}{scalp_line}\n"
             f"Мнение ИИ-трейдера (уверенность {decision['confidence']:.0%}):\n"
             f"«{decision['reason']}»\n\n"
             f"План выхода - сделаю сам:\n"
+            f"• радар разворота: с прибыли +{ep['surge_from']:.1f}% продам при "
+            f"ПЕРВОМ признаке разворота (затухание импульса, цена под средней, "
+            f"свечи вниз) - сильный взлёт не дам превратиться в падение;\n"
             f"• умная фиксация прибыли: чем выше пик роста, тем меньший откат "
-            f"терплю ({_fmt_tiers(getattr(self._cfg, 'harvest_tiers', None) or ())}) - "
+            f"терплю ({_fmt_tiers(ep['tiers'])}) - "
             f"при большом росте продам уже при маленьком падении;\n"
             f"• трейлинг-стоп: если прибыль дорастёт до "
-            f"+{self._cfg.trailing_activate_pct:.1f}%, а потом откатится на "
-            f"{self._cfg.trailing_drop_pct:.1f}% - зафиксирую заработанное «на спаде»\n"
+            f"+{ep['trail_activate']:.1f}%, а потом откатится на "
+            f"{ep['trail_drop']:.1f}% - зафиксирую заработанное «на спаде»\n"
             f"• стоп-лосс: при падении до {stop_price:.2f} ₽ "
             f"(−{self._cfg.stop_loss_pct:.0f}%) уточню у ИИ, не ложный ли "
             f"прокол, и продам максимум через "
@@ -670,13 +897,17 @@ class TradingEngine:
 
         1) аварийный стоп-лосс (-SL * HARD_SL_MULT) - продаём немедленно;
         2) тейк-профит (+TP) - продаём немедленно;
-        3) трейлинг-стоп: прибыль поднималась до TRAILING_ACTIVATE_PCT и
-           откатилась на TRAILING_DROP_PCT - фиксируем остаток прибыли;
+        3) трейлинг-стоп: прибыль поднималась до ACTIVATE и откатилась на DROP;
         4) стоп-лосс (-SL): первый цикл даём ИИ право вето (hold = ждём
            отскок один цикл), дальше продаём (SL_CONFIRM_CYCLES проверок);
-        5) досрочная продажа по ИИ - ТОЛЬКО при прибыли: фиксировать убытки
+        5) РАДАР РАЗВОРОТА (v1.7.0, правка владельца): если прибыль когда-то
+           доходила до SURGE_SENSE_FROM_PCT и появился ХОТЬ ОДИН признак,
+           что рост закончился (затухание импульса, цена под средней,
+           свечи вниз, перегрев) - продаём СРАЗУ, пока прибыль не растаяла;
+        6) досрочная продажа по ИИ - ТОЛЬКО при прибыли: фиксировать убытки
            по желанию модели запрещено, убытки режет только стоп-лосс.
         """
+        ep = self._exit_params()
         entry = float(position.get("entry_price", 0) or 0)
         if entry <= 0:
             log.warning("%s: позиция без цены входа (%s) - удаляю из состояния",
@@ -685,15 +916,15 @@ class TradingEngine:
             return
         profit_pct = (price / entry - 1.0) * 100.0
 
-        # Помним максимум прибыли по позиции - нужен трейлинг-стопу.
+        # Помним максимум прибыли по позиции - нужен трейлинг-стопу и радару.
         prev_max = float(position.get("max_profit_pct", 0.0) or 0.0)
         max_profit = max(prev_max, profit_pct)
         if max_profit > prev_max:
             position = {**position, "max_profit_pct": round(max_profit, 2)}
             self._state.set_position(ticker, position)
 
-        stop_pct = self._cfg.stop_loss_pct
-        hard_stop_pct = stop_pct * self._cfg.hard_sl_mult
+        stop_pct = ep["stop_pct"]
+        hard_stop_pct = stop_pct * ep["hard_mult"]
 
         # 1) Аварийный стоп: падение слишком глубокое - без разговоров.
         if profit_pct <= -hard_stop_pct:
@@ -704,7 +935,7 @@ class TradingEngine:
             return
 
         # 2) Тейк-профит.
-        if profit_pct >= self._cfg.take_profit_pct:
+        if profit_pct >= ep["take_pct"]:
             await self._sell(ticker, price, position, "тейк-профит", profit_pct,
                              "достигнута цель по прибыли")
             return
@@ -713,8 +944,7 @@ class TradingEngine:
         # тем меньший откат от него терпим - при сильном росте продаём
         # уже при крошечном падении (вето ИИ тут НЕ работает: это защита
         # заработанного, а не убыток).
-        tier = harvest_signal(max_profit, profit_pct,
-                              getattr(self._cfg, "harvest_tiers", None) or ())
+        tier = harvest_signal(max_profit, profit_pct, ep["tiers"])
         if tier is not None:
             drop_pp, peak_cap = tier
             giveback = max_profit - profit_pct
@@ -727,9 +957,9 @@ class TradingEngine:
                 return
 
         # 3) Трейлинг-стоп: фиксируем большую часть заработанного.
-        if (self._cfg.trailing_activate_pct > 0
-                and max_profit >= self._cfg.trailing_activate_pct
-                and profit_pct <= max_profit - self._cfg.trailing_drop_pct):
+        if (ep["trail_activate"] > 0
+                and max_profit >= ep["trail_activate"]
+                and profit_pct <= max_profit - ep["trail_drop"]):
             await self._sell(
                 ticker, price, position, "трейлинг-стоп", profit_pct,
                 f"прибыль доходила до +{max_profit:.1f}%, но цена откатилась - "
@@ -769,7 +999,7 @@ class TradingEngine:
                     f"({profit_pct:+.2f}%), но ИИ-трейдер видит признаки "
                     f"восстановления и советует подождать: "
                     f"«{verdict['reason']}».\nПроверю ещё раз через "
-                    f"{self._cfg.poll_interval_sec // 60} мин; если цена "
+                    f"{self._check_period_min()} мин; если цена "
                     f"останется ниже стопа - продам без уговоров.")
                 return
             # ИИ недоступен или не уверен - продаём по классике.
@@ -783,24 +1013,30 @@ class TradingEngine:
                      "продолжаю охранять позицию", ticker)
             self._state.set_position(ticker, {**position, "sl_confirm": 0})
 
-        # 5) Досрочный выход по ИИ - только при прибыли.
+        # Сводка индикаторов для радара разворота и ИИ: считаем ОДИН раз,
+        # если не удалось - стопы выше уже отработали, радар просто пропустим.
+        history, summary = await self._position_summary(ticker, price)
+
+        # 5) РАДАР РАЗВОРОТА (v1.7.0): прибыль недавно была большой, а цена
+        # подаёт признаки разворота - выходим сразу при ПЕРВОМ намёке.
+        # Работает только в плюс: за убытками следят стоп-лоссы.
+        if (profit_pct > 0 and max_profit >= ep["surge_from"] and summary):
+            hints = indicators.surge_fall_hints(summary, [p for _, p in history]
+                                                if history else [])
+            if hints:
+                await self._sell(
+                    ticker, price, position, "защита прибыли", profit_pct,
+                    f"рост доходил до +{max_profit:.1f}%, а сейчас "
+                    + "; ".join(hints[:2])
+                    + " - продаю при первом намёке на разворот")
+                return
+
+        # 6) Досрочный выход по ИИ - только при прибыли.
         if (self._cfg.llm_decisions_enabled
                 and profit_pct >= self._cfg.llm_early_sell_min_profit_pct):
             decision = self._llm_cache.get(ticker)
             fresh = decision and (time.monotonic() - decision[0]) < self._llm_ttl_sec()
             if not fresh:
-                history = None
-                try:
-                    sma_h = self._sma_hours()
-                    step_h = self._candle_step_h(sma_h)
-                    fast_n = self._fast_n(sma_h, step_h)
-                    history = await self._client.get_candles_history(
-                        ticker, self._fetch_hours(fast_n, step_h), step_h)
-                    closes = [p for _, p in history]
-                    summary = (indicators.summarize_generic(closes, price, fast_n, step_h)
-                               if len(closes) >= self._min_candles(fast_n) else {})
-                except Exception:  # noqa: BLE001
-                    summary = {}
                 sentiment = await self._get_sentiment(ticker)
                 brief = self._build_brief(ticker, price, summary, sentiment,
                                           position=position, history=history)
@@ -819,6 +1055,33 @@ class TradingEngine:
                     verdict["confidence"] >= self._sell_confidence():
                 await self._sell(ticker, price, position, "решение ИИ", profit_pct,
                                  verdict["reason"])
+
+    async def _position_summary(self, ticker: str, price: float
+                                ) -> Tuple[List[Tuple[float, float]], Dict[str, Any]]:
+        """Свечи + индикаторы по открытой позиции (для радара разворота и ИИ).
+
+        Ошибка API не должна ломать лестницу выходов: возвращаем ([], {})."""
+        try:
+            sma_h = self._sma_hours()
+            step_h = self._candle_step_h(sma_h)
+            fast_n = self._fast_n(sma_h, step_h)
+            history = await self._client.get_candles_history(
+                ticker, self._fetch_hours(fast_n, step_h), step_h)
+            closes = [p for _, p in history]
+            if len(closes) >= self._min_candles(fast_n):
+                return history, indicators.summarize_generic(
+                    closes, price, fast_n, step_h)
+            return history, {}
+        except Exception as exc:  # noqa: BLE001
+            log.info("%s: сводка позиции недоступна (%s) - радар пропустит цикл",
+                     ticker, exc)
+            return [], {}
+
+    def _check_period_min(self) -> int:
+        """Как часто движок перепроверяет позиции (для текстов человеку)."""
+        if self.scalp_mode():
+            return max(1, self._cfg.scalp_exit_poll_sec // 60)
+        return max(1, self._cfg.poll_interval_sec // 60)
 
     async def _sl_verdict(self, ticker: str, price: float,
                           position: Dict[str, Any],
@@ -922,6 +1185,10 @@ class TradingEngine:
             reason_human = ("рост был сильным, и при высоком пике я продаю "
                             "уже при крошечном откате - лучше забрать "
                             "заработанное сейчас, чем смотреть, как оно тает")
+        elif reason == "защита прибыли":
+            reason_human = ("цена сильно выросла, но подала первые признаки "
+                            "разворота - по правилу владельца продаю сразу "
+                            "при первом намёке на падение, не жду отката")
         else:
             reason_human = f"ИИ-трейдер предложил закрыть позицию заранее: {detail}"
         emoji = "💰" if pnl >= 0 else "🩹"
@@ -1156,7 +1423,8 @@ class TradingEngine:
                      summary: Dict[str, Optional[float]], sentiment: float,
                      position: Optional[Dict[str, Any]] = None,
                      history: Optional[List[Tuple[float, float]]] = None,
-                     extra: Optional[str] = None) -> str:
+                     extra: Optional[str] = None,
+                     morning_ctx: Optional[Dict[str, Any]] = None) -> str:
         """Сводка для трейдера-LLM: индикаторы + путь цены в масштабе
         активности + новости + память прошлых решений."""
         name = self._client.instrument_name(ticker)
@@ -1165,7 +1433,10 @@ class TradingEngine:
                             f". Текущая цена {price:.2f} ₽.",
                             f"Режим: активность {info['activity']}/100, "
                             f"стратегия смотрит средние ~{info['sma_hours']:g} ч "
-                            f"(свечи {info['step_min']} мин)."]
+                            f"(свечи {info['step_min']} мин)."
+                            + (" СКАЛЬП-РЕЖИМ: позиция живёт минуты-часы, "
+                               "главная задача - не передержать и зафиксировать "
+                               "при остановке роста." if self.scalp_mode() else "")]
         if summary:
             sma_fast = summary.get("sma_fast")
             if sma_fast:
@@ -1197,6 +1468,23 @@ class TradingEngine:
             if vol is not None:
                 lines.append(f"Волатильность: {vol:.2f}% в час")
 
+        # v1.7.0: положение цены в локальном диапазоне - чтобы модель не
+        # советовала покупать вплотную к локальному максимуму (кейс LKOH).
+        if history:
+            closes = [p for _, p in history]
+            rp = indicators.range_position(closes, max(12, len(closes) // 3), price)
+            dist = rp.get("dist_to_high_pct")
+            bounce = rp.get("bounce_from_low_pct")
+            pos = rp.get("pos_in_range")
+            if dist is not None and pos is not None and bounce is not None:
+                verdict_txt = ("погоня за ценой, лучше не входить"
+                               if pos >= 0.8
+                               else "нормально для входа на откате")
+                lines.append(
+                    f"Локальный диапазон: до максимума {dist:+.2f}%, "
+                    f"от минимума +{bounce:.1f}%, положение в диапазоне "
+                    f"{pos * 100:.0f}% - {verdict_txt}")
+
         # Свежий путь цены - "график до настоящего момента" в масштабе
         # активности: активный режим видит локальные минуты, спокойный -
         # длинный отрезок суток. Сэмплируем до 30 точек, чтобы промпт не
@@ -1214,6 +1502,15 @@ class TradingEngine:
 
         lines.append(f"Сентимент новостей: {sentiment:+.2f} "
                      f"(от −1 плохие до +1 хорошие).")
+
+        # v1.7.0: утренний якорь - ИИ видит, что ночных торгов не было, и
+        # получает вчерашнюю основную сессию как опору (в т.ч. вчерашнее утро).
+        if morning_ctx:
+            morning_txt = sessions.describe_morning_context(morning_ctx)
+            if morning_txt:
+                lines.append("УТРО (ночных торгов не было - вечернюю сессию "
+                             "и ночные пустоты в расчёт не бери, опирайся на "
+                             "вчерашнюю основную сессию): " + morning_txt)
 
         if position:
             entry = float(position.get("entry_price", 0) or 0)
@@ -1275,7 +1572,8 @@ class TradingEngine:
     async def _get_llm_decision(self, ticker: str, price: float,
                                 summary: Dict[str, Optional[float]], score: float,
                                 sentiment: float,
-                                history: Optional[List[Tuple[float, float]]] = None
+                                history: Optional[List[Tuple[float, float]]] = None,
+                                morning_ctx: Optional[Dict[str, Any]] = None
                                 ) -> Optional[dict]:
         """Вердикт трейдера-LLM с кэшем на 10-30 минут (без LLM -> None)."""
         if not self._cfg.llm_decisions_enabled:
@@ -1284,7 +1582,7 @@ class TradingEngine:
         if cached and (time.monotonic() - cached[0]) < self._llm_ttl_sec():
             return cached[1]
         brief = self._build_brief(ticker, price, summary, sentiment,
-                                  history=history)
+                                  history=history, morning_ctx=morning_ctx)
         verdict = await self._analyst.analyze_market(brief)
         self._llm_cache[ticker] = (time.monotonic(), verdict)
         if verdict:
@@ -1462,4 +1760,5 @@ class TradingEngine:
                 f"свечи {info['step_min']} мин) "
                 f"(порог сигнала {self._score_threshold():.2f}), "
                 f"покупок сегодня: {self._state.buys_today()}/"
-                f"{self._max_buys_today()}{memory_txt}")
+                f"{self._max_buys_today()}{memory_txt}"
+                + (", РЕЖИМ: скальпинг" if self.scalp_mode() else ""))

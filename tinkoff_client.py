@@ -424,13 +424,23 @@ class TinkoffClient:
     async def get_market_snapshot(self) -> List[Dict[str, Any]]:
         """Снимок всего рынка TQBR одним HTTP-запросом (без ключей и лимитов).
 
-        Возвращает список {ticker, price, day_chg_pct, turnover}:
+        Возвращает список {ticker, price, day_chg_pct, turnover,
+        trading_status, updatetime}:
         turnover - оборот за сегодня в рублях (важно для фильтра неликвида).
+
+        ВАЖНО (v1.7.0): живые поля LAST / LASTTOPREVPRICE / VALTODAY живут
+        в блоке MARKETDATA, а НЕ в securities - раньше мы просили их у
+        securities, ISS молча выкидывал незнакомые колонки и возвращал
+        только SECID+PREVPRICE, из-за чего обороты ВСЕГДА были нулями:
+        сканер и днём писал "рынок не торгуется" и никогда не находил
+        кандидатов. Теперь запрашиваем оба блока и склеиваем их по SECID.
         Ошибка сети/формата -> TinkoffClientError (сканер покажет пропуск).
         """
         url = (self.MOEX_ISS_URL
-               + "?iss.meta=off&iss.only=securities"
-                 "&securities.columns=SECID,PREVPRICE,LAST,LASTTOPREVPRICE,VALTODAY")
+               + "?iss.meta=off&iss.only=securities,marketdata"
+                 "&securities.columns=SECID,PREVPRICE"
+                 "&marketdata.columns=SECID,LAST,LASTTOPREVPRICE,"
+                 "VALTODAY,TRADINGSTATUS,UPDATETIME")
         if self._http is None:
             raise TinkoffClientError("HTTP-сессия ещё не открыта (client.start())")
         try:
@@ -443,33 +453,62 @@ class TinkoffClient:
         except (asyncio.TimeoutError, aiohttp.ClientError, OSError, ValueError) as exc:
             raise TinkoffClientError(f"MOEX ISS недоступен: {exc}") from exc
 
-        block = payload.get("securities", {}) if isinstance(payload, dict) else {}
-        cols = block.get("columns", []) or []
-        idx = {name: i for i, name in enumerate(cols)}
-        if "SECID" not in idx:
+        def _block(name: str) -> Tuple[Dict[str, int], List[list]]:
+            block = payload.get(name, {}) if isinstance(payload, dict) else {}
+            cols = block.get("columns", []) or []
+            return ({name: i for i, name in enumerate(cols)},
+                    block.get("data", []) or [])
+
+        sec_idx, sec_rows = _block("securities")
+        md_idx, md_rows = _block("marketdata")
+        if "SECID" not in sec_idx and "SECID" not in md_idx:
             raise TinkoffClientError("MOEX ISS: неожиданный формат ответа")
 
-        def _num(row: list, name: str) -> float:
+        def _num(row: list, idx: Dict[str, int], name: str) -> float:
             if name not in idx:
                 return 0.0
-            value = row[idx[name]]
+            value = row[idx[name]] if idx[name] < len(row) else None
             try:
                 return float(value) if value is not None else 0.0
             except (TypeError, ValueError):
                 return 0.0
 
+        def _txt(row: list, idx: Dict[str, int], name: str) -> str:
+            if name not in idx or idx[name] >= len(row):
+                return ""
+            value = row[idx[name]]
+            return str(value) if value is not None else ""
+
+        # Склейка: marketdata - живые цифры, securities - PREVPRICE на случай,
+        # если LAST по бумаге пуст (торгов по ней сегодня ещё не было).
+        prev_price: Dict[str, float] = {}
+        for row in sec_rows:
+            if sec_idx.get("SECID", 0) < len(row) and row[sec_idx["SECID"]]:
+                prev_price[str(row[sec_idx["SECID"]])] = _num(row, sec_idx, "PREVPRICE")
         out: List[Dict[str, Any]] = []
-        for row in block.get("data", []) or []:
-            secid = row[idx["SECID"]]
-            if not secid:
+        for row in md_rows:
+            if md_idx.get("SECID", 0) >= len(row) or not row[md_idx["SECID"]]:
                 continue
+            secid = str(row[md_idx["SECID"]])
+            price = _num(row, md_idx, "LAST") or prev_price.get(secid, 0.0)
             out.append({
-                "ticker": str(secid),
-                "price": _num(row, "LAST") or _num(row, "PREVPRICE"),
-                "day_chg_pct": _num(row, "LASTTOPREVPRICE"),
-                "turnover": _num(row, "VALTODAY"),
+                "ticker": secid,
+                "price": price,
+                "day_chg_pct": _num(row, md_idx, "LASTTOPREVPRICE"),
+                "turnover": _num(row, md_idx, "VALTODAY"),
+                "trading_status": _txt(row, md_idx, "TRADINGSTATUS"),
+                "updatetime": _txt(row, md_idx, "UPDATETIME"),
             })
-        log.info("Снимок MOEX ISS: %d бумаг", len(out))
+        # Бумаги, которых нет в marketdata (редкий случай), добавляем из
+        # securities с нулевым оборотом - чтобы не терять вселенную.
+        seen = {r["ticker"] for r in out}
+        for secid, prev in prev_price.items():
+            if secid not in seen:
+                out.append({"ticker": secid, "price": prev,
+                            "day_chg_pct": 0.0, "turnover": 0.0,
+                            "trading_status": "", "updatetime": ""})
+        log.info("Снимок MOEX ISS: %d бумаг (marketdata: %d, securities: %d)",
+                 len(out), len(md_rows), len(sec_rows))
         return out
 
     def get_lot_size(self, ticker: str) -> int:
