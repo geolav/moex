@@ -23,6 +23,13 @@ scanner.py - сканер рынка Мосбиржи: раз в SCAN_INTERVAL_M
 слоты занимают лучшие кандидаты (до 10 бумаг) - так бот торгует весь рынок,
 а не только ручной список.
 
+АВТОПОКУПКА (v1.7.1, SCAN_AUTO_BUY, переключение /autobuy): после отправки
+отчёта сканер передаёт лучших кандидатов движку (auto_buy_from_scan) - и тот
+может САМ купить до SCAN_AUTO_BUY_PER_SCAN бумаг за скан. Это НЕ обход
+проверок: каждый кандидат прогоняется через полный путь входа движка
+(порог сигнала, анти-погоня, новости, ИИ, лимиты, бюджет). Не прошёл -
+остаётся только в отчёте и watchlist.
+
 История бага v1.6.x (исправлено в v1.7.0): живые обороты читались из блока
 securities, где их НЕТ (они в marketdata), поэтому сканер всегда видел нули и
 писал "рынок не торгуется" даже в разгар торгового дня. Теперь:
@@ -31,8 +38,8 @@ securities, где их НЕТ (они в marketdata), поэтому скане
   - такое сообщение в автоматическом режиме приходит не чаще одного раза
     в 3 часа (раньше оно повторялось каждые 10 минут и заспамивало владельца).
 
-ВАЖНО: сканер сам НЕ торгует (кроме авто-подбора списка в скальп-режиме):
-"купить сразу" - /buy или кнопка, "отдать боту" - /watch или кнопка.
+Ручные покупки: кнопка «Купить» (= 1 лот) или /buy ТИКЕР ШТ,
+под автоторговлю - кнопка «Торгуй» или /watch ТИКЕР.
 """
 from __future__ import annotations
 
@@ -64,7 +71,10 @@ _CLOSED_NOTIFY_TTL_SEC = 3 * 3600
 
 
 def _report_keyboard(top: List[Dict[str, Any]]):
-    """Кнопки под отчётом сканера: купить / отдать под управление (v1.7.0).
+    """Кнопки под отчётом сканера (v1.7.0, подписи уточнены в v1.7.1):
+
+    «Купить ТИКЕР (1 лот)» - немедленная покупка одного лота своими руками;
+    «Торгуй ТИКЕР» - отдать бумагу боту под автоторговлю (/watch).
 
     aiogram может быть недоступен в тестах - тогда вернём None (без кнопок).
     """
@@ -79,12 +89,24 @@ def _report_keyboard(top: List[Dict[str, Any]]):
     for row in top[:4]:
         ticker = row["ticker"]
         rows.append([
-            InlineKeyboardButton(text=f"🛒 Купить {ticker}",
+            InlineKeyboardButton(text=f"🛒 Купить {ticker} (1 лот)",
                                  callback_data=f"buy:{ticker}"),
-            InlineKeyboardButton(text=f"👁 Веду {ticker}",
+            InlineKeyboardButton(text=f"🤖 Торгуй {ticker}",
                                  callback_data=f"watch:{ticker}"),
         ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _auto_buy_enabled(cfg, state) -> bool:
+    """Включена ли автопокупка кандидатов сканера (v1.7.1).
+
+    Приоритет тот же, что в движке: state.scan_auto_buy (/autobuy)
+    -> cfg.scan_auto_buy (env). None/нет ключа - env-настройка.
+    """
+    value = getattr(state, "scan_auto_buy", None)
+    if value is None:
+        value = getattr(cfg, "scan_auto_buy", True)
+    return bool(value)
 
 
 class MarketScanner:
@@ -173,6 +195,8 @@ class MarketScanner:
             await self._deliver(text, photos, top)
             if text.startswith("😴"):
                 self._last_closed_notify = time.monotonic()
+            # v1.7.1: автопокупка - лучшего кандидата можно купить самому.
+            await self._maybe_auto_buy(top, manual=manual)
             return text
 
     # ------------------------------------------------------------------ анализ
@@ -253,6 +277,42 @@ class MarketScanner:
         text = self._build_report(top, verdicts, scalp_note)
         photos = self._render_photos(top)
         return text, photos, top
+
+    async def _maybe_auto_buy(self, top: List[Dict[str, Any]],
+                              *, manual: bool = False) -> None:
+        """Автопокупка кандидатов сканера (v1.7.1).
+
+        Передаём тикеры из отчёта движку: каждый проходит полный путь
+        входа, и движок может купить до SCAN_AUTO_BUY_PER_SCAN бумаг.
+        О покупке придёт обычное сообщение от движка; сюда - короткая
+        сводка, если что-то куплено.
+        """
+        if not top or not _auto_buy_enabled(self._cfg, self._state):
+            return
+        method = getattr(self._engine, "auto_buy_from_scan", None)
+        if method is None:   # тестовый/старый движок без автопокупки
+            return
+        candidates = [row["ticker"] for row in top]
+        try:
+            bought = await method(candidates)
+        except Exception as exc:  # noqa: BLE001 - сканер обязан пережить сбой
+            log.warning("Сканер: автопокупка не удалась (%s)", exc)
+            return
+        if not bought:
+            log.info("Сканер: автопокупка - кандидаты проверки движка не "
+                     "прошли (сигнал/ИИ/новости/лимиты)")
+            return
+        log.info("Сканер: сам купил по итогам скана: %s", ", ".join(bought))
+        scope = "ручного скана" if manual else "скана"
+        note = (f"🤖 Автопокупка по итогам {scope}: сам купил "
+                f"{', '.join(bought)} - сигнал, новости и вердикт ИИ "
+                f"сошлись. Подробности сделки - сообщением выше.")
+        try:
+            await self._notify(note)
+        except TypeError:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Сканер: не удалось отправить сводку автопокупки: %s", exc)
 
     async def _deep_analyze(self, pool: List[Dict[str, Any]]
                             ) -> List[Dict[str, Any]]:
@@ -341,9 +401,16 @@ class MarketScanner:
         lines.append("")
         if scalp_note:
             lines.append(scalp_note.strip())
-        lines.append("Кнопки под сообщением: купить сразу или отдать боту "
-                     "под управление. Вручную: /buy ТИКЕР ШТ, /watch ТИКЕР • "
+        lines.append("Кнопки: «Купить ТИКЕР» - сразу 1 лот своими руками; "
+                     "«Торгуй ТИКЕР» - отдать боту под автоторговлю. "
+                     "Вручную: /buy ТИКЕР ШТ, /watch ТИКЕР • "
                      "графики моих бумаг: /charts")
+        if _auto_buy_enabled(self._cfg, self._state):
+            lines.append(f"🤖 Автопокупка вкл: до "
+                         f"{getattr(self._cfg, 'scan_auto_buy_per_scan', 1)} "
+                         f"лучш(его/их) кандидата(ов) могу купить сам - только "
+                         f"если сигнал, новости, ИИ и лимиты все за "
+                         f"(/autobuy off - выключить).")
         return "\n".join(lines)
 
     def _render_photos(self, top: List[Dict[str, Any]]) -> List[bytes]:

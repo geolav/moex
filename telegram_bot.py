@@ -4,7 +4,14 @@ telegram_bot.py - Telegram-интерфейс управления (aiogram 3.x)
 v1.7.0: команды можно не печатать - есть кнопки:
   • reply-клавиатура под чатом (/status, /scan, /scalp и др.);
   • синяя кнопка «Меню» с описаниями команд (set_my_commands в main.py);
-  • inline-кнопки: «Купить»/«Веду» в отчётах сканера и «Продать» в /positions.
+  • inline-кнопки: «Купить»/«Торгуй» в отчётах сканера и «Продать» в /positions.
+
+v1.7.1:
+  • длинные справки /help и /start шлются ПО ЧАСТЯМ: Telegram не принимает
+    сообщения длиннее 4096 символов, а HELP_TEXT вырос до ~7.3 тыс. - было
+    'Bad Request: message is too long' и команда просто не отвечала;
+  • новая команда /autobuy - включить/выключить автопокупку кандидатов
+    сканера (бот сам покупает лучших, прогоняя их через все проверки).
 
 Команды (принимаются ТОЛЬКО от администратора из TELEGRAM_ADMIN_ID):
   /start           - сводный статус бота простыми словами;
@@ -54,7 +61,7 @@ import charts
 
 log = logging.getLogger("telegram")
 
-VERSION = "1.7.0"
+VERSION = "1.7.1"
 
 HELP_TEXT = (
     "Команды (можно не печатать - жмите кнопки на клавиатуре ниже чата):\n"
@@ -68,6 +75,7 @@ HELP_TEXT = (
     "/sell GAZP 30 - продать вручную (без числа - продать всё)\n"
     "/watchlist - бумаги под автоматической торговлей\n"
     "/watch MTSS - добавить бумагу, /unwatch MTSS - убрать\n"
+    "/autobuy - автопокупка кандидатов сканера: вкл/выкл\n"
     "/scalp - СКАЛЬП-РЕЖИМ: весь рынок сам, до 10 бумаг, сделки по 5 мин\n"
     "/memory - что бот выучил из своих сделок (винрейт, уроки, плохие часы)\n"
     "/reset_memory - забыть всю память сделок (начать учиться заново)\n"
@@ -89,8 +97,13 @@ HELP_TEXT = (
     "• Сканер рынка - раз в 10 минут бот просматривает почти весь рынок "
     "Мосбиржи (ликвидные бумаги с оборотом от десятков миллионов) и "
     "присылает топ кандидатов на покупку с графиками, вердиктом ИИ и "
-    "кнопками. Сам он их НЕ покупает: /buy - купить сразу, /watch - отдать "
-    "под автоторговлю.\n"
+    "кнопками. Кнопка «Купить» - сразу 1 лот своими руками; «Торгуй» - "
+    "отдать бумагу под автоторговлю; /buy - купить указанное количество.\n"
+    "• Автопокупка со сканера (/autobuy) - по итогам каждого скана бот "
+    "может САМ купить до одного лучшего кандидата (лимит настраивается в "
+    ".env). Это не шальная сделка: кандидат прогоняется через ВСЕ обычные "
+    "проверки - порог сигнала, анти-погоня, новости, вердикт ИИ, дневные "
+    "лимиты и бюджет. Выключить: /autobuy off.\n"
     "• Скальп-режим (/scalp) - отдельный режим для многих мелких сделок: "
     "сканер сам отбирает лучшие бумаги всего рынка (до 10 одновременно), "
     "решения о сделках - каждые 5 минут, охрана позиций - каждые 2.5 мин, "
@@ -134,7 +147,7 @@ HELP_TEXT = (
     "Реальный счёт - настоящие деньги и настоящие сделки."
 )
 
-#: Кнопки под чатом: команды в один тап (v1.7.0).
+#: Кнопки под чатом: команды в один тап (v1.7.0, /autobuy - v1.7.1).
 #: ВАЖНО: aiogram 3 - это pydantic-модели, ТОЛЬКО именованные аргументы.
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     keyboard=[
@@ -142,9 +155,10 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
          KeyboardButton(text="/charts")],
         [KeyboardButton(text="/scan"), KeyboardButton(text="/watchlist"),
          KeyboardButton(text="/stats")],
-        [KeyboardButton(text="/scalp"), KeyboardButton(text="/toggle_trading"),
-         KeyboardButton(text="/memory")],
-        [KeyboardButton(text="/ask "), KeyboardButton(text="/help")],
+        [KeyboardButton(text="/scalp"), KeyboardButton(text="/autobuy"),
+         KeyboardButton(text="/toggle_trading")],
+        [KeyboardButton(text="/memory"), KeyboardButton(text="/ask "),
+         KeyboardButton(text="/help")],
     ],
     resize_keyboard=True,
     is_persistent=True,
@@ -158,6 +172,7 @@ BOT_COMMANDS = [
     ("charts", "графики всех бумаг под управлением"),
     ("stats", "статистика и график за часы"),
     ("scan", "сканер рынка: топ кандидатов"),
+    ("autobuy", "автопокупка кандидатов сканера: вкл/выкл"),
     ("buy", "купить: /buy SBER 100 (штуки)"),
     ("sell", "продать: /sell GAZP 30 (или всё)"),
     ("watchlist", "список бумаг под автоторговлей"),
@@ -222,7 +237,9 @@ def create_router(ctx: AppContext) -> Router:
         scalp = ("⚡ Скальп-режим ВКЛЮЧЁН (весь рынок, до "
                  f"{ctx.config.scalp_max_positions} бумаг)\n"
                  if ctx.state.scalp_mode else "")
-        await message.answer(
+        # v1.7.1: приветствие и справка РАЗДЕЛЬНО - справка (~7 тыс. символов)
+        # не влезает в лимит Telegram 4096, из-за чего /start падал целиком.
+        greeting = (
             f"🤖 Бот-трейдер для Мосбиржи (v{VERSION})\n"
             f"Режим: {mode}\n"
             f"Автотрейдинг: {trading}\n"
@@ -233,10 +250,12 @@ def create_router(ctx: AppContext) -> Router:
             f"(проверка каждые {ctx.config.poll_interval_sec // 60} мин)\n"
             f"Работаю уже: {uptime}\n\n"
             "Команды можно не печатать - жмите кнопки на клавиатуре ниже "
-            "или синюю кнопку «Меню» слева от поля ввода.\n\n"
-            f"{HELP_TEXT}",
-            reply_markup=MAIN_KEYBOARD,
+            "или синюю кнопку «Меню» слева от поля ввода. Полная справка "
+            "придёт следующими сообщениями."
         )
+        await message.answer(greeting, reply_markup=MAIN_KEYBOARD)
+        for chunk in split_message(HELP_TEXT):
+            await message.answer(chunk)
 
     # --------------------------------------------------------------- /status
     @router.message(Command("status"))
@@ -323,7 +342,9 @@ def create_router(ctx: AppContext) -> Router:
         audit = ctx.state.last_audit_result
         if audit:
             parts.append(f"Последняя проверка ИИ-аудитора: {audit[:200]}")
-        await message.answer("\n".join(parts))
+        # v1.7.1: через резку длинных текстов - /status с большим числом
+        # позиций тоже мог упереться в лимит Telegram.
+        await _answer_long(message, "\n".join(parts))
 
     # ---------------------------------------------------------------- /stats
     @router.message(Command("stats"))
@@ -545,7 +566,7 @@ def create_router(ctx: AppContext) -> Router:
             await message.answer(
                 "Память сделок не подключена (LEARNING=False в настройках).")
             return
-        await message.answer(ctx.memory.summary_text())
+        await _answer_long(message, ctx.memory.summary_text())
 
     # --------------------------------------------------------- /reset_memory
     @router.message(Command("reset_memory"))
@@ -863,7 +884,12 @@ def create_router(ctx: AppContext) -> Router:
     async def cmd_help(message: Message) -> None:
         if not is_admin(message):
             return
-        await message.answer(HELP_TEXT, reply_markup=MAIN_KEYBOARD)
+        # v1.7.1: HELP_TEXT ~7.3 тыс. символов > лимит Telegram 4096 -
+        # шлём по частям, клавиатуру вешаем на последнюю часть.
+        parts = split_message(HELP_TEXT)
+        for i, chunk in enumerate(parts):
+            markup = MAIN_KEYBOARD if i == len(parts) - 1 else None
+            await message.answer(chunk, reply_markup=markup)
 
     # ------------------------------------------------------------------- /scalp
     @router.message(Command("scalp"))
@@ -931,6 +957,57 @@ def create_router(ctx: AppContext) -> Router:
             "(до 10 минут). Если сделок станет не хватать по дневному лимиту - "
             "поднимите MAX_BUYS_PER_DAY в .env. Выключить: /scalp off")
 
+    # --------------------------------------------------------------- /autobuy
+    @router.message(Command("autobuy"))
+    async def cmd_autobuy(message: Message,
+                          command: Optional[CommandObject] = None) -> None:
+        """Автопокупка кандидатов сканера: бот сам покупает лучших."""
+        if not is_admin(message):
+            return
+        args = (command.args or "").strip().lower() if command else ""
+        current = getattr(ctx.state, "scan_auto_buy", None)
+        if current is None:
+            current = bool(getattr(ctx.config, "scan_auto_buy", True))
+        if args in ("on", "вкл", "включить"):
+            new_value = True
+        elif args in ("off", "выкл", "выключить"):
+            new_value = False
+        elif args == "":
+            new_value = not current
+        else:
+            await message.answer(
+                "Не понял аргумент. Варианты:\n"
+                "/autobuy - переключить\n"
+                "/autobuy on - включить\n"
+                "/autobuy off - выключить")
+            return
+        setter = getattr(ctx.state, "set_scan_auto_buy", None)
+        if setter is None:
+            await message.answer(
+                "Переключение недоступно: обновите бота (в state.json нет "
+                "ключа scan_auto_buy).")
+            return
+        setter(new_value)
+        if new_value:
+            await message.answer(
+                "🤖 Автопокупка со сканера ВКЛЮЧЕНА.\n"
+                f"• После каждого скана (раз в {ctx.config.scan_interval_min} мин) "
+                f"пробую купить до "
+                f"{getattr(ctx.config, 'scan_auto_buy_per_scan', 1)} лучш(его/их) "
+                f"кандидат(а) САМ - без нажатия кнопок.\n"
+                "• Это не шальные сделки: кандидат проходит ВСЕ обычные проверки - "
+                "порог сигнала, анти-погоня, новости, вердикт ИИ, дневные лимиты, "
+                "бюджет. Не прошёл - остаётся только в отчёте и watchlist.\n"
+                f"• Лимит бумаг под управлением: {ctx.engine.max_tickers()} "
+                f"(сейчас: {len(ctx.engine.watchlist())}, список: /watchlist).\n"
+                "Выключить: /autobuy off")
+        else:
+            await message.answer(
+                "⏸ Автопокупка со сканера ВЫКЛЮЧЕНА: кандидатов из отчётов "
+                "покупаю только по кнопке «Купить» или команде /buy.\n"
+                "Бумаги из /watchlist продолжу торговать автоматически, "
+                "как раньше. Включить: /autobuy on")
+
     # ------------------------------------------------- кнопки под сообщениями
     @router.callback_query(F.data.startswith("buy:"))
     async def cb_buy(callback: CallbackQuery) -> None:
@@ -973,7 +1050,7 @@ def create_router(ctx: AppContext) -> Router:
 
     @router.callback_query(F.data.startswith("watch:"))
     async def cb_watch(callback: CallbackQuery) -> None:
-        """Кнопка «Веду ТИКЕР» в отчёте сканера: отдать под автоторговлю."""
+        """Кнопка «Торгуй ТИКЕР» в отчёте сканера: отдать под автоторговлю."""
         user = getattr(callback, "from_user", None)
         if getattr(user, "id", None) != admin_id:
             await callback.answer("Только для администратора", show_alert=True)
@@ -1250,16 +1327,64 @@ def _uptime(started_monotonic: float) -> str:
     return f"{hours} ч {minutes} мин"
 
 
+# ---------------------------------------------------------------------------
+# Длинные сообщения: Telegram не принимает больше 4096 символов на одно
+# сообщение. В v1.7.0 HELP_TEXT вырос до ~7.3 тыс., и /help и /start падали
+# с 'Bad Request: message is too long'. Теперь любой длинный текст режется
+# на части по строкам.
+# ---------------------------------------------------------------------------
+def split_message(text: str, limit: int = 3900) -> List[str]:
+    """Режет длинный текст на части не длиннее `limit` символов.
+
+    Резка по СТРОКАМ: списки и абзацы не рвутся посреди слова. Одна
+    гигантская строка (длиннее лимита) режется грубо, посимвольно.
+    """
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return [text] if text else []
+    parts: List[str] = []
+    current: List[str] = []
+    size = 0
+    for line in text.split("\n"):
+        while len(line) > limit:
+            if current:
+                parts.append("\n".join(current))
+                current, size = [], 0
+            parts.append(line[:limit])
+            line = line[limit:]
+        if current and size + 1 + len(line) > limit:
+            parts.append("\n".join(current))
+            current, size = [], 0
+        current.append(line)
+        size += len(line) + (1 if len(current) > 1 else 0)
+    if current:
+        parts.append("\n".join(current))
+    return parts
+
+
+async def _answer_long(message: Message, text: str) -> None:
+    """Ответ в чат длинным текстом: по частям, если не влезает в лимит."""
+    for chunk in split_message(text):
+        await message.answer(chunk)
+
+
 async def send_admin_message(bot: Bot, admin_id: int, text: str,
                              reply_markup=None) -> None:
     """Отправка уведомления администратору (движок, аудитор, сканер).
 
-    reply_markup - необязательная клавиатура (кнопки отчёта сканера)."""
-    if reply_markup is not None:
-        await bot.send_message(chat_id=admin_id, text=text,
-                               reply_markup=reply_markup)
-    else:
-        await bot.send_message(chat_id=admin_id, text=text)
+    v1.7.1: длинные тексты режутся на части по <=3900 символов - ни одно
+    уведомление больше не падает с 'message is too long'. reply_markup
+    (кнопки отчёта сканера) вешается на ПЕРВУЮ часть."""
+    chunks = split_message(text)
+    if not chunks:
+        return
+    for i, chunk in enumerate(chunks):
+        markup = reply_markup if i == 0 else None
+        if markup is not None:
+            await bot.send_message(chat_id=admin_id, text=chunk,
+                                   reply_markup=markup)
+        else:
+            await bot.send_message(chat_id=admin_id, text=chunk)
 
 
 def build_dispatcher(ctx: AppContext) -> Dispatcher:

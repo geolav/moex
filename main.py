@@ -114,6 +114,10 @@ def _print_banner(config: BotConfig, state: StateStore) -> None:
              config.poll_interval_sec,
              "вкл" if config.scan_enabled else "выкл",
              config.scan_interval_min)
+    log.info("Сканер: автопокупка кандидатов %s (до %d за скан; "
+             "переключение в Telegram: /autobuy)",
+             "вкл" if config.scan_auto_buy else "выкл",
+             config.scan_auto_buy_per_scan)
     if state.scalp_mode:
         log.info("Скальп: полные циклы каждые %d сек, охрана позиций каждые "
                  "%d сек, кулдаун %d мин", config.scalp_poll_sec,
@@ -185,7 +189,9 @@ async def async_main() -> int:
             )
 
     # Сканер рынка: раз в SCAN_INTERVAL_MIN минут ищет кандидаты по всему
-    # рынку TQBR и присылает топ с графиками. Сам НЕ торгует - подсказывает.
+    # рынку TQBR и присылает топ с графиками. v1.7.1: лучших кандидатов он
+    # может и КУПИТЬ сам (SCAN_AUTO_BUY, лимит за скан, /autobuy) - каждый
+    # кандидат проходит полный путь проверок движка.
     scanner = MarketScanner(config, state, client, analyst, engine,
                             notify_admin, send_admin_photos)
 
@@ -267,11 +273,13 @@ async def async_main() -> int:
                         if config.scan_enabled else "сканер выключен")
             scalp_txt = (" Скальп-режим ВКЛ (/scalp)." if state.scalp_mode
                          else "")
+            autobuy_txt = (" Автопокупка кандидатов сканера: вкл (/autobuy)."
+                           if config.scan_auto_buy else "")
             await notify_admin(
                 f"Бот запущен (v{VERSION}). Режим: {mode}. "
                 f"Тикеры: {', '.join(engine.watchlist())}. "
                 f"Торговля: {'вкл' if state.trading_enabled else 'выкл'}. "
-                f"{scan_txt}.{scalp_txt} "
+                f"{scan_txt}.{scalp_txt}{autobuy_txt} "
                 f"Команды теперь есть кнопками: /help.")
         except Exception as exc:  # noqa: BLE001 - Telegram мог быть недоступен
             log.warning("Приветствие в Telegram не отправлено: %s", exc)

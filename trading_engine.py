@@ -45,6 +45,11 @@ trading_engine.py - торговая логика бота v2: гибрид "и�
 
 КРИТИЧНО ДЛЯ VPS 1 ГБ ОЗУ: тикеры обрабатываются СТРОГО последовательно
 (for-цикл), asyncio.gather() не используется.
+
+v1.7.1: АВТОПОКУПКА СО СКАНЕРА - scan_once может вызвать
+auto_buy_from_scan(candidates): лучшие кандидаты сканера прогоняются через
+обычный путь входа и покупаются сами (SCAN_AUTO_BUY, лимит за скан
+SCAN_AUTO_BUY_PER_SCAN). Все сделки движка - под _trade_lock.
 """
 from __future__ import annotations
 
@@ -536,6 +541,81 @@ class TradingEngine:
         log.info("Скальп: список бумаг обновлён сканером: %s", ", ".join(keep))
         return keep
 
+    # -------------------------------------------------- автопокупка со сканера
+    def _scan_auto_buy_enabled(self) -> bool:
+        """Включена ли автопокупка кандидатов сканера (v1.7.1).
+
+        Приоритет: state.scan_auto_buy (переключается командой /autobuy)
+        -> cfg.scan_auto_buy (env SCAN_AUTO_BUY). Старые state.json без
+        ключа и тестовые фейки дают None - тогда берём env-настройку.
+        """
+        value = getattr(self._state, "scan_auto_buy", None)
+        if value is None:
+            value = getattr(self._cfg, "scan_auto_buy", True)
+        return bool(value)
+
+    async def auto_buy_from_scan(self, candidates: List[str]) -> List[str]:
+        """Сканер нашёл кандидатов - пробую купить лучшего(их) САМ (v1.7.1).
+
+        Это НЕ обход правил: каждая покупка проходит ПОЛНЫЙ путь обычного
+        входа (_process_ticker -> _evaluate_entry): торговый статус рынка,
+        кулдаун, дневной лимит покупок, память об ошибках, порог сигнала,
+        анти-погоня, новости, вердикт ИИ, лимит вложенности и бюджет.
+        Отличие от ручной кнопки только одно: не нужно нажимать её самому.
+
+        Бумага добавляется в watchlist, если есть свободный слот (ИНАЧЕ у
+        позиции не будет выходов: в обычном режиме лестница выходов
+        обходит именно watchlist). Список полон - кандидат пропускается:
+        его всегда можно купить кнопкой или /watch вручную.
+
+        Лимит за один вызов - SCAN_AUTO_BUY_PER_SCAN (по умолчанию 1):
+        сканер раз в 10 минут, так что это 'иногда сам что-то покупает',
+        а не скупает весь рынок.
+
+        Возвращает тикеры, по которым РЕАЛЬНО открылись позиции.
+        """
+        if not self._scan_auto_buy_enabled():
+            return []
+        if not getattr(self._state, "trading_enabled", True):
+            return []   # автоторговля выключена - и автопокупка тоже
+        limit = max(1, int(getattr(self._cfg, "scan_auto_buy_per_scan", 1) or 1))
+        bought: List[str] = []
+        for raw in candidates:
+            if len(bought) >= limit:
+                break
+            ticker = (raw or "").strip().upper()
+            if not ticker or ticker in self._state.positions or ticker in bought:
+                continue
+            if ticker not in self.watchlist():
+                if len(self.watchlist()) >= self.max_tickers():
+                    log.info("Автопокупка: %s пропущен - список бумаг полон "
+                             "(%d/%d). Купить вручную: /buy %s ШТ или /watch %s",
+                             ticker, len(self.watchlist()), self.max_tickers(),
+                             ticker, ticker)
+                    continue
+                checker = getattr(self._client, "ensure_instrument", None)
+                if checker is not None and not checker(ticker):
+                    log.info("Автопокупка: %s не найден на бирже - пропуск", ticker)
+                    continue
+                current = self.watchlist()
+                current.append(ticker)
+                self._save_watchlist(current)
+                log.info("Автопокупка: %s взят под управление: %s",
+                         ticker, ", ".join(current))
+            try:
+                await self._process_ticker(ticker)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - один кандидат не решает
+                log.warning("Автопокупка %s: не удалась (%s)", ticker, exc)
+                continue
+            if ticker in self._state.positions:
+                bought.append(ticker)
+            else:
+                log.info("Автопокупка: %s все проверки не прошёл "
+                         "(сигнал/ИИ/новости/лимиты) - только смотрю", ticker)
+        return bought
+
     # ------------------------------------------------------------------- вход
     async def _evaluate_entry(self, ticker: str, price: float) -> None:
         # Шаг 0. Страховки частоты: кулдаун и дневной лимит (вне влияния LLM).
@@ -754,6 +834,22 @@ class TradingEngine:
                    summary: Dict[str, Optional[float]], score: float,
                    decision: dict,
                    morning_ctx: Optional[Dict[str, Any]] = None) -> None:
+        # v1.7.1: покупки движка под ТЕМ ЖЕ замком, что и ручные /buy /sell.
+        # Раньше цикл движка и ручная команда могли поставить ордера на одну
+        # бумагу одновременно; теперь добавился и сканер (автопокупка) -
+        # дубли исключены: под замком ещё раз проверяем, что позиции нет.
+        async with self._trade_lock:
+            if ticker in self._state.positions:
+                log.info("%s: позиция уже открыта - повторную покупку отменяю "
+                         "(гонка цикл/сканер/ручная команда)", ticker)
+                return
+            await self._buy_locked(ticker, price, sentiment, summary, score,
+                                   decision, morning_ctx=morning_ctx)
+
+    async def _buy_locked(self, ticker: str, price: float, sentiment: float,
+                          summary: Dict[str, Optional[float]], score: float,
+                          decision: dict,
+                          morning_ctx: Optional[Dict[str, Any]] = None) -> None:
         try:
             portfolio = await self._client.get_portfolio_summary()
         except Exception as exc:  # noqa: BLE001

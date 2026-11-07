@@ -207,6 +207,8 @@ class BotConfig:
     scan_deep_n: int              # сколько бумаг глубоко считать по свечам
     scan_report_top: int          # сколько кандидатов присылать в отчёте
     scan_llm: bool                # ИИ-комментарий по кандидатам (1 запрос)
+    scan_auto_buy: bool           # v1.7.1: бот сам покупает лучших кандидатов
+    scan_auto_buy_per_scan: int   # v1.7.1: максимум автопокупок за один скан
 
     # --- Инфраструктура ---
     rate_limit_rpm: int
@@ -351,6 +353,10 @@ def load_config() -> BotConfig:
         scan_deep_n=_env_int("SCAN_DEEP_N", 20, low=5, high=60),
         scan_report_top=_env_int("SCAN_REPORT_TOP", 6, low=3, high=10),
         scan_llm=_env_bool("SCAN_LLM", True),
+        # v1.7.1: автопокупка кандидатов сканера (переключение - /autobuy).
+        scan_auto_buy=_env_bool("SCAN_AUTO_BUY", True),
+        scan_auto_buy_per_scan=_env_int("SCAN_AUTO_BUY_PER_SCAN", 1,
+                                        low=1, high=5),
         rate_limit_rpm=_env_int("RATE_LIMIT_RPM", 90, low=5, high=250),
         news_rss_urls=_env_urls(
             "NEWS_RSS_URLS",
@@ -398,6 +404,7 @@ class StateStore:
         "daily_buys": {"date": "", "count": 0},  # покупки за сегодня
         "watchlist": [],          # тикеры под управлением бота (до 6/10)
         "scalp_mode": False,      # v1.7.0: скальп-режим (/scalp в Telegram)
+        "scan_auto_buy": True,    # v1.7.1: автопокупка кандидатов сканера (/autobuy)
     }
 
     def __init__(self, path: str, initial_overrides: Optional[Dict[str, Any]] = None):
@@ -596,6 +603,16 @@ class StateStore:
 
     def set_scalp_mode(self, value: bool) -> None:
         self._data["scalp_mode"] = bool(value)
+        self.save()
+
+    # --- автопокупка кандидатов сканера (v1.7.1) -------------------------------
+    @property
+    def scan_auto_buy(self) -> bool:
+        """Покупать ли самому лучших кандидатов сканера (/autobuy)."""
+        return bool(self._data.get("scan_auto_buy", True))
+
+    def set_scan_auto_buy(self, value: bool) -> None:
+        self._data["scan_auto_buy"] = bool(value)
         self.save()
 
     # --- кулдаун и дневной лимит покупок ------------------------------------------
