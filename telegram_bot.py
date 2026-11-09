@@ -74,7 +74,7 @@ import predictor
 
 log = logging.getLogger("telegram")
 
-VERSION = "1.8.2"
+VERSION = "1.8.3"
 
 HELP_TEXT = (
     "Команды (можно не печатать - жмите кнопки на клавиатуре ниже чата):\n"
@@ -321,7 +321,13 @@ def create_router(ctx: AppContext) -> Router:
                         f"• {pos['ticker']}: {pos['quantity']} шт "
                         f"({lots} лот(а)) по текущей цене {pos['price']:.2f} ₽"
                     )
-            parts.append(_portfolio_consistency_line(ctx, broker_positions))
+            consistency = _portfolio_consistency_line(ctx, broker_positions)
+            parts.append(consistency)
+            if consistency.startswith("⚠️ РАСХОЖДЕНИЕ") and ctx.state.trading_enabled:
+                ctx.state.set_trading_enabled(False)
+                parts.append("🛑 Автоторговля автоматически выключена. Продажи и "
+                             "защита уже открытых позиций продолжают работать; "
+                             "включайте обратно только после ручной сверки.")
         except Exception as exc:  # noqa: BLE001 - API мог моргнуть, покажем локальное
             parts.append(f"(Сверку с брокером сейчас сделать не смог: {exc})")
 
@@ -736,6 +742,8 @@ def create_router(ctx: AppContext) -> Router:
             portfolio = await ctx.client.get_portfolio_summary()
             broker_positions = portfolio.get("positions", [])
             consistency = _portfolio_consistency_line(ctx, broker_positions)
+            if consistency.startswith("⚠️ РАСХОЖДЕНИЕ") and ctx.state.trading_enabled:
+                ctx.state.set_trading_enabled(False)
         except Exception as exc:  # noqa: BLE001
             broker_positions = []
             consistency = f"⚠️ Не удалось сверить позиции с брокером: {exc}"

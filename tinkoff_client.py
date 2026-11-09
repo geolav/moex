@@ -755,10 +755,26 @@ class TinkoffClient:
 
         positions: List[Dict[str, Any]] = []
         for position in response.positions:
+            # PortfolioResponse.positions содержит НЕ только акции: в нём
+            # присутствуют также валютные позиции (например RUB000UTSTOM).
+            # Денежный остаток уже учтён в total_amount_currencies/cash и
+            # не должен попадать в акции, invested_value или сверку state.
+            raw_kind = getattr(position, "instrument_type", None)
+            kind = str(getattr(raw_kind, "value", raw_kind) or "").strip().lower()
+            figi = str(getattr(position, "figi", "") or "")
+            if kind:
+                if kind not in {"share", "instrument_type_share"}:
+                    continue
+            elif figi not in self._ticker_by_figi:
+                # Совместимость со старыми SDK/моками без instrument_type:
+                # неизвестный FIGI нельзя безопасно считать акцией.
+                continue
+
             quantity = _to_float(position.quantity)
-            ticker = self._ticker_by_figi.get(position.figi, position.figi)
-            lots = int(getattr(position, "quantity_lots", None) and
-                       quotation_to_decimal(position.quantity_lots)) or 0
+            ticker = self._ticker_by_figi.get(figi, figi)
+            quantity_lots = getattr(position, "quantity_lots", None)
+            lots = (int(quotation_to_decimal(quantity_lots))
+                    if quantity_lots is not None else 0)
             if not lots:  # quantity_lots иногда пуст - считаем из лота бумаги
                 lot_size = self._instruments.get(ticker, {}).get("lot", 1)
                 lots = int(quantity // lot_size)
@@ -768,6 +784,7 @@ class TinkoffClient:
                 "quantity": quantity,
                 "price": _to_float(position.current_price),
                 "avg_price": _to_float(position.average_position_price),
+                "instrument_type": "share",
             })
         return {
             "total": _to_float(response.total_amount_portfolio),

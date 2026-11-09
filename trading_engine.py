@@ -1122,6 +1122,33 @@ class TradingEngine:
             log.error("%s: портфель недоступен (%s) - покупка отменена", ticker, exc)
             return
 
+        # Перед автоматической покупкой сверяем реальные акции брокера с
+        # позицией state. Валютные остатки уже отфильтрованы клиентом.
+        # При реальном расхождении защёлкиваем автоторговлю в OFF; продажи и
+        # сопровождение существующих позиций продолжают работать.
+        state_units = {
+            t: int(pos.get("lots", 0) or 0) * (self._client.get_lot_size(t) or 1)
+            for t, pos in self._state.positions.items()
+        }
+        broker_units = {
+            str(pos.get("ticker", "")).upper(): int(round(float(pos.get("quantity", 0) or 0)))
+            for pos in portfolio.get("positions", []) if pos.get("ticker")
+        }
+        mismatches = [
+            f"{t}: state={state_units.get(t, 0)} / broker={broker_units.get(t, 0)} шт"
+            for t in sorted(set(state_units) | set(broker_units))
+            if state_units.get(t, 0) != broker_units.get(t, 0)
+        ]
+        if mismatches:
+            self._state.set_trading_enabled(False)
+            detail = "; ".join(mismatches[:6])
+            log.critical("Автоторговля выключена: расхождение state/брокер: %s", detail)
+            await self._safe_notify(
+                "🛑 Автоторговля автоматически выключена из-за расхождения "
+                "позиций state и брокера: " + detail + ". Проверьте /status и "
+                "/positions; после ручной сверки включайте /toggle_trading.")
+            return
+
         invested = 0.0
         for t, pos in self._state.positions.items():
             sz = self._client.get_lot_size(t) or 1

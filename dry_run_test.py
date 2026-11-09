@@ -1,5 +1,5 @@
 """
-dry_run_test.py - самопроверка всего бота v1.8.2 на МАКЕТАХ без сети и токенов.
+dry_run_test.py - самопроверка всего бота v1.8.3 на МАКЕТАХ без сети и токенов.
 
 Проверяет ключевую логику ДО выхода на реальные деньги:
   1. торговый движок: сигнал + сентимент + LLM 'buy' -> покупка;
@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 from datetime import datetime
+from decimal import Decimal
 import math
 import os
 import sys
@@ -46,6 +47,8 @@ from news_filter import classify_headlines  # noqa: E402
 from trading_engine import TradingEngine  # noqa: E402
 from trade_memory import TradeMemory  # noqa: E402
 from scanner import MarketScanner  # noqa: E402
+from tinkoff_client import TinkoffClient  # noqa: E402
+import tinkoff_client as tinkoff_module  # noqa: E402
 import sessions  # noqa: E402
 
 PASSED: list[str] = []
@@ -135,6 +138,7 @@ class FakeClient:
         self.sells: list[tuple[str, int]] = []
         self.connected = True
         self.account_id = "test-account-1234"
+        self.holdings: dict[str, int] = {}
 
     def get_lot_size(self, ticker: str) -> int:
         return 10  # как у SBER
@@ -191,15 +195,21 @@ class FakeClient:
                 f"увеличил дивиденды."]
 
     async def get_portfolio_summary(self) -> dict:
-        return {"total": 55000.0, "cash": 50000.0, "positions": []}
+        positions = [{"ticker": ticker, "quantity": units,
+                      "price": self.price, "avg_price": self.price}
+                     for ticker, units in self.holdings.items() if units > 0]
+        return {"total": 55000.0, "cash": 50000.0, "positions": positions}
 
     async def buy(self, ticker: str, lots: int, price: float = 0.0) -> dict:
         self.buys.append((ticker, lots))
+        self.holdings[ticker] = self.holdings.get(ticker, 0) + lots * self.get_lot_size(ticker)
         return {"order_id": f"buy-{len(self.buys)}", "status": 4,
                 "lots_executed": lots, "requested_lots": lots}
 
     async def sell(self, ticker: str, lots: int, price: float = 0.0) -> dict:
         self.sells.append((ticker, lots))
+        self.holdings[ticker] = max(
+            0, self.holdings.get(ticker, 0) - lots * self.get_lot_size(ticker))
         return {"order_id": f"sell-{len(self.sells)}", "status": 4,
                 "lots_executed": lots, "requested_lots": lots}
 
@@ -229,7 +239,7 @@ class FakeAnalyst:
 
 async def main() -> int:
     print("=" * 64)
-    print("DRY-RUN самопроверка MOEX Trading Bot v1.8.2 (моки, без сети)")
+    print("DRY-RUN самопроверка MOEX Trading Bot v1.8.3 (моки, без сети)")
     print("=" * 64)
 
     tmp = tempfile.mkdtemp(prefix="bot_dryrun_")
@@ -798,6 +808,62 @@ async def main() -> int:
           bool(deep_rows))
     check("рыночная ширина 61.5% передана в функцию подтверждения сетапов",
           captured_breadth == [61.5], str(captured_breadth))
+
+    # --- Test 22: portfolio currencies are not reported as shares --------
+    print("\n[22] Портфель T-Invest: cash currency не считается акцией")
+    original_q2d = tinkoff_module.quotation_to_decimal
+    def fake_q2d(value):
+        if hasattr(value, "units"):
+            return (Decimal(str(getattr(value, "units", 0)))
+                    + Decimal(str(getattr(value, "nano", 0))) / Decimal(1_000_000_000))
+        return Decimal(str(value or 0))
+    tinkoff_module.quotation_to_decimal = fake_q2d
+    class PortfolioClient(TinkoffClient):
+        def __init__(self):
+            self._ticker_by_figi = {"FIGI_SBER": "SBER"}
+            self._instruments = {"SBER": {"lot": 10}}
+            self.response = SimpleNamespace(
+                total_amount_portfolio=SimpleNamespace(units=100000, nano=0),
+                total_amount_currencies=SimpleNamespace(units=97500, nano=0),
+                positions=[
+                    SimpleNamespace(figi="FIGI_SBER", instrument_type="share",
+                                   quantity=SimpleNamespace(units=10, nano=0),
+                                   current_price=SimpleNamespace(units=250, nano=0),
+                                   average_position_price=SimpleNamespace(units=248, nano=0)),
+                    SimpleNamespace(figi="RUB000UTSTOM", instrument_type="currency",
+                                   quantity=SimpleNamespace(units=97500, nano=0),
+                                   current_price=SimpleNamespace(units=1, nano=0),
+                                   average_position_price=SimpleNamespace(units=1, nano=0)),
+                ])
+        async def _call(self, _name, _operation):
+            return self.response
+    try:
+        normalized_portfolio = await PortfolioClient().get_portfolio_summary()
+    finally:
+        tinkoff_module.quotation_to_decimal = original_q2d
+    check("RUB000UTSTOM исключён из массива акций, cash сохранён отдельно",
+          normalized_portfolio["cash"] == 97500.0
+          and [p["ticker"] for p in normalized_portfolio["positions"]] == ["SBER"],
+          str(normalized_portfolio))
+
+    # --- Test 23: broker/state mismatch locks automated buying ------------
+    print("\n[23] Несовпадение state и брокера блокирует автопокупку")
+    mismatch_state = StateStore(
+        os.path.join(tmp, "mismatch_state.json"),
+        initial_overrides={"trading_enabled": True})
+    class MismatchClient(FakeClient):
+        async def get_portfolio_summary(self) -> dict:
+            return {"total": 100000.0, "cash": 90000.0,
+                    "positions": [{"ticker": "SBER", "quantity": 20.0}]}
+    mismatch_client = MismatchClient()
+    mismatch_engine = TradingEngine(cfg, mismatch_state, mismatch_client,
+                                    FakeAnalyst(), notify)
+    await mismatch_engine._buy_locked(
+        "GAZP", 150.0, 0.7, {"atr_pct": 0.2}, 0.7,
+        {"action": "buy", "confidence": 0.9})
+    check("при расхождении автоторговля выключена и ордер не отправлен",
+          not mismatch_state.trading_enabled and not mismatch_client.buys,
+          f"enabled={mismatch_state.trading_enabled}, buys={mismatch_client.buys}")
 
     print("\n" + "=" * 64)
     print(f"ИТОГО: пройдено {len(PASSED)}, провалено {len(FAILED)}")

@@ -276,13 +276,35 @@ class MarketScanner:
         scored = await self._deep_analyze(pool, breadth_pct=breadth_pct)
         scored.sort(key=lambda r: (r.get("rank_score", 0.0), r["score"]), reverse=True)
         top = scored[:cfg.scan_report_top]
+        min_rank = float(getattr(cfg, "scan_min_candidate_rank", 48.0))
+        require_spread = self._engine_scalp()
+        max_spread_pct = float(getattr(cfg, "scalp_max_spread_pct", 0.10))
         ai_candidates = select_top_candidates(
             scored,
             limit=getattr(cfg, "scan_ai_candidates", 3),
-            min_rank=getattr(cfg, "scan_min_candidate_rank", 48.0),
-            require_spread=self._engine_scalp(),
-            max_spread_pct=getattr(cfg, "scalp_max_spread_pct", 0.10),
+            min_rank=min_rank,
+            require_spread=require_spread,
+            max_spread_pct=max_spread_pct,
         )
+        # Диагностика пустого shortlist: показывает, какой именно локальный
+        # gate отсеял бумаги. Groq не вызывается, если кандидатов нет.
+        if not ai_candidates:
+            rank_ok = [r for r in scored
+                       if float(r.get("rank_score", 0.0) or 0.0) >= min_rank]
+            setup_ok = [r for r in rank_ok if r.get("allowed_setups")]
+            spread_ok = [r for r in setup_ok
+                         if (r.get("spread_pct") is not None
+                             and float(r.get("spread_pct") or 0.0) <= max_spread_pct)]
+            atr_ok = [r for r in spread_ok
+                      if float(r.get("atr_pct") or 0.0) > 0]
+            log.info(
+                "Сканер: shortlist пуст; всего=%d, rank>=%g: %d, с сетапом: %d, "
+                "спред<=%g%%: %d, ATR известен: %d; Groq не вызываю",
+                len(scored), min_rank, len(rank_ok), len(setup_ok),
+                max_spread_pct, len(spread_ok), len(atr_ok))
+        if self._engine_scalp() and not sessions.is_scalp_entry_time():
+            log.info("Сканер: сейчас вне окна новых скальп-входов 10:15-18:20 МСК; "
+                     "анализ выполнен только для отчёта")
         # Breadth добавляется в компактный payload для пакетной оценки.
         for row in ai_candidates:
             row["market_breadth_pct"] = breadth_pct
