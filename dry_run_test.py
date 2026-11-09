@@ -86,6 +86,19 @@ def make_test_config(tmp: str) -> BotConfig:
         scalp_stop_loss_pct=2.0, scalp_take_profit_pct=3.0,
         scalp_trailing_activate_pct=1.0, scalp_trailing_drop_pct=0.5,
         scalp_surge_from_pct=1.5,
+        # v1.8.0: дисциплина - в dry-run выключена (детерминизм по времени),
+        # её правила проверяет test_v180.py.
+        scalp_max_buys_per_day=999, scalp_stop_cap_pct=1.0,
+        scalp_stop_min_pct=0.6, scalp_atr_stop_mult=1.2,
+        scalp_tp1_r=1e9, scalp_tp1_fraction=0.5,
+        scalp_time_stop_min=10**9, scalp_time_stop_min_r=0.3,
+        scalp_daily_loss_pct=0.0, scalp_streak_pause_min=0,
+        stop_cooldown_h=2.0, max_per_basket=99,
+        no_entry_first_min=0, no_entry_last_min=0, evening_entries=True,
+        risk_per_trade_pct=0.0, min_buy_confidence=0.0,
+        score_threshold_floor=0.0, ai_max_per_cycle=999,
+        commission_pct=0.05, max_spread_pct=0.1, cost_cover_mult=3.0,
+        breadth_risk_off=35.0, breadth_risk_on=55.0,
         scan_enabled=False, scan_interval_min=10, scan_min_turnover=50.0,
         scan_min_price=5.0, scan_deep_n=20, scan_report_top=6, scan_llm=False,
         rate_limit_rpm=90,
@@ -275,6 +288,9 @@ async def main() -> int:
     checks.append(("act=100: ИИ смотрит локальный отрезок (4 ч)",
                    i100["ai_window_hours"] == 4.0))
     checks.append(("act=100: кэш LLM 10 мин", engine._llm_ttl_sec() == 600.0))
+    # v1.8.0: дефолт state теперь агрессивность 45 - для сравнения со старой
+    # формулой задаём 50 явно.
+    state.set_aggressiveness(50)
     checks.append(("act=100, aggr=50: кулдаун ~42 мин",
                    40 <= engine._cooldown_sec() / 60 <= 44))
     checks.append(("act=100, aggr=50: лимит покупок 22",
@@ -283,8 +299,11 @@ async def main() -> int:
     state.set_activity(100)
     checks.append(("aggr=90, act=100: порог сигнала 0.055",
                    abs(engine._score_threshold() - 0.055) < 1e-9))
-    checks.append(("aggr=90, act=100: требуемая уверенность 0.30",
-                   abs(engine._required_confidence() - 0.30) < 1e-9))
+    # v1.8.0: нижний потолок уверенности снят в тестовом конфиге
+    # (min_buy_confidence=0.0), формула даёт 0.285; в боевом конфиге
+    # пол MIN_BUY_CONFIDENCE=0.60 - проверяется в test_v180.py.
+    checks.append(("aggr=90, act=100: требуемая уверенность 0.285",
+                   abs(engine._required_confidence() - 0.285) < 1e-9))
     for name, ok in checks:
         check(name, ok)
 

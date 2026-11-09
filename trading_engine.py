@@ -50,11 +50,36 @@ v1.7.1: АВТОПОКУПКА СО СКАНЕРА - scan_once может выз
 auto_buy_from_scan(candidates): лучшие кандидаты сканера прогоняются через
 обычный путь входа и покупаются сами (SCAN_AUTO_BUY, лимит за скан
 SCAN_AUTO_BUY_PER_SCAN). Все сделки движка - под _trade_lock.
+
+v1.8.0 (по итогам разбора сделок 6-9.11, 17 закрытых сделок: win 59%,
+средний плюс +0.70% против среднего минуса -1.25%):
+  1. СТОП-ЛОСС ЖЁСТКИЙ: исполняется сразу, БЕЗ подтверждений и вето ИИ
+     (кейс ALRS: 'стоп достигнут, но ИИ ждёт отскок, откладываю').
+  2. FAIL-CLOSED: ИИ недоступен (429/пусто/лимит) - покупок НЕТ
+     (кейс POSI: куплен через минуту после 'Трейдер-LLM недоступен').
+  3. СРЕДНЯЯ ЦЕНА ВХОДА: сверка позиций с портфелем брокера
+     (reconcile_portfolio): средневзвешенная цена вместо цены последней
+     докупки (кейс VKCO: показывал +0.52% при реальных -1.73%).
+  4. КУЛДАУН ПОСЛЕ СТОПА: STOP_COOLDOWN_H (2 ч) запрет повторного входа
+     (ALRS: стоп 11:53 -> снова купили 14:23).
+  5. ОКНА ВРЕМЕНИ: не входим в первые 15 минут, последние 20 минут
+     и в вечернюю сессию (кейс: 3 покупки в 10:00:14-17).
+  6. КОРЗИНЫ: не больше MAX_PER_BASKET позиций в correlated отрасли.
+  7. РАЗМЕР ПО РИСКУ: budget = капитал * RISK_PER_TRADE_PCT / стоп-дистанция,
+     а не 'равная доля на 10 бумаг по 8000 ₽'.
+  8. СКАЛЬП v1.8.0: до 4 позиций (не 10), <=8 входов/день, стоп
+     max(0.6%, 1.2*ATR-оценка) <= 1.0%, TP1 = 1R половиной + безубыток,
+     тайм-стоп 45 мин, дневной стоп -1%, пауза 60 мин после 2 убытков.
+  9. БЮДЖЕТ ИИ: не больше AI_MAX_PER_CYCLE обращений к Groq за цикл -
+     иначе суточный лимит кончался к 15:00.
+  10. РЕЖИМ РЫНКА: breadth от сканера; risk_off - покупок нет совсем.
 """
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
+import math
 import time
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
@@ -65,6 +90,38 @@ import sessions
 log = logging.getLogger("engine")
 
 Notifier = Callable[[str], Awaitable[None]]
+
+# ---------------------------------------------------------------------------
+# v1.8.0: отраслевые корзины (коррелированные бумаги). Не больше
+# MAX_PER_BASKET открытых позиций на одну корзину: 'Нефтегаз, банки,
+# металлургия - это коррелированные корзины' (промпт, модуль 4).
+# Тикер без корзины -> уникальная корзина 'прочие:ТИКЕР' (лимит не мешает).
+# ---------------------------------------------------------------------------
+BASKETS: Dict[str, Tuple[str, ...]] = {
+    "нефтегаз": ("GAZP", "ROSN", "TATN", "TATNP", "LKOH", "SNGS", "SNGSP",
+                 "RNFT", "NVTK", "TRNFP", "BANEP", "BANE"),
+    "банки/финансы": ("SBER", "SBERP", "VTBR", "TCSG", "T", "CBOM", "ROSB",
+                      "MOEX", "SMLT"),
+    "металлургия": ("GMKN", "PLZL", "ALRS", "CHMF", "MAGN", "NLMK",
+                    "MTLR", "MTLRP", "RUAL"),
+    "IT/телеком": ("MTSS", "VKCO", "OZON", "YDEX", "SOFL", "POSI", "ASTR",
+                   "AFKS", "SFIN"),
+    "энергетика": ("FEES", "IRAO", "HYDR", "ENPG", "UPRO", "LSNG", "LSNGP"),
+    "химия/удобрения": ("PHOR", "AKRN"),
+    "транспорт": ("AFLT", "UTAR", "NMTP", "GLTR", "UWGN"),
+    "девелоперы": ("LSRG", "PIKK", "CNRU"),
+    "ритейл/потреб": ("MGNT", "X5", "WUSH", "AGRO", "MGNT"),
+}
+_BASKET_MAP: Dict[str, str] = {}
+for _basket_name, _basket_tickers in BASKETS.items():
+    for _t in _basket_tickers:
+        _BASKET_MAP.setdefault(_t, _basket_name)
+
+
+def basket_of(ticker: str) -> str:
+    """Корзина тикера: отрасль из словаря или уникальная 'прочие:ТИКЕР'."""
+    t = (ticker or "").strip().upper()
+    return _BASKET_MAP.get(t, f"прочие:{t}")
 
 #: Базовый кэш LLM-вердиктов (при активности сокращается, см. _llm_ttl_sec).
 _LLM_CACHE_TTL_SEC = 30 * 60
@@ -149,6 +206,9 @@ class TradingEngine:
         # Скальп-режим: когда был последний ПОЛНЫЙ цикл (решения о покупках),
         # между ними - быстрая охрана позиций каждые SCALP_EXIT_POLL_SEC.
         self._last_full_cycle = 0.0
+        # v1.8.0: бюджет обращений к ИИ за один цикл (AI_MAX_PER_CYCLE):
+        # 10 бумаг каждые 5 минут съедали суточный лимит Groq к 15:00.
+        self._llm_calls_this_cycle = 0
 
     # -------------------------------------------------------------- жизненный цикл
     def request_stop(self) -> None:
@@ -210,6 +270,7 @@ class TradingEngine:
         Ошибка по одному тикеру не останавливает остальные.
         """
         self._cycles_done += 1
+        self._llm_calls_this_cycle = 0
         for ticker in self.watchlist():
             if self._stop_event.is_set():
                 break
@@ -343,15 +404,26 @@ class TradingEngine:
     def _activity(self) -> int:
         return self._state.activity()
 
+    def _cfgv(self, name: str, default):
+        """Чтение поля конфига с фолбэком: старые фейки в тестах и упрощённые
+        конфиги не обязаны знать все поля v1.8.0."""
+        return getattr(self._cfg, name, default)
+
     def _score_threshold(self) -> float:
         aggr = self._state.aggressiveness()
         act = self._activity()
-        return max(0.05, round(0.60 - 0.55 * (aggr / 100.0) - 0.05 * (act / 100.0), 3))
+        # v1.8.0: нижняя граница SCORE_THRESHOLD_FLOOR (0.20): раньше при
+        # агрессивности 80 порог опускался до 0.11 и почти не фильтровал.
+        return max(self._cfgv("score_threshold_floor", 0.0),
+                   round(0.60 - 0.55 * (aggr / 100.0) - 0.05 * (act / 100.0), 3))
 
     def _required_confidence(self) -> float:
         aggr = self._state.aggressiveness()
         act = self._activity()
-        return max(0.30, round(0.65 - 0.35 * (aggr / 100.0) - 0.05 * (act / 100.0), 3))
+        # v1.8.0: для покупки уверенность ИИ не может быть ниже
+        # MIN_BUY_CONFIDENCE (0.60) - требование промпта трейдера.
+        return max(self._cfgv("min_buy_confidence", 0.0),
+                   round(0.65 - 0.35 * (aggr / 100.0) - 0.05 * (act / 100.0), 3))
 
     def _sell_confidence(self) -> float:
         """Уверенность LLM, необходимая для досрочной продажи позиции."""
@@ -376,10 +448,11 @@ class TradingEngine:
 
     def _max_buys_today(self) -> int:
         # 2..~32 в зависимости от агрессивности и активности, но не больше env-потолка.
-        # Скальп: сделки мелкие и частые - потолок выше, но env всё равно главнее.
+        # Скальп: сделки мелкие и частые; v1.8.0 - не больше
+        # SCALP_MAX_BUYS_PER_DAY (8) входов за день (разбор логов).
         if self.scalp_mode():
             return min(self._cfg.max_buys_per_day,
-                       max(30, 2 + self._cfg.scalp_max_positions * 4))
+                       max(2, int(getattr(self._cfg, "scalp_max_buys_per_day", 8) or 8)))
         return min(self._cfg.max_buys_per_day,
                    2 + self._state.aggressiveness() // 5 + self._activity() // 10)
 
@@ -395,6 +468,199 @@ class TradingEngine:
     def _cooldown_active(self, ticker: str) -> bool:
         elapsed = time.time() - self._state.last_buy_ts(ticker)
         return elapsed < self._cooldown_sec()
+
+    # ------------------------------------------------ дисциплина входа (v1.8.0)
+    def _entry_time_blocked(self) -> Optional[str]:
+        """Запрет новых входов по времени сессии (v1.8.0).
+
+        Не входим: в первые NO_ENTRY_FIRST_MIN минут после открытия (10:00),
+        в последние NO_ENTRY_LAST_MIN минут основной сессии и в вечернюю
+        сессию (если не разрешено EVENING_ENTRIES). Разбор сделок: три покупки
+        в 10:00:14-17 закрылись хуже всех - на открытии спреды и шум максимальны.
+        """
+        now = sessions.msk_now()
+        m = now.hour * 60 + now.minute
+        first = int(getattr(self._cfg, "no_entry_first_min", 0) or 0)
+        last = int(getattr(self._cfg, "no_entry_last_min", 0) or 0)
+        if first and 10 * 60 <= m < 10 * 60 + first:
+            return (f"первые {first} мин сессии - входы запрещены "
+                    f"(ждём 10:{first:02d} МСК)")
+        main_end = 18 * 60 + 45
+        if last and main_end - last <= m <= main_end:
+            return (f"последние {last} мин основной сессии - входы запрещены")
+        if m >= 19 * 60 and not self._cfgv("evening_entries", True):
+            return ("вечерняя сессия - новых входов нет "
+                    "(EVENING_ENTRIES=False)")
+        return None
+
+    def _market_regime_now(self) -> Dict[str, Any]:
+        """Режим рынка от сканера (breadth/IMOEX): dict или {} = неизвестен."""
+        getter = getattr(self._state, "market_regime", None)
+        if callable(getter):
+            try:
+                return dict(getter() or {})
+            except Exception:  # noqa: BLE001 - режим не должен ломать цикл
+                return {}
+        return {}
+
+    def _regime_name(self) -> str:
+        return str(self._market_regime_now().get("regime") or "neutral")
+
+    def _regime_line(self) -> str:
+        reg = self._market_regime_now()
+        if not reg:
+            return ""
+        breadth = reg.get("breadth_pct")
+        breadth_txt = (f", breadth {float(breadth):.0f}% растущих"
+                       if breadth is not None else "")
+        avg = reg.get("avg_day_chg_pct")
+        avg_txt = (f", средняя бумага {float(avg):+.1f}% за день"
+                   if avg is not None else "")
+        return (f"Режим рынка: {reg.get('regime', 'neutral')}{breadth_txt}"
+                f"{avg_txt}. risk_off = покупок нет; neutral = только лучшие "
+                f"сетапы; risk_on = обычные правила.")
+
+    def _scalp_stop_pct(self, summary: Dict[str, Any]) -> float:
+        """Стоп скальпа (v1.8.0): max(SCALP_STOP_MIN_PCT, ATR_MULT*ATR-оценка),
+        но не больше SCALP_STOP_CAP_PCT.
+
+        ATR(14) на 5-мин свечах оцениваем по волатильности сводки (ст.откл.
+        часовых изменений -> за 5-мин свечу через корень): честный ATR по
+        OHLC стоил бы лишних свечей, а порядок величины тот же.
+        """
+        vol_hour: Optional[float] = None
+        try:
+            vol_hour = float(summary.get("volatility")) if summary else None
+        except (TypeError, ValueError):
+            vol_hour = None
+        atr_pct = 0.0
+        if vol_hour and vol_hour > 0:
+            atr_pct = self._cfgv("scalp_atr_stop_mult", 1.2) * vol_hour * math.sqrt(1.0 / 12.0)
+        stop = max(self._cfgv("scalp_stop_min_pct", 0.6), atr_pct)
+        return round(min(stop, self._cfgv("scalp_stop_cap_pct", 1.0)), 2)
+
+    def _plan_stop_pct(self, summary: Dict[str, Any], decision: Any) -> float:
+        """Стоп для новой сделки: скальп - по ATR-правилу; иначе план ИИ
+        (stop_pct 0.3..8%), если внятный, или настройка STOP_LOSS_PCT."""
+        if self.scalp_mode():
+            return self._scalp_stop_pct(summary)
+        stop = self._cfg.stop_loss_pct
+        if isinstance(decision, dict):
+            try:
+                ai_stop = float(decision.get("stop_pct") or 0)
+            except (TypeError, ValueError):
+                ai_stop = 0.0
+            if 0.3 <= ai_stop <= 8.0:
+                stop = ai_stop
+        return round(max(0.3, min(8.0, stop)), 2)
+
+    def _plan_tp1_pct(self, decision: Any, stop_pct_plan: float) -> float:
+        """Цель TP1 для проверки издержек: скальп - 1R; иначе план ИИ
+        или TAKE_PROFIT_PCT."""
+        if self.scalp_mode():
+            return round(stop_pct_plan * self._cfgv("scalp_tp1_r", 1.0), 2)
+        if isinstance(decision, dict):
+            try:
+                tp1 = float(decision.get("tp1_pct") or 0)
+            except (TypeError, ValueError):
+                tp1 = 0.0
+            if 0.1 <= tp1 <= 30.0:
+                return round(tp1, 2)
+        return round(self._cfg.take_profit_pct, 2)
+
+    def _round_trip_cost_pct(self, spread_pct: Optional[float]) -> float:
+        """Круговые издержки в %: комиссия x2 + спред (неизвестный спред
+        оцениваем как ещё одну комиссию - консервативно)."""
+        spread = self._cfgv("commission_pct", 0.05) if spread_pct is None \
+            else max(0.0, float(spread_pct))
+        return 2.0 * self._cfgv("commission_pct", 0.05) + spread
+
+    def _costs_ok(self, tp1_pct: float, spread_pct: Optional[float]) -> bool:
+        """Ход до TP1 должен покрывать круговые издержки COST_COVER_MULT раз
+        (v1.8.0, модуль 3 промпта): иначе сделка математически проигрышная."""
+        if tp1_pct <= 0:
+            return False
+        return tp1_pct >= self._cfgv("cost_cover_mult", 3.0) * self._round_trip_cost_pct(spread_pct)
+
+    def _risk_budget(self, total_money: float, price: float, stop_pct: float,
+                     size_mult: float = 1.0) -> float:
+        """Бюджет сделки ПО РИСКУ (v1.8.0): qty = капитал * риск% / (вход-стоп).
+
+        В рублях: capital * RISK_PER_TRADE_PCT / stop_pct * 100.
+        size_mult от ИИ может только УМЕНЬШИТЬ бюджет (0.5 = половина).
+        0 = расчёт невозможен (плохие входные данные) - бюджет не трогаем.
+        """
+        if price <= 0 or stop_pct <= 0 or total_money <= 0:
+            return 0.0
+        risk_rub = total_money * self._cfgv("risk_per_trade_pct", 0.0) / 100.0
+        budget = risk_rub * 100.0 / stop_pct
+        return budget * max(0.25, min(1.0, float(size_mult or 1.0)))
+
+    def _basket_full(self, ticker: str) -> Optional[str]:
+        """Причина отказа по лимиту корзины (v1.8.0) или None."""
+        limit = int(getattr(self._cfg, "max_per_basket", 0) or 0)
+        if limit <= 0:
+            return None
+        basket = basket_of(ticker)
+        if basket.startswith("прочие:"):
+            return None   # не из словаря - корреляцию не проверяем
+        same = [t for t in self._state.positions if basket_of(t) == basket]
+        if len(same) >= limit:
+            return (f"корзина '{basket}' уже с {len(same)} позицией(ями) "
+                    f"({', '.join(same)}) - лимит {limit}")
+        return None
+
+    async def _total_money(self) -> float:
+        """Все деньги счёта (кэш + позиции по цене входа) для расчёта риска."""
+        try:
+            portfolio = await self._client.get_portfolio_summary()
+            cash = float(portfolio.get("cash", 0) or 0)
+        except Exception:  # noqa: BLE001
+            cash = 0.0
+        invested = 0.0
+        for t, pos in self._state.positions.items():
+            sz = self._client.get_lot_size(t) or 1
+            invested += int(pos.get("lots", 0) or 0) * sz * \
+                float(pos.get("entry_price", 0) or 0)
+        return cash + invested
+
+    async def _spread_ok(self, ticker: str) -> Optional[str]:
+        """Проверка спреда перед покупкой (v1.8.0).
+
+        None = ок (или проверка недоступна - например, фейковый клиент в
+        тестах), строка = причина отказа. Спред берём из стакана
+        (TinkoffClient.get_spread_pct), если он есть.
+        """
+        if self._cfgv("max_spread_pct", 0.1) <= 0:
+            return None
+        getter = getattr(self._client, "get_spread_pct", None)
+        if getter is None:
+            return None
+        try:
+            spread = await getter(ticker)
+        except Exception:  # noqa: BLE001 - стакан мог не ответить
+            return None
+        if spread is None:
+            return None
+        if float(spread) > self._cfgv("max_spread_pct", 0.1):
+            return (f"спред {float(spread):.2f}% > допуска "
+                    f"{self._cfgv('max_spread_pct', 0.1):.2f}%")
+        return None
+
+    @staticmethod
+    def _entry_ts_unix(position: Dict[str, Any]) -> float:
+        """Время входа позиции в unix-секундах (для тайм-стопа скальпа)."""
+        value = position.get("entry_ts_unix")
+        try:
+            if value:
+                return float(value)
+        except (TypeError, ValueError):
+            pass
+        raw = str(position.get("entry_ts", "") or "")
+        try:
+            return time.mktime(time.strptime(raw, "%Y-%m-%d %H:%M:%S"))
+        except (ValueError, TypeError):
+            return 0.0
 
     # --------------------------------------------- активность: масштаб времени
     def _sma_hours(self) -> float:
@@ -619,6 +885,53 @@ class TradingEngine:
 
     # ------------------------------------------------------------------- вход
     async def _evaluate_entry(self, ticker: str, price: float) -> None:
+        # Шаг -1. Окна времени (v1.8.0): не входим на открытии, в конце сессии
+        # и в вечерку - там спреды и шум максимальны (кейс: 3 покупки в
+        # 10:00:14-17, худшая из них VKCO закрылась -1.73%).
+        blocked = self._entry_time_blocked()
+        if blocked:
+            log.info("%s: вход отложен - %s", ticker, blocked)
+            return
+        # Шаг -0.9. Режим рынка (v1.8.0): risk_off - покупок нет совсем.
+        # Breadth считает сканер по всем ликвидным бумагам (это бесплатно).
+        regime = self._regime_name()
+        if regime == "risk_off":
+            log.info("%s: режим рынка risk_off (слабый рынок) - покупки "
+                     "приостановлены до улучшения breadth", ticker)
+            return
+        # Шаг -0.8. Скальп: глобальная пауза после 2 убытков подряд и
+        # дневной стоп скальпа -1% капитала (v1.8.0).
+        if self.scalp_mode():
+            paused = getattr(self._state, "scalp_paused_until", None)
+            if callable(paused):
+                left = paused() - time.time()
+                if left > 0:
+                    log.info("Скальп: пауза после серии убытков - ещё %.0f мин",
+                             left / 60.0)
+                    return
+            if (self._cfgv("scalp_daily_loss_pct", 0.0) > 0
+                    and self._cfg.learning_enabled and self._memory is not None):
+                try:
+                    day_pnl = self._memory.today_realized_pnl()
+                    total = await self._total_money()
+                    limit_rub = total * self._cfgv("scalp_daily_loss_pct", 0.0) / 100.0
+                    if day_pnl < 0 and abs(day_pnl) >= limit_rub:
+                        log.info("Скальп: дневной стоп %.1f%% достигнут "
+                                 "(сегодня %+.0f ₽ при лимите −%.0f ₽) - "
+                                 "входы до завтра", self._cfgv("scalp_daily_loss_pct", 0.0),
+                                 day_pnl, limit_rub)
+                        return
+                except Exception:  # noqa: BLE001 - проверка не ломает цикл
+                    pass
+        # Шаг -0.7. Кулдаун после стоп-лосса по этой бумаге (v1.8.0):
+        # раньше бот снова покупал бумагу через 2.5 ч после стопа (ALRS).
+        get_cooldown = getattr(self._state, "stop_cooldown_until", None)
+        if callable(get_cooldown):
+            until = get_cooldown(ticker)
+            if until and until > time.time():
+                log.info("%s: кулдаун после стоп-лосса - покупки снова через "
+                         "~%.0f мин", ticker, (until - time.time()) / 60.0)
+                return
         # Шаг 0. Страховки частоты: кулдаун и дневной лимит (вне влияния LLM).
         if self._cooldown_active(ticker):
             log.debug("%s: кулдаун после прошлой покупки - пропуск", ticker)
@@ -743,8 +1056,15 @@ class TradingEngine:
                                                 sentiment, history,
                                                 morning_ctx=morning_ctx)
         if decision is None:
-            # LLM недоступен -> старое правило (цена ниже средней + не-плохие
-            # новости), чтобы бот не вставал полностью.
+            # v1.8.0, FAIL-CLOSED: ИИ недоступен (лимит Groq, 429, пустой
+            # ответ) - покупок НЕТ. Раньше срабатывало правило-фолбэк, и бот
+            # покупал сразу после 'Трейдер-LLM недоступен (429)' - кейс POSI
+            # 15:02 (до этого ИИ дважды говорил hold).
+            if self._cfg.llm_decisions_enabled:
+                log.warning("%s: ИИ-трейдер недоступен - покупка отменена "
+                            "(fail-closed: при сбое ИИ покупок нет)", ticker)
+                return
+            # LLM выключен владельцем (LLM_DECISIONS=False) - старое правило.
             await self._entry_fallback_sma(ticker, price, closes, fast_n)
             return
 
@@ -857,6 +1177,13 @@ class TradingEngine:
             log.error("%s: портфель недоступен (%s) - покупка отменена", ticker, exc)
             return
 
+        # v1.8.0: не больше MAX_PER_BASKET позиций в одной отрасли-корзине
+        # (нефтегаз/банки/металлургия ходят вместе - не складываем все яйца).
+        basket_reason = self._basket_full(ticker)
+        if basket_reason:
+            log.info("%s: покупка отменена - %s", ticker, basket_reason)
+            return
+
         budget = portfolio["cash"] * self._cfg.max_position_pct / 100.0
         # Потолок общей вложенности: сколько процентов ВСЕХ денег (кэш +
         # позиции) может одновременно быть в акциях. Если уже вложено много -
@@ -906,6 +1233,37 @@ class TradingEngine:
                          "(равная доля на %d бумаг)", ticker, budget, share,
                          self._cfg.scalp_max_positions)
                 budget = share
+        # v1.8.0: спред - если стакан отвечает и спред шире допуска,
+        # сделка отменяется (малоликвидные бумаги съедают ход издержками).
+        spread_problem = await self._spread_ok(ticker)
+        if spread_problem:
+            log.info("%s: покупка отменена - %s", ticker, spread_problem)
+            return
+        # v1.8.0: план сделки - стоп и цель; ход до цели обязан покрывать
+        # круговые издержки COST_COVER_MULT раз, иначе входить невыгодно.
+        stop_pct_plan = self._plan_stop_pct(summary, decision)
+        tp1_pct_plan = self._plan_tp1_pct(decision, stop_pct_plan)
+        if not self._costs_ok(tp1_pct_plan, None):
+            log.info("%s: ход до цели %.2f%% не покрывает круговые издержки "
+                     "(x%.0f от %.2f%%) - покупка отменена", ticker,
+                     tp1_pct_plan, self._cfgv("cost_cover_mult", 3.0),
+                     self._round_trip_cost_pct(None))
+            return
+        # v1.8.0: размер ПО РИСКУ - qty = капитал * RISK_PER_TRADE_PCT / стоп-
+        # дистанция (вместо 'равной доли на 10 бумаг' по 8 000 ₽). size_mult
+        # от ИИ может только уменьшить бюджет.
+        try:
+            size_mult = float(decision.get("size_mult", 1.0) or 1.0) \
+                if isinstance(decision, dict) else 1.0
+        except (TypeError, ValueError):
+            size_mult = 1.0
+        risk_budget = self._risk_budget(total_money, price, stop_pct_plan,
+                                        size_mult)
+        if risk_budget > 0 and risk_budget < budget:
+            log.info("%s: бюджет урезан по риску: %.0f -> %.0f ₽ (риск %.2f%% "
+                     "капитала, стоп %.2f%%)", ticker, budget, risk_budget,
+                     self._cfgv("risk_per_trade_pct", 0.0), stop_pct_plan)
+            budget = risk_budget
         lot_size = self._client.get_lot_size(ticker)
         lot_cost = price * lot_size
         lots = int(budget // lot_cost) if lot_cost > 0 else 0
@@ -917,13 +1275,20 @@ class TradingEngine:
         result = await self._client.buy(ticker, lots, price=price)
         shares = lots * lot_size
         cost = shares * price
+        # v1.8.0: в позиции храним ПЛАН сделки (стоп/цель) и точное время
+        # входа - стопы/TP1/тайм-стоп считают по ним. Средневзвешенную цену
+        # входа сверяем с брокером (reconcile_portfolio) при старте.
         self._state.set_position(ticker, {
             "lots": lots,
             "entry_price": round(price, 4),
             "entry_ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "entry_ts_unix": time.time(),
             "order_id": result.get("order_id", ""),
             "max_profit_pct": 0.0,   # для трейлинг-стопа
-            "sl_confirm": 0,         # счётчик циклов ниже стоп-лосса
+            "sl_confirm": 0,         # совместимость со старым полем
+            "stop_pct": stop_pct_plan,
+            "tp1_pct": tp1_pct_plan,
+            "tp1_done": False,
         })
         self._state.set_last_buy_ts(ticker, time.time())
         self._state.record_buy_today()
@@ -932,7 +1297,7 @@ class TradingEngine:
         log.info("%s, ордер %s исполнено лотов: %s",
                  short, result.get("order_id"), result.get("lots_executed"))
 
-        stop_price = price * (1.0 - self._cfg.stop_loss_pct / 100.0)
+        stop_price = price * (1.0 - stop_pct_plan / 100.0)
         take_price = price * (1.0 + self._cfg.take_profit_pct / 100.0)
         name = self._client.instrument_name(ticker)
         info = self.activity_info()
@@ -976,10 +1341,9 @@ class TradingEngine:
             f"+{ep['trail_activate']:.1f}%, а потом откатится на "
             f"{ep['trail_drop']:.1f}% - зафиксирую заработанное «на спаде»\n"
             f"• стоп-лосс: при падении до {stop_price:.2f} ₽ "
-            f"(−{self._cfg.stop_loss_pct:.0f}%) уточню у ИИ, не ложный ли "
-            f"прокол, и продам максимум через "
-            f"{self._cfg.sl_confirm_cycles} проверки;\n"
-            f"• аварийный стоп: при −{self._cfg.stop_loss_pct * self._cfg.hard_sl_mult:.1f}% продаю сразу, без разговоров;\n"
+            f"(−{stop_pct_plan:.1f}%) продаю СРАЗУ, без вопросов к ИИ - "
+            f"откладывать стоп запрещено (v1.8.0);\n"
+            f"• аварийный стоп: при −{stop_pct_plan * self._cfg.hard_sl_mult:.1f}% продаю сразу, без разговоров;\n"
             f"• цель «тейк-профит»: продажа при росте до {take_price:.2f} ₽ "
             f"(+{self._cfg.take_profit_pct:.0f}%).\n"
             f"Каждую закрытую сделку запомню и учту: после убытков требования "
@@ -1020,8 +1384,11 @@ class TradingEngine:
             position = {**position, "max_profit_pct": round(max_profit, 2)}
             self._state.set_position(ticker, position)
 
-        stop_pct = ep["stop_pct"]
+        # v1.8.0: стоп теперь свой у каждой сделки (план ИИ / скальп-ATR),
+        # старое поле - на случай позиций из прошлой версии.
+        stop_pct = float(position.get("stop_pct") or 0) or ep["stop_pct"]
         hard_stop_pct = stop_pct * ep["hard_mult"]
+        scalp = self.scalp_mode()
 
         # 1) Аварийный стоп: падение слишком глубокое - без разговоров.
         if profit_pct <= -hard_stop_pct:
@@ -1030,6 +1397,40 @@ class TradingEngine:
                 f"падение {profit_pct:.1f}% пробило аварийный уровень "
                 f"−{hard_stop_pct:.1f}% - терять больше нельзя")
             return
+
+        # 1.5) СКАЛЬП, тайм-стоп (v1.8.0): сделке дали SCALP_TIME_STOP_MIN
+        # минут; если за это время она не дала нужной доли R - закрываем:
+        # время без результата - тоже убыток (альтернативные издержки).
+        if scalp:
+            ts_unix = self._entry_ts_unix(position)
+            need_pct = stop_pct * self._cfgv("scalp_time_stop_min_r", 0.3)
+            if (ts_unix
+                    and time.time() - ts_unix >= self._cfgv("scalp_time_stop_min", 10**9) * 60.0
+                    and profit_pct < need_pct):
+                await self._sell(
+                    ticker, price, position, "тайм-стоп", profit_pct,
+                    f"за {self._cfgv('scalp_time_stop_min', 10**9)} мин сделка не дала "
+                    f"+{need_pct:.2f}% - время вышло, выходим")
+                return
+
+            # 1.6) СКАЛЬП, TP1 (v1.8.0): часть позиции на 1R, стоп остатка -
+            # в безубыток с учётом издержек.
+            if not bool(position.get("tp1_done")):
+                tp1_pct = stop_pct * self._cfgv("scalp_tp1_r", 1.0)
+                if profit_pct >= tp1_pct:
+                    await self._scalp_take_profit_1(ticker, price, position,
+                                                    tp1_pct)
+                    return
+            else:
+                # 1.7) СКАЛЬП, безубыток после TP1 (v1.8.0): остаток больше
+                # не должен превратиться в убыток.
+                be = float(position.get("be_stop_price") or 0)
+                if be > 0 and price <= be:
+                    await self._sell(
+                        ticker, price, position, "стоп в безубыток", profit_pct,
+                        f"после TP1 цена вернулась к безубытку ({be:.2f} ₽) - "
+                        f"остаток закрываю без потери")
+                    return
 
         # 2) Тейк-профит.
         if profit_pct >= ep["take_pct"]:
@@ -1063,45 +1464,15 @@ class TradingEngine:
                 f"фиксирую остаток, пока он не превратился в убыток")
             return
 
-        # 4) Стоп-лосс с подтверждением и правом вето ИИ.
+        # 4) СТОП-ЛОСС - ЖЁСТКИЙ (v1.8.0): продаём немедленно, БЕЗ циклов
+        # подтверждения и БЕЗ вето ИИ. Разбор сделок 6-9.11: 'стоп достигнут
+        # (-2.22%), но ИИ ждёт отскок, откладываю' (ALRS 11:51) -> продажа
+        # по той же цене позже; стоп не обсуждается.
         if profit_pct <= -stop_pct:
-            seen = int(position.get("sl_confirm", 0) or 0)
-            if seen + 1 >= max(1, self._cfg.sl_confirm_cycles):
-                await self._sell(
-                    ticker, price, position, "стоп-лосс", profit_pct,
-                    f"цена держится ниже стоп-уровня уже {seen + 1} "
-                    f"проверк(и) подряд - убыток подтверждаю и продаю")
-                return
-            # Первый цикл ниже стопа: ИИ может отложить продажу,
-            # если видит восстановление (локальный прокол, а не тренд).
-            verdict = None
-            if self._cfg.llm_decisions_enabled:
-                verdict = await self._sl_verdict(ticker, price, position,
-                                                 profit_pct)
-            if verdict and verdict["action"] == "sell":
-                await self._sell(
-                    ticker, price, position, "решение ИИ на стопе", profit_pct,
-                    verdict["reason"] or "тренд сломан - продаю не откладывая")
-                return
-            if (verdict and verdict["action"] == "hold"
-                    and verdict["confidence"] >= self._cfg.sl_veto_confidence):
-                self._state.set_position(
-                    ticker, {**position, "sl_confirm": seen + 1})
-                log.info("%s: стоп-лосс достигнут (%.2f%%), но ИИ ждёт отскок "
-                         "(%.0f%%): %s - откладываю продажу на цикл",
-                         ticker, profit_pct, verdict["confidence"] * 100,
-                         verdict["reason"])
-                await self._safe_notify(
-                    f"⏳ {ticker}: цена дошла до стоп-лосса "
-                    f"({profit_pct:+.2f}%), но ИИ-трейдер видит признаки "
-                    f"восстановления и советует подождать: "
-                    f"«{verdict['reason']}».\nПроверю ещё раз через "
-                    f"{self._check_period_min()} мин; если цена "
-                    f"останется ниже стопа - продам без уговоров.")
-                return
-            # ИИ недоступен или не уверен - продаём по классике.
-            await self._sell(ticker, price, position, "стоп-лосс", profit_pct,
-                             "достигнут предел убытка")
+            await self._sell(
+                ticker, price, position, "стоп-лосс", profit_pct,
+                f"цена дошла до стоп-уровня ({price:.2f} ₽) - продаю сразу, "
+                f"без ожидания отскока")
             return
 
         # Цена восстановилась выше стопа - счётчик подтверждения сбрасываем.
@@ -1137,7 +1508,7 @@ class TradingEngine:
                 sentiment = await self._get_sentiment(ticker)
                 brief = self._build_brief(ticker, price, summary, sentiment,
                                           position=position, history=history)
-                verdict = await self._analyst.analyze_market(brief)
+                verdict = await self._ask_analyst(brief)
                 self._llm_cache[ticker] = (time.monotonic(), verdict)
                 if verdict:
                     self._state.append_decision({
@@ -1180,41 +1551,6 @@ class TradingEngine:
             return max(1, self._cfg.scalp_exit_poll_sec // 60)
         return max(1, self._cfg.poll_interval_sec // 60)
 
-    async def _sl_verdict(self, ticker: str, price: float,
-                          position: Dict[str, Any],
-                          profit_pct: float) -> Optional[dict]:
-        """Спрашивает ИИ-трейдера у стоп-лосса: продавать или дать отскок.
-
-        Это единственное место, где ИИ может помешать продаже в убыток:
-        и то лишь один цикл и при высокой уверенности (SL_VETO_CONFIDENCE).
-        """
-        try:
-            sma_h = self._sma_hours()
-            step_h = self._candle_step_h(sma_h)
-            fast_n = self._fast_n(sma_h, step_h)
-            history = await self._client.get_candles_history(
-                ticker, self._fetch_hours(fast_n, step_h), step_h)
-            closes = [p for _, p in history]
-            summary = (indicators.summarize_generic(closes, price, fast_n, step_h)
-                       if len(closes) >= self._min_candles(fast_n) else {})
-            sentiment = await self._get_sentiment(ticker)
-            extra = (
-                f"СТОП-ЛОСС ДОСТИГНУТ: текущий результат {profit_pct:+.2f}%, "
-                f"предел убытка −{self._cfg.stop_loss_pct:.1f}%. Решается "
-                f"вопрос: продать сразу или дать один цикл на отскок. "
-                f"Если видишь локальное восстановление (цена возвращается к "
-                f"средней, импульс вниз затухает) - держи; если тренд сломан "
-                f"или падение продолжается - продавай. Не откладывай продажу "
-                f"без сильных аргументов: убыток глубже стопа расти не должен.")
-            brief = self._build_brief(ticker, price, summary, sentiment,
-                                      position=position, history=history,
-                                      extra=extra)
-            return await self._analyst.analyze_market(brief)
-        except Exception as exc:  # noqa: BLE001 - сбой ИИ = решаем по правилу
-            log.warning("%s: ИИ не смог оценить стоп-лосс (%s) - решаю по "
-                        "правилу", ticker, exc)
-            return None
-
     async def _sell(self, ticker: str, price: float, position: Dict[str, Any],
                     reason: str, profit_pct: float, detail: str) -> None:
         lots = int(position.get("lots", 0) or 0)
@@ -1233,6 +1569,31 @@ class TradingEngine:
         self._state.record_action(short)
         log.info("%s, ордер %s исполнено лотов: %s",
                  short, result.get("order_id"), result.get("lots_executed"))
+
+        # v1.8.0: после стоп-лосса - запрет повторного входа на STOP_COOLDOWN_H
+        # (2 ч): раньше бот снова покупал ту же бумагу через 2.5 ч после стопа
+        # (ALRS: стоп в 11:53, повторный вход в 14:23).
+        if reason in ("стоп-лосс", "аварийный стоп-лосс") \
+                and self._cfgv("stop_cooldown_h", 0.0) > 0:
+            set_cooldown = getattr(self._state, "set_stop_cooldown", None)
+            if callable(set_cooldown):
+                set_cooldown(ticker, time.time() + self._cfgv("stop_cooldown_h", 0.0) * 3600.0)
+                log.info("%s: после стопа покупки запрещены %.1f ч",
+                         ticker, self._cfgv("stop_cooldown_h", 0.0))
+        # v1.8.0: серии убытков скальпа -> глобальная пауза покупок скальпа.
+        if self.scalp_mode():
+            scalp_result = getattr(self._state, "record_scalp_result", None)
+            if callable(scalp_result):
+                try:
+                    triggered = scalp_result(pnl, self._cfgv("scalp_streak_pause_min", 0))
+                    if triggered and triggered >= 2:
+                        await self._safe_notify(
+                            f"⏸ Скальп: 2 убытка подряд - пауза покупок на "
+                            f"{self._cfgv('scalp_streak_pause_min', 0)} мин "
+                            f"(дисциплина v1.8.0). Открытые позиции продолжаю "
+                            f"охранять как обычно.")
+                except Exception:  # noqa: BLE001
+                    pass
 
         # Запоминаем сделку - это база "учёта ошибок" (trade_memory.py).
         lesson = ""
@@ -1286,6 +1647,17 @@ class TradingEngine:
             reason_human = ("цена сильно выросла, но подала первые признаки "
                             "разворота - по правилу владельца продаю сразу "
                             "при первом намёке на падение, не жду отката")
+        elif reason == "тайм-стоп":
+            reason_human = ("сделке дали отведённое время, а она так и не "
+                            "пошла в плюс достаточно - закрываю: время без "
+                            "результата тоже стоит денег")
+        elif reason == "стоп в безубыток":
+            reason_human = ("после частичной фиксации на 1R цена вернулась "
+                            "к цене входа - закрываю остаток в ноль, "
+                            "чтобы плюс не превратился в минус")
+        elif reason == "тейк-профит (1R)":
+            reason_human = ("цена дала первую цель (1R) - фиксирую прибыль "
+                            "по плану сделки")
         else:
             reason_human = f"ИИ-трейдер предложил закрыть позицию заранее: {detail}"
         emoji = "💰" if pnl >= 0 else "🩹"
@@ -1300,6 +1672,136 @@ class TradingEngine:
             + lesson
         )
         await self._safe_notify(friendly)
+
+    async def _scalp_take_profit_1(self, ticker: str, price: float,
+                                   position: Dict[str, Any],
+                                   tp1_pct: float) -> None:
+        """TP1 скальпа (v1.8.0): продаём SCALP_TP1_FRACTION позиции, стоп
+        остатка переносим в безубыток с учётом издержек; дальше остаток
+        ведёт трейлинг. Позиция из одного лота закрывается целиком -
+        частичную продажу сделать не из чего."""
+        lots = int(position.get("lots", 0) or 0)
+        entry = float(position.get("entry_price", 0) or 0)
+        profit_now = (price / entry - 1.0) * 100.0 if entry > 0 else 0.0
+        if lots < 1:
+            self._state.drop_position(ticker)
+            return
+        fraction = max(0.1, min(0.9, self._cfgv("scalp_tp1_fraction", 0.5)))
+        sell_lots = max(1, int(lots * fraction))
+        if sell_lots >= lots:
+            await self._sell(
+                ticker, price, position, "тейк-профит (1R)", profit_now,
+                f"цена дала +{tp1_pct:.2f}% (1R) - забираю всё "
+                f"(позиция из {lots} лот(а))")
+            return
+        round_trip = self._round_trip_cost_pct(None)
+        be_price = entry * (1.0 + round_trip / 100.0) if entry > 0 else entry
+        try:
+            await self._client.sell(ticker, sell_lots, price=price)
+        except Exception as exc:  # noqa: BLE001 - позиция остаётся под охраной
+            log.warning("%s: частичная продажа TP1 не прошла (%s)", ticker, exc)
+            return
+        remaining = lots - sell_lots
+        self._state.set_position(ticker, {
+            **position, "lots": remaining, "tp1_done": True,
+            "be_stop_price": round(be_price, 4),
+        })
+        self._state.record_action(
+            f"TP1 {ticker}: продал {sell_lots} из {lots} лот по {price:.2f} ₽, "
+            f"стоп остатка -> безубыток {be_price:.2f} ₽")
+        await self._safe_notify(
+            f"🎯 {ticker}: TP1 по плану скальпа - продал {sell_lots} лот(а) "
+            f"по {price:.2f} ₽ (цель 1R: +{tp1_pct:.2f}%).\n"
+            f"Остаток {remaining} лот(а) веду дальше: стоп в безубыток "
+            f"{be_price:.2f} ₽ (с издержками) и трейлинг - этот кусок уже "
+            f"не может стать убытком.")
+
+    async def reconcile_portfolio(self) -> str:
+        """v1.8.0: сверка state.json с реальным портфелем (при старте).
+
+        Разбор логов: в state было 7 позиций, а на счёте - другие, и VKCO
+        считался по цене последней докупки (+0.52% при реальных -1.73%).
+        Теперь:
+          - позиция есть на счёте, но нет в state -> берём под охрану со
+            средней ценой брокера (средневзвешенная);
+          - лоты/средняя цена расходятся -> правим по брокеру;
+          - позиции в state нет на счёте -> убираем из охраны.
+        Возвращает человекочитаемый отчёт.
+        """
+        try:
+            summary = await self._client.get_portfolio_summary()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Сверка с портфелем не удалась: %s", exc)
+            return f"сверка с портфелем не удалась ({exc})"
+        broker: Dict[str, Dict[str, Any]] = {}
+        for p in summary.get("positions", []):
+            lots = int(p.get("lots", 0) or 0)
+            if lots > 0:
+                broker[str(p.get("ticker", "")).strip().upper()] = p
+        fixes: List[str] = []
+
+        # 1) Что помнит state - сверяем со счётом.
+        for ticker in list(self._state.positions.keys()):
+            pos = self._state.positions.get(ticker) or {}
+            held = broker.get(ticker)
+            if held is None:
+                self._state.drop_position(ticker)
+                fixes.append(f"{ticker}: на счёте такой позиции нет - убрал "
+                             f"из охраны")
+                continue
+            held_lots = int(held.get("lots", 0) or 0)
+            avg = float(held.get("avg_price", 0) or 0)
+            entry = float(pos.get("entry_price", 0) or 0)
+            if held_lots != int(pos.get("lots", 0) or 0):
+                pos = {**pos, "lots": held_lots}
+                fixes.append(f"{ticker}: лоты поправлены по брокеру "
+                             f"-> {held_lots}")
+            if avg > 0 and entry > 0 and abs(avg / entry - 1.0) > 0.005:
+                pos = {**pos, "entry_price": round(avg, 4)}
+                fixes.append(f"{ticker}: средняя цена входа по брокеру "
+                             f"{entry:.2f} -> {avg:.2f} ₽ (средневзвешенная)")
+            self._state.set_position(ticker, pos)
+
+        # 2) Что есть на счёте, но не помнит state - берём под охрану.
+        for ticker, held in broker.items():
+            if ticker in self._state.positions:
+                continue
+            if hasattr(self._client, "ensure_instrument") and \
+                    not self._client.ensure_instrument(ticker):
+                fixes.append(f"{ticker}: бумага на счёте, но не найдена во "
+                             f"вселенной TQBR - без охраны")
+                continue
+            lots = int(held.get("lots", 0) or 0)
+            avg = float(held.get("avg_price", 0) or 0)
+            if avg <= 0:
+                try:
+                    avg = float(await self._client.get_price(ticker) or 0.0)
+                except Exception:  # noqa: BLE001
+                    avg = 0.0
+            if avg <= 0:
+                fixes.append(f"{ticker}: не смог определить среднюю цену - "
+                             f"позиция пока без охраны")
+                continue
+            self._state.set_position(ticker, {
+                "lots": lots,
+                "entry_price": round(avg, 4),
+                "entry_ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "entry_ts_unix": time.time(),
+                "max_profit_pct": 0.0,
+                "sl_confirm": 0,
+                "tp1_done": False,
+                "source": "portfolio",
+            })
+            if ticker not in self.watchlist():
+                current = self.watchlist()
+                if len(current) < self.max_tickers():
+                    current.append(ticker)
+                    self._save_watchlist(current)
+            fixes.append(f"{ticker}: взят под охрану со счёта ({lots} лот(а) "
+                         f"по {avg:.2f} ₽)")
+        report = "; ".join(fixes) if fixes else "расхождений нет"
+        log.info("Сверка позиций с портфелем: %s", report)
+        return report
 
     # --------------------------------------------------------- ручные сделки
     async def force_buy(self, ticker: str, units: int) -> str:
@@ -1375,9 +1877,11 @@ class TradingEngine:
                 "lots": lots,
                 "entry_price": round(price, 4),
                 "entry_ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "entry_ts_unix": time.time(),
                 "order_id": result.get("order_id", ""),
                 "max_profit_pct": 0.0,
                 "sl_confirm": 0,
+                "tp1_done": False,
                 "source": "manual",
             })
             self._state.set_last_buy_ts(ticker, time.time())
@@ -1390,11 +1894,11 @@ class TradingEngine:
         stop_price = price * (1.0 - self._cfg.stop_loss_pct / 100.0)
         return (f"✅ РУЧНАЯ ПОКУПКА {ticker}: {lots} лот(а) = {shares} шт "
                 f"по ~{price:.2f} ₽ (≈{_fmt_rub(cost)} ₽).\n"
-                f"Позиция взята под присмотр: аварийный стоп "
+                f"Позиция взята под присмотр: стоп-лосс {stop_price:.2f} ₽ - "
+                f"продаю СРАЗУ, без вето ИИ (v1.8.0), аварийный стоп "
                 f"−{self._cfg.stop_loss_pct * self._cfg.hard_sl_mult:.1f}%, "
-                f"стоп-лосс {stop_price:.2f} ₽, тейк-профит "
-                f"+{self._cfg.take_profit_pct:.0f}%, умная фиксация прибыли "
-                f"и трейлинг работают как обычно.")
+                f"тейк-профит +{self._cfg.take_profit_pct:.0f}%, умная фиксация "
+                f"прибыли и трейлинг работают как обычно.")
 
     async def force_sell(self, ticker: str, units: Optional[int] = None) -> str:
         """Ручная продажа по приказу владельца (/sell ТИКЕР [ШТ]).
@@ -1544,6 +2048,9 @@ class TradingEngine:
                             + (" СКАЛЬП-РЕЖИМ: позиция живёт минуты-часы, "
                                "главная задача - не передержать и зафиксировать "
                                "при остановке роста." if self.scalp_mode() else "")]
+        regime_txt = self._regime_line()
+        if regime_txt:
+            lines.append(regime_txt)
         if summary:
             sma_fast = summary.get("sma_fast")
             if sma_fast:
@@ -1639,6 +2146,12 @@ class TradingEngine:
             if entry > 0:
                 lines.append(f"ОТКРЫТА ПОЗИЦИЯ: куплено по {entry:.2f} ₽, "
                              f"текущая прибыль {((price / entry) - 1.0) * 100:+.1f}%.")
+                stop_pct_pos = float(position.get("stop_pct") or 0)
+                if stop_pct_pos > 0:
+                    lines.append(
+                        f"План позиции (исполняет КОД, обсуждению не подлежит): "
+                        f"стоп −{stop_pct_pos:.2f}%, цель "
+                        f"+{float(position.get('tp1_pct') or stop_pct_pos * 2):.2f}%.")
 
         # Память: последние решения по этой бумаге (скилл рефлексии AI-Trader).
         memory = [d for d in self._state.decision_log()
@@ -1657,6 +2170,10 @@ class TradingEngine:
         if news_items:
             lines.append("Свежие новости (заголовки):")
             lines.extend(f"- {item[:150]}" for item in news_items[:5])
+        else:
+            # v1.8.0: отсутствие новостей - НЕ нейтральный фактор в плюс.
+            lines.append("Свежих новостей нет (лента пуста или недоступна) - "
+                         "это НЕ аргумент в пользу покупки.")
         if extra:
             lines.append(extra)
         # Память о завершённых сделках: ИИ видит, чем кончались его прошлые
@@ -1666,8 +2183,11 @@ class TradingEngine:
                 lines.extend(self._memory.lesson_lines(ticker))
             except Exception:  # noqa: BLE001 - память не должна ломать промпт
                 pass
-        lines.append("\nДай вердикт строго JSON: "
+        lines.append("\nДай вердикт строго JSON без текста вокруг: "
                      '{"action": "buy|sell|hold", "confidence": 0.0-1.0, '
+                     '"setup": "pullback|breakout|reversal|exit|none", '
+                     '"stop_pct": число_процентов, "tp1_pct": число_процентов, '
+                     '"size_mult": 0.5 или 1.0, '
                      '"reason": "коротко по-русски"}.')
         return "\n".join(lines)
 
@@ -1691,21 +2211,54 @@ class TradingEngine:
         self._memory_notify_ts[ticker] = time.monotonic()
         await self._safe_notify(text)
 
+    async def _ask_analyst(self, brief: str) -> Optional[dict]:
+        """Вердикт ИИ с поддержкой старых аналитиков без параметра scalp
+        (тестовые фейки): сигнатуру проверяем, а не ловим TypeError.
+
+        ЛЮБОЙ сбой аналитика -> None (движок трактует как hold/fail-closed,
+        как и в продовом AIAnalyst: ошибки API там гасятся внутри)."""
+        try:
+            accepts_scalp = "scalp" in inspect.signature(
+                self._analyst.analyze_market).parameters
+        except (TypeError, ValueError):
+            accepts_scalp = True
+        try:
+            if accepts_scalp:
+                return await self._analyst.analyze_market(
+                    brief, scalp=self.scalp_mode())
+            return await self._analyst.analyze_market(brief)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - сбой ИИ = вердикта нет
+            log.warning("Аналитик упал с исключением (%s) - вердикта нет "
+                        "(fail-closed)", exc)
+            return None
+
     async def _get_llm_decision(self, ticker: str, price: float,
                                 summary: Dict[str, Optional[float]], score: float,
                                 sentiment: float,
                                 history: Optional[List[Tuple[float, float]]] = None,
                                 morning_ctx: Optional[Dict[str, Any]] = None
                                 ) -> Optional[dict]:
-        """Вердикт трейдера-LLM с кэшем на 10-30 минут (без LLM -> None)."""
+        """Вердикт трейдера-LLM с кэшем на 10-30 минут (без LLM -> None).
+
+        v1.8.0: есть бюджет обращений за цикл (AI_MAX_PER_CYCLE, по умолчанию
+        3): 10 бумаг каждые 5 минут съедали суточный лимит Groq к 15:00.
+        """
         if not self._cfg.llm_decisions_enabled:
             return None
         cached = self._llm_cache.get(ticker)
         if cached and (time.monotonic() - cached[0]) < self._llm_ttl_sec():
             return cached[1]
+        if self._llm_calls_this_cycle >= max(1, self._cfgv("ai_max_per_cycle", 999)):
+            log.info("%s: лимит обращений к ИИ на цикл исчерпан (%d) - "
+                     "вердикт в следующем цикле", ticker,
+                     self._cfgv("ai_max_per_cycle", 999))
+            return cached[1] if cached else None
+        self._llm_calls_this_cycle += 1
         brief = self._build_brief(ticker, price, summary, sentiment,
                                   history=history, morning_ctx=morning_ctx)
-        verdict = await self._analyst.analyze_market(brief)
+        verdict = await self._ask_analyst(brief)
         self._llm_cache[ticker] = (time.monotonic(), verdict)
         if verdict:
             log.info("%s: трейдер-LLM: %s (%.2f): %s", ticker,

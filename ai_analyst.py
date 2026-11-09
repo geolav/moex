@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -41,6 +42,28 @@ log = logging.getLogger("ai_analyst")
 
 class AnalystError(RuntimeError):
     """Невосполнимая ошибка ИИ-аналитика (неверный ключ, плохой запрос)."""
+
+
+# ---------------------------------------------------------------------------
+# v1.8.0: ПОЛНЫЕ ПРОМПТЫ живут в отдельных файлах (prompts/*.txt) - их можно
+# править и читать целиком без погружения в код. Загружаем их при старте;
+# если файла нет - работаем на кратком встроенном фолбэке (бот не должен
+# вставать из-за переименования файла).
+# ---------------------------------------------------------------------------
+_PROMPTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prompts")
+
+
+def _load_prompt(filename: str, fallback: str) -> str:
+    try:
+        with open(os.path.join(_PROMPTS_DIR, filename), "r", encoding="utf-8") as fh:
+            text = fh.read().strip()
+        if text:
+            return text
+        log.warning("Промпт %s пуст - использую встроенный фолбэк", filename)
+    except OSError as exc:
+        log.warning("Промпт %s не найден (%s) - использую встроенный фолбэк",
+                    filename, exc)
+    return fallback
 
 
 _SENTIMENT_SYSTEM_PROMPT = (
@@ -224,6 +247,26 @@ _TRADER_SYSTEM_PROMPT = (
     '"reason": "одно короткое предложение по-русски, человеческим языком"}'
 )
 
+# v1.8.0: ПОЛНЫЙ промпт трейдера живёт в файле prompts/trader_system.txt
+# (вставлен ЦЕЛИКОМ по требованию владельца). Встроенная версия выше остаётся
+# фолбэком на случай отсутствия файла.
+_TRADER_SYSTEM_PROMPT = _load_prompt("trader_system.txt", _TRADER_SYSTEM_PROMPT)
+
+#: Промпт 2: модуль скальпа - добавляется к system-промпту в скальп-режиме.
+_SCALP_MODULE_PROMPT = _load_prompt("scalp_module.txt", "")
+
+#: Фолбэк промпта 3, если prompts/auditor.txt не найден.
+_AUDITOR_TRADES_FALLBACK = (
+    "Ты - аудитор торгового бота: надёжность важнее красивых цифр. Тебе дают "
+    "сводку последних сделок, решений ИИ и текущих параметров. Верни СТРОГО "
+    'JSON: {"metrics":{},"violations":[],"suggestions":[],' 
+    '"verdict":"ok|warn|stop"}. Не хвали бота и не оправдывай убытки; '
+    "если данных мало - так и скажи."
+)
+
+#: Промпт 3: ИИ-аудитор сделок (метрики/нарушения/предложения/verdict).
+_AUDITOR_TRADES_PROMPT = _load_prompt("auditor.txt", _AUDITOR_TRADES_FALLBACK)
+
 
 def parse_decision_json(raw_text: str) -> Optional[dict]:
     """
@@ -247,6 +290,36 @@ def parse_decision_json(raw_text: str) -> Optional[dict]:
         if f'"{action}"' in lowered or f"'{action}'" in lowered:
             return {"action": action, "confidence": 0.3, "reason": "ответ без JSON"}
     return None
+
+
+def _decision_extras(decision: dict) -> dict:
+    """Достаёт необязательные поля промпта v1.8.0 из вердикта ИИ.
+
+    setup: pullback|breakout|reversal|exit|none; stop_pct/tp1_pct - план
+    сделки в %; size_mult - множитель размера (0.5/1.0). Всё опционально:
+    старые ответы без этих полей остаются валидными.
+    """
+    out: Dict[str, Any] = {}
+    setup = str(decision.get("setup", "") or "").lower().strip()
+    if setup in ("pullback", "breakout", "reversal", "exit", "none"):
+        out["setup"] = setup
+    for key, low, high in (("stop_pct", 0.05, 20.0), ("tp1_pct", 0.05, 50.0)):
+        try:
+            value = float(decision.get(key))
+        except (TypeError, ValueError):
+            continue
+        if low <= value <= high:
+            out[key] = round(value, 2)
+    try:
+        mult = float(decision.get("size_mult", 0) or 0)
+    except (TypeError, ValueError):
+        mult = 0.0
+    if mult > 0:
+        # Разрешаем только скромнее или равным базовому: 0.25..1.0,
+        # с округлением к ближайшему из 0.5/1.0 (модель любит 0.7).
+        mult = max(0.25, min(1.0, mult))
+        out["size_mult"] = 0.5 if mult < 0.75 else 1.0
+    return out
 
 #: Коды HTTP, при которых имеет смысл повторить запрос (5xx).
 _RETRYABLE_STATUS_MIN = 500
@@ -480,21 +553,29 @@ class AIAnalyst:
         )
         return raw.strip() or "Все ОК"
 
-    async def analyze_market(self, market_brief: str) -> Optional[dict]:
+    async def analyze_market(self, market_brief: str, *,
+                             scalp: bool = False) -> Optional[dict]:
         """
         Скилл 'трейдер': вердикт по сводке рынка -> dict с ключами
         action ('buy'|'sell'|'hold'), confidence (0..1), reason (str).
 
-        При ошибке API возвращает None (движок переходит на правило-фолбэк).
+        v1.8.0: scalp=True добавляет к system-промпту модуль скальпа
+        (prompts/scalp_module.txt). В ответе дополнительно читаются
+        setup/stop_pct/tp1_pct/size_mult (см. _decision_extras).
+        При ошибке API возвращает None (движок ОБЯЗАН считать это hold:
+        при недоступном ИИ покупок нет).
         """
         brief = (market_brief or "").strip()[:8000]  # страховка TPM free-тарифа
         if not brief:
             return None
+        system = _TRADER_SYSTEM_PROMPT
+        if scalp and _SCALP_MODULE_PROMPT:
+            system = f"{system}\n\n{_SCALP_MODULE_PROMPT}"
         try:
             raw = await self._chat(
-                _TRADER_SYSTEM_PROMPT,
+                system,
                 brief,
-                max_tokens=768,   # v1.7.2: база знаний выросла - даём запас
+                max_tokens=768,   # база знаний выросла - даём запас
                 temperature=0.2,
             )
         except AnalystError as exc:
@@ -512,7 +593,50 @@ class AIAnalyst:
         except (TypeError, ValueError):
             confidence = 0.5
         reason = str(decision.get("reason", ""))[:300]
-        return {"action": action, "confidence": confidence, "reason": reason}
+        result = {"action": action, "confidence": confidence, "reason": reason}
+        result.update(_decision_extras(decision))
+        return result
+
+    async def audit_trade_report(self, payload: str) -> Optional[dict]:
+        """Промпт 3: разбор сделок аудтором -> JSON с метриками и вердиктом.
+
+        Ожидаемый ответ: {"metrics": {...}, "violations": [...],
+        "suggestions": [...], "verdict": "ok|warn|stop"}.
+        Любая ошибка/нечитаемый ответ -> None (аудитор покажет лог-вердикт).
+        """
+        text = (payload or "").strip()[:9000]
+        if not text:
+            return None
+        try:
+            raw = await self._chat(
+                _AUDITOR_TRADES_PROMPT,
+                text,
+                max_tokens=900,
+                temperature=0.2,
+            )
+        except AnalystError as exc:
+            log.warning("Аудитор сделок недоступен (%s)", exc)
+            return None
+        start, end = raw.find("{"), raw.rfind("}")
+        if not 0 <= start < end:
+            log.warning("Аудитор сделок ответил без JSON: %.120r", raw)
+            return None
+        try:
+            data = json.loads(raw[start:end + 1])
+        except json.JSONDecodeError:
+            log.warning("Аудитор сделок вернул битый JSON: %.120r", raw)
+            return None
+        if not isinstance(data, dict):
+            return None
+        verdict = str(data.get("verdict", "")).lower().strip()
+        if verdict not in ("ok", "warn", "stop"):
+            verdict = "warn" if data.get("violations") else "ok"
+        return {
+            "verdict": verdict,
+            "metrics": data.get("metrics") if isinstance(data.get("metrics"), dict) else {},
+            "violations": [str(v)[:200] for v in (data.get("violations") or []) if str(v).strip()][:8],
+            "suggestions": [str(s)[:200] for s in (data.get("suggestions") or []) if str(s).strip()][:3],
+        }
 
     async def scan_verdicts(self, rows: List[Dict[str, Any]]) -> Dict[str, str]:
         """

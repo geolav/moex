@@ -534,6 +534,39 @@ class TinkoffClient:
         price = quotation_to_decimal(response.last_prices[0].price)
         return float(price) if price else None
 
+    async def get_spread_pct(self, ticker: str) -> Optional[float]:
+        """Текущий спред по стакану в процентах от середины (v1.8.0).
+
+        Нужен движку перед покупкой: спред > MAX_SPREAD_PCT - сделку лучше
+        пропустить (издержки съедят ход). None - стакан недоступен/пуст:
+        вызывающий код считает проверку непройденной "по умолчанию ок".
+        """
+        instrument = self._instruments.get(ticker)
+        if instrument is None:
+            return None
+        try:
+            response = await self._call(
+                "get_order_book",
+                lambda: self._api.market_data.get_order_book(
+                    figi=instrument["figi"], depth=1),
+            )
+        except TinkoffClientError as exc:
+            log.debug("%s: стакан недоступен (%s)", ticker, exc)
+            return None
+        bids = list(getattr(response, "bids", []) or [])
+        asks = list(getattr(response, "asks", []) or [])
+        if not bids or not asks:
+            return None
+        try:
+            bid = float(quotation_to_decimal(bids[0].price))
+            ask = float(quotation_to_decimal(asks[0].price))
+        except (TypeError, ValueError, AttributeError, IndexError):
+            return None
+        mid = (bid + ask) / 2.0
+        if mid <= 0 or bid <= 0 or ask <= 0:
+            return None
+        return (ask - bid) / mid * 100.0
+
     async def is_tradable(self, ticker: str) -> Optional[bool]:
         """Открыта ли сейчас торговая сессия по бумаге (v1.6.1).
 
