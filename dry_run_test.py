@@ -1,5 +1,5 @@
 """
-dry_run_test.py - самопроверка всего бота v1.6.0 на МАКЕТАХ без сети и токенов.
+dry_run_test.py - самопроверка всего бота v1.8.0 на МАКЕТАХ без сети и токенов.
 
 Проверяет ключевую логику ДО выхода на реальные деньги:
   1. торговый движок: сигнал + сентимент + LLM 'buy' -> покупка;
@@ -8,6 +8,7 @@ dry_run_test.py - самопроверка всего бота v1.6.0 на МА�
   4. вердикт LLM 'hold' -> покупка отложена, админу уходит объяснение
      (не чаще раза в 30 минут на тикер);
   5. активность: таймфреймы, пороги, кулдаун, лимиты, TTL кэша LLM;
+ 11. новая проверка OHLCV-setups и риск-логика v1.8.0;
   6. индикаторы на любом таймфрейме + адаптивная оценка отката;
   7. ai_analyst: пустой content (gpt-oss) -> ретрай с большим лимитом ->
      финальный ответ; parse_decision_json;
@@ -23,6 +24,8 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+from datetime import datetime
+import math
 import os
 import sys
 import tempfile
@@ -39,6 +42,8 @@ from cleanup import run_cleanup  # noqa: E402
 from config import BotConfig, StateStore  # noqa: E402
 import indicators  # noqa: E402
 from trading_engine import TradingEngine  # noqa: E402
+from trade_memory import TradeMemory  # noqa: E402
+import sessions  # noqa: E402
 
 PASSED: list[str] = []
 FAILED: list[str] = []
@@ -70,7 +75,8 @@ def make_test_config(tmp: str) -> BotConfig:
         llm_decisions_enabled=True,
         trade_cooldown_min=120, max_buys_per_day=25,
         learning_enabled=True, memory_max_trades=400,
-        daily_loss_limit_pct=2.0, loss_streak_pause_h=4.0,
+        daily_loss_limit_pct=1.5, estimated_round_trip_cost_pct=0.1,
+        loss_streak_pause_h=4.0,
         sl_confirm_cycles=2, sl_veto_confidence=0.60,
         hard_sl_mult=1.5, trailing_activate_pct=2.0, trailing_drop_pct=1.5,
         llm_early_sell_min_profit_pct=0.5,
@@ -78,27 +84,22 @@ def make_test_config(tmp: str) -> BotConfig:
         # v1.7.0: радар разворота / анти-погоня / утренний якорь / скальп.
         # (make_test_config заполняет ВСЕ поля BotConfig, включая новые - и
         # None вместо числа ломал вход: None > 0 в анти-погоне и др.)
-        surge_sense_from_pct=3.0, chase_guard_pct=0.5, chase_bounce_pct=1.2,
+        surge_sense_from_pct=3.0, chase_guard_pct=0.0, chase_bounce_pct=0.0,
         morning_anchor_until=13,
-        scalp_max_positions=10, scalp_poll_sec=300, scalp_exit_poll_sec=150,
+        scalp_max_positions=4, scalp_poll_sec=300, scalp_exit_poll_sec=60,
         scalp_cooldown_min=20,
         scalp_harvest_tiers=((5.0, 0.15), (3.0, 0.25), (2.0, 0.4)),
-        scalp_stop_loss_pct=2.0, scalp_take_profit_pct=3.0,
+        scalp_stop_loss_pct=1.0, scalp_take_profit_pct=2.0,
         scalp_trailing_activate_pct=1.0, scalp_trailing_drop_pct=0.5,
         scalp_surge_from_pct=1.5,
-        # v1.8.0: дисциплина - в dry-run выключена (детерминизм по времени),
-        # её правила проверяет test_v180.py.
-        scalp_max_buys_per_day=999, scalp_stop_cap_pct=1.0,
-        scalp_stop_min_pct=0.6, scalp_atr_stop_mult=1.2,
-        scalp_tp1_r=1e9, scalp_tp1_fraction=0.5,
-        scalp_time_stop_min=10**9, scalp_time_stop_min_r=0.3,
-        scalp_daily_loss_pct=0.0, scalp_streak_pause_min=0,
-        stop_cooldown_h=2.0, max_per_basket=99,
-        no_entry_first_min=0, no_entry_last_min=0, evening_entries=True,
-        risk_per_trade_pct=0.0, min_buy_confidence=0.0,
-        score_threshold_floor=0.0, ai_max_per_cycle=999,
-        commission_pct=0.05, max_spread_pct=0.1, cost_cover_mult=3.0,
-        breadth_risk_off=35.0, breadth_risk_on=55.0,
+        scalp_max_entries_per_day=8, scalp_risk_per_trade_pct=0.3,
+        scalp_daily_loss_limit_pct=1.0, scalp_max_position_pct=15.0,
+        scalp_min_stop_pct=0.6, scalp_atr_multiplier=1.2,
+        scalp_max_stop_pct=1.0, scalp_max_spread_pct=0.1,
+        scalp_round_trip_cost_pct=0.1, scalp_min_reward_cost_multiple=3.0,
+        scalp_time_stop_min=45, scalp_min_progress_r=0.3,
+        scalp_loss_pause_minutes=60, scalp_stop_cooldown_min=120,
+        scalp_max_sector_positions=2,
         scan_enabled=False, scan_interval_min=10, scan_min_turnover=50.0,
         scan_min_price=5.0, scan_deep_n=20, scan_report_top=6, scan_llm=False,
         rate_limit_rpm=90,
@@ -143,13 +144,37 @@ class FakeClient:
         """Закрытые свечи: плоско ~252, в конце откат до 250 - цена ниже SMA."""
         count = max(10, min(400, int(float(hours_back) / max(step_h, 1e-9) * 1.5) + 3))
         now = time.time()
-        # По возрастанию времени: старые свечи в начале, свежие в конце.
-        ascending = [252.0] * (count - 3) + [250.6, 250.3, 250.0]
-        return [(now - (count - 1 - j) * step_h * 3600.0, ascending[j])
-                for j in range(count)]
+        # Детерминированная история с умеренным восстановлением и откатом;
+        # RSI не экстремальный, MACD перестал ухудшаться, цена не у локального хая.
+        n = 100
+        slope, amp, period, phase, curvature = (
+            -0.03584600538128794, 1.96834058103559,
+            19.67927903044148, 0.7690268868957966,
+            -0.000246460123912826)
+        ascending = [245 + slope * i + amp * math.sin(i * 2 * math.pi / period + phase)
+                     + curvature * i * i for i in range(n)]
+        shift = 250.0 - ascending[-1]
+        ascending = [value + shift for value in ascending]
+        return [(now - (n - 1 - j) * step_h * 3600.0, ascending[j])
+                for j in range(n)]
 
     async def get_sma(self, ticker: str) -> float:
-        return 255.0  # цена 250 ниже SMA -> MA-фолбэк
+        return 248.0
+
+    def get_atr_pct(self, ticker: str, period: int = 14) -> float:
+        return 0.3
+
+    def get_spread_pct(self, ticker: str) -> float:
+        return 0.05
+
+    def get_entry_context(self, ticker: str, lookback: int = 20) -> dict:
+        return {
+            "last_close": 250.0, "last_high": 250.1, "last_low": 249.7,
+            "previous_high": 249.9, "previous_low": 249.5,
+            "close_above_prev_high": True, "higher_low": True,
+            "volume_ratio": 1.6, "pullback_volume_fade": False,
+            "avg_volume": 1000.0, "current_volume": 1600.0,
+        }
 
     async def get_news(self, ticker: str) -> list[str]:
         return [f"{self.instrument_name(ticker)} отчитался о росте прибыли и "
@@ -174,7 +199,9 @@ class FakeAnalyst:
 
     def __init__(self, verdict: dict | None = None) -> None:
         self.verdict = verdict or {"action": "buy", "confidence": 0.9,
-                                   "reason": "откат и перепроданность"}
+                                   "setup": "breakout", "stop_pct": 0.8,
+                                   "tp1_pct": 2.0, "size_mult": 1.0,
+                                   "reason": "разворот подтверждён 3 из 4 условий, объём 1.6x"}
         self.market_calls = 0
         self.last_brief = ""
 
@@ -184,7 +211,7 @@ class FakeAnalyst:
     async def audit_logs(self, log_text: str) -> str:
         return "Все ОК"
 
-    async def analyze_market(self, market_brief: str) -> dict:
+    async def analyze_market(self, market_brief: str, scalp_mode: bool = False) -> dict:
         self.market_calls += 1
         self.last_brief = market_brief
         return dict(self.verdict)
@@ -192,7 +219,7 @@ class FakeAnalyst:
 
 async def main() -> int:
     print("=" * 64)
-    print("DRY-RUN самопроверка MOEX Trading Bot v1.6.0 (моки, без сети)")
+    print("DRY-RUN самопроверка MOEX Trading Bot v1.8.0 (моки, без сети)")
     print("=" * 64)
 
     tmp = tempfile.mkdtemp(prefix="bot_dryrun_")
@@ -207,13 +234,20 @@ async def main() -> int:
         notifications.append(text)
 
     engine = TradingEngine(cfg, state, client, analyst, notify)
+    # Явный risk-on нужен для проверки полной позиции (neutral режет размер вдвое).
+    engine.set_market_context({"breadth_pct": 60.0, "symbols": 80})
 
     # --- Тест 1: активность 50, сигнал + сентимент + LLM 'buy' -> покупка ----
-    print("\n[1] Активность 50: цена 250 ниже средней, LLM 'buy' -> ПОКУПКА")
+    print("\n[1] Активность 50: подтверждённый reversal по OHLCV, LLM 'buy' -> ПОКУПКА")
     info = engine.activity_info()
     check("активность 50 -> средняя ~5 ч на 15-мин свечах",
           3.0 < info["sma_hours"] < 7.0 and info["step_min"] == 15,
           f"sma_hours={info['sma_hours']}, step={info['step_min']} мин")
+    # Этот участок проверяет цепочку ордеров и Telegram отдельно от
+    # математики индикаторов (она покрыта тестом 6 ниже). Для mock-рынка
+    # подаём сильный score; setup всё равно обязан пройти OHLCV-гейт.
+    original_build_score = indicators.build_score
+    indicators.build_score = lambda summary: 0.8
     await engine.cycle()
     pos = state.positions.get("SBER")
     check("позиция SBER открыта", pos is not None)
@@ -225,8 +259,10 @@ async def main() -> int:
           sum(1 for n in notifications if "ПОКУПКА" in n) == 2, str(len(notifications)))
     check("сообщение содержит мнение ИИ-трейдера",
           any("Мнение ИИ-трейдера" in n for n in notifications))
-    check("промпт LLM содержит путь цены и режим",
-          "Путь цены" in analyst.last_brief and "активность" in analyst.last_brief)
+    check("промпт LLM содержит путь цены, режим и OHLCV-сетап",
+          "Путь цены" in analyst.last_brief and "активность" in analyst.last_brief
+          and "Объём последней" in analyst.last_brief
+          and "Сетапы, подтверждённые кодом" in analyst.last_brief)
 
     # --- Тест 2: цена выросла на +8% -> тейк-профит --------------------------
     print("\n[2] Цена 270 (вход 250, TP +5%) -> ПРОДАЖА")
@@ -253,7 +289,7 @@ async def main() -> int:
     # (страховка частоты) стоит ДО сигнала и заблокировал бы весь сценарий.
     state.set_last_buy_ts("SBER", 0)
     state.set_last_buy_ts("GAZP", 0)
-    state._data["daily_buys"] = {"date": time.strftime("%Y-%m-%d"), "count": 0}
+    state._data["daily_buys"] = {"date": config._trading_date_msk(), "count": 0}
     analyst_hold = FakeAnalyst({"action": "hold", "confidence": 0.8,
                                 "reason": "падение может продолжиться"})
     engine2 = TradingEngine(cfg, state, client, analyst_hold, notify)
@@ -271,6 +307,7 @@ async def main() -> int:
     check("повторное объяснение подавлено (анти-спам 30 мин на тикер)",
           len(hold_notes) == 2 and len(sber_notes) == 1 and len(gazp_notes) == 1,
           f"всего: {len(hold_notes)} (SBER {len(sber_notes)}, GAZP {len(gazp_notes)})")
+    indicators.build_score = original_build_score
 
     # --- Тест 5: активность - таймфреймы, пороги, кулдаун, TTL ----------------
     print("\n[5] Активность: таймфреймы и параметры на 0/50/100")
@@ -288,9 +325,6 @@ async def main() -> int:
     checks.append(("act=100: ИИ смотрит локальный отрезок (4 ч)",
                    i100["ai_window_hours"] == 4.0))
     checks.append(("act=100: кэш LLM 10 мин", engine._llm_ttl_sec() == 600.0))
-    # v1.8.0: дефолт state теперь агрессивность 45 - для сравнения со старой
-    # формулой задаём 50 явно.
-    state.set_aggressiveness(50)
     checks.append(("act=100, aggr=50: кулдаун ~42 мин",
                    40 <= engine._cooldown_sec() / 60 <= 44))
     checks.append(("act=100, aggr=50: лимит покупок 22",
@@ -299,11 +333,8 @@ async def main() -> int:
     state.set_activity(100)
     checks.append(("aggr=90, act=100: порог сигнала 0.055",
                    abs(engine._score_threshold() - 0.055) < 1e-9))
-    # v1.8.0: нижний потолок уверенности снят в тестовом конфиге
-    # (min_buy_confidence=0.0), формула даёт 0.285; в боевом конфиге
-    # пол MIN_BUY_CONFIDENCE=0.60 - проверяется в test_v180.py.
-    checks.append(("aggr=90, act=100: требуемая уверенность 0.285",
-                   abs(engine._required_confidence() - 0.285) < 1e-9))
+    checks.append(("aggr=90, act=100: требуемая уверенность 0.30",
+                   abs(engine._required_confidence() - 0.30) < 1e-9))
     for name, ok in checks:
         check(name, ok)
 
@@ -316,8 +347,9 @@ async def main() -> int:
     sc_5m = indicators.build_score(s_5m)
     check("ключи sma_fast/sma_slow/fast_hours на месте",
           s_5m.get("sma_fast") and s_5m.get("fast_hours") == round(12 / 12, 4))
-    check("тот же откат даёт БОЛЬШЕ очков на часовом окне (активный режим)",
-          sc_5m > sc_hour, f"5м: {sc_5m:.2f} vs 24ч: {sc_hour:.2f}")
+    check("нахождение ниже SMA само по себе не превращается в положительный сигнал",
+          sc_5m < 0 and sc_hour < 0,
+          f"5м: {sc_5m:.2f} vs 24ч: {sc_hour:.2f}")
     check("волатильность переведена в %/час на 5-мин свечах",
           (s_5m.get("volatility") or 0) > (s_hour.get("volatility") or 0),
           f"5м: {s_5m.get('volatility'):.2f} vs 1ч: {s_hour.get('volatility'):.2f}")
@@ -371,22 +403,28 @@ async def main() -> int:
     check("для gpt-oss передан reasoning_effort=low",
           fake.extra.get("reasoning_effort") == "low", str(fake.extra))
 
-    # Пустой content дважды -> фолбэк на reasoning-текст (а не молчаливый отказ).
+    # Пустой content дважды не должен подменяться reasoning; третий ответ читается. 
     a2 = AIAnalyst(a_cfg)
     a2._client = FakeGroqClient(empty_times=2)
     sentiment = await a2.analyze_sentiment("SBER отчитался о росте прибыли")
-    check("две пустые попытки -> фолбэк на reasoning (2 вызова API)",
-          a2._client.calls == 2, f"calls={a2._client.calls}")
-    check("сентимент из reasoning без числа -> нейтральный 0.0 (не ошибка)",
+    check("после двух пустых content модель получила третий шанс",
+          a2._client.calls == 3, f"calls={a2._client.calls}")
+    check("пустой content не трактуется как позитивный сентимент",
           sentiment == 0.0, f"sentiment={sentiment}")
 
-    # parse_decision_json: JSON в ```-обёртке и текст без JSON.
-    check("JSON в код-блоке распарсен",
-          (parse_decision_json("```json\n{\"action\": \"buy\", \"confidence\": 0.8, "
-                               "\"reason\": \"откат\"}\n```") or {}).get("action") == "buy")
-    check("фолбэк на слово-действие",
-          (parse_decision_json("Я считаю, нужно 'hold' позицию") or {})
-          .get("action") == "hold")
+    # parse_decision_json: JSON в ```-обёртке и строгие поля BUY.
+    valid_buy_json = (
+        "```json\n{\"action\": \"buy\", \"confidence\": 0.8, "
+        "\"setup\": \"breakout\", \"stop_pct\": 0.8, "
+        "\"tp1_pct\": 1.6, \"size_mult\": 0.5, "
+        "\"reason\": \"объём 1.6x, пробой подтверждён\"}\n```"
+    )
+    check("JSON BUY с сетапом и планом сделки распарсен",
+          (parse_decision_json(valid_buy_json) or {}).get("setup") == "breakout")
+    check("BUY без setup/stop/TP1 отклонён (fail-closed)",
+          parse_decision_json('{"action":"buy","confidence":0.8,"reason":"buy"}') is None)
+    check("невалидный текст без JSON отклонён (fail-closed)",
+          parse_decision_json("Я считаю, нужно 'hold' позицию") is None)
 
     # --- Тест 8: аудитор логов -------------------------------------------------
     print("\n[8] ИИ-аудитор: tail 50 строк -> вердикт -> Telegram")
@@ -426,7 +464,158 @@ async def main() -> int:
     rss_mb = _read_rss_mb()
     check(f"VmRSS = {rss_mb:.0f} МБ (с ориентиром < 300 МБ)", rss_mb < 300)
 
+    # --- Тест 11: fail-closed при недоступной LLM ------------------------------
+    print("\n[11] Groq недоступен -> автоматическая покупка запрещена")
+
+    class NoDecisionAnalyst(FakeAnalyst):
+        async def analyze_market(self, market_brief: str, scalp_mode: bool = False):
+            self.market_calls += 1
+            return None
+
+    fail_state = StateStore(os.path.join(tmp, "fail_closed_state.json"),
+                            initial_overrides={"trading_enabled": True})
+    fail_client = FakeClient()
+    fail_analyst = NoDecisionAnalyst()
+    fail_engine = TradingEngine(cfg, fail_state, fail_client, fail_analyst, notify)
+    fail_engine.set_market_context({"breadth_pct": 60.0, "symbols": 80})
+    await fail_engine._evaluate_entry("SBER", fail_client.price)
+    check("LLM None не приводит к покупке", not fail_client.buys and not fail_state.positions)
+
+    # --- Тест 12: жёсткий обычный стоп не ждёт голосования ИИ ------------------
+    print("\n[12] Обычный stop-loss исполняется кодом без вето ИИ")
+    stop_state = StateStore(os.path.join(tmp, "hard_stop_state.json"),
+                            initial_overrides={"trading_enabled": True})
+    stop_client = FakeClient()
+    stop_analyst = FakeAnalyst({"action": "hold", "confidence": 1.0,
+                                "reason": "подожди отскока"})
+    stop_engine = TradingEngine(cfg, stop_state, stop_client, stop_analyst, notify)
+    stop_position = {"lots": 1, "entry_price": 100.0, "max_profit_pct": 0.0}
+    stop_state.set_position("SBER", stop_position)
+    await stop_engine._check_exit("SBER", 97.0, stop_position)
+    check("касание стопа закрыло позицию несмотря на HOLD ИИ",
+          not stop_state.positions and stop_client.sells == [("SBER", 1)])
+    check("ИИ не опрашивался для разрешения стопа", stop_analyst.market_calls == 0)
+
+    # --- Тест 13: скальп TP1/2R и P&L всей позиции ------------------------------
+    print("\n[13] Скальп: TP1 половиной, перенос стопа, остаток закрывается на 2R")
+    scalp_state = StateStore(os.path.join(tmp, "scalp_partial_state.json"),
+                             initial_overrides={"trading_enabled": True})
+    scalp_state.set_scalp_mode(True)
+    scalp_client = FakeClient()
+    scalp_engine = TradingEngine(cfg, scalp_state, scalp_client, FakeAnalyst(), notify)
+    scalp_position = {"lots": 4, "initial_lots": 4, "realized_lots": 0,
+                      "realized_exit_value": 0.0, "entry_price": 100.0,
+                      "entry_epoch": time.time(), "entry_ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                      "max_price": 100.0, "scalp_managed": True,
+                      "scalp_risk_pct": 0.6, "scalp_atr_pct": 0.2,
+                      "scalp_round_trip_cost_pct": 0.1,
+                      "stop_price": 99.4, "tp1_done": False}
+    scalp_state.set_position("SBER", scalp_position)
+    await scalp_engine._check_exit("SBER", 100.6, scalp_position)
+    partial_pos = scalp_state.positions.get("SBER", {})
+    check("TP1 продал половину и оставил два лота",
+          partial_pos.get("lots") == 2 and partial_pos.get("tp1_done") is True
+          and scalp_client.sells == [("SBER", 2)])
+    check("стоп после TP1 перенесён выше цены входа",
+          float(partial_pos.get("stop_price", 0)) > 100.0)
+    await scalp_engine._check_exit("SBER", 101.2, partial_pos)
+    check("остаток закрыт на 2R", not scalp_state.positions
+          and scalp_client.sells == [("SBER", 2), ("SBER", 2)])
+    check("P&L посчитан по всей позиции и обеим продажам",
+          abs(scalp_state.realized_pnl_today() - 32.0) < 1e-6,
+          f"net pnl after estimated 0.1% round-trip cost={scalp_state.realized_pnl_today():.2f}")
+
+    # --- Тест 14: стоп-кулдаун 120 минут и time-stop ---------------------------
+    print("\n[14] Скальп: cooldown после стопа и тайм-стоп 45 минут")
+    cooldown_state = StateStore(os.path.join(tmp, "scalp_cooldown_state.json"),
+                                initial_overrides={"trading_enabled": True})
+    cooldown_state.set_scalp_mode(True)
+    cooldown_client = FakeClient()
+    cooldown_engine = TradingEngine(cfg, cooldown_state, cooldown_client, FakeAnalyst(), notify)
+    stopped_pos = {"lots": 1, "initial_lots": 1, "entry_price": 100.0,
+                   "entry_epoch": time.time(), "max_price": 100.0,
+                   "scalp_managed": True, "scalp_risk_pct": 0.6,
+                   "scalp_atr_pct": 0.2, "scalp_round_trip_cost_pct": 0.1,
+                   "stop_price": 99.4, "tp1_done": False}
+    cooldown_state.set_position("SBER", stopped_pos)
+    await cooldown_engine._check_exit("SBER", 99.3, stopped_pos)
+    check("после скальп-стопа установлен запрет повторного входа",
+          cooldown_state.stop_cooldown_until("SBER") > time.time())
+    timed_state = StateStore(os.path.join(tmp, "scalp_time_stop_state.json"),
+                             initial_overrides={"trading_enabled": True})
+    timed_state.set_scalp_mode(True)
+    timed_client = FakeClient()
+    timed_engine = TradingEngine(cfg, timed_state, timed_client, FakeAnalyst(), notify)
+    timed_pos = {"lots": 1, "initial_lots": 1, "entry_price": 100.0,
+                 "entry_epoch": time.time() - 46 * 60, "max_price": 100.0,
+                 "scalp_managed": True, "scalp_risk_pct": 0.6,
+                 "scalp_atr_pct": 0.2, "scalp_round_trip_cost_pct": 0.1,
+                 "stop_price": 99.4, "tp1_done": False}
+    timed_state.set_position("SBER", timed_pos)
+    await timed_engine._check_exit("SBER", 100.1, timed_pos)
+    check("после 46 минут без +0.3R сработал time-stop",
+          not timed_state.positions and timed_client.sells == [("SBER", 1)])
+
     # --- Итог ---------------------------------------------------------------------
+
+    # --- Тест 15: ручные частичные продажи и нетто-P&L ------------------------
+    print("\n[15] Ручная продажа частями: VWAP выхода, издержки, дневной P&L")
+    manual_state = StateStore(os.path.join(tmp, "manual_partial_state.json"),
+                              initial_overrides={"trading_enabled": True})
+    manual_client = FakeClient()
+    manual_engine = TradingEngine(cfg, manual_state, manual_client, FakeAnalyst(), notify)
+    manual_state.set_position("SBER", {
+        "lots": 4, "initial_lots": 4, "realized_lots": 0,
+        "realized_exit_value": 0.0, "entry_price": 100.0,
+        "entry_ts": sessions.msk_now().strftime("%Y-%m-%d %H:%M:%S"),
+        "estimated_round_trip_cost_pct": 0.1,
+    })
+    manual_client.price = 101.0
+    await manual_engine.force_sell("SBER", units=20)
+    half = manual_state.positions.get("SBER", {})
+    check("первый ручной транш записан как частичный выход",
+          half.get("lots") == 2 and half.get("realized_lots") == 2
+          and abs(float(half.get("realized_exit_value", 0)) - 202.0) < 1e-6)
+    manual_client.price = 102.0
+    await manual_engine.force_sell("SBER", units=20)
+    check("после второго транша позиция закрыта",
+          "SBER" not in manual_state.positions)
+    check("полная цена выхода усреднена, P&L net учёл 0.1% издержек",
+          abs(manual_state.realized_pnl_today() - 56.0) < 1e-6,
+          f"net pnl={manual_state.realized_pnl_today():.2f} ₽")
+
+    # --- Тест 16: журнал фиксирует московский час входа -----------------------
+    print("\n[16] Trade journal: час входа всегда считается по Москве")
+    journal = TradeMemory(os.path.join(tmp, "journal_msk.json"), max_trades=100)
+    closed = datetime(2026, 11, 9, 10, 30, tzinfo=sessions.MSK).timestamp()
+    rec = journal.record(
+        ticker="SBER", entry_price=100.0, exit_price=101.0,
+        lots=1, lot_size=1, reason="test", profit_pct=0.9,
+        entry_ts_str="2026-11-09 10:00:00", closed_ts=closed, cost_rub=0.1)
+    check("вход 10:00 МСК отнесён к часу 10 и удержание 30 минут",
+          rec["entry_hour"] == "10" and rec["hold_min"] == 30,
+          f"entry_hour={rec['entry_hour']}, hold_min={rec['hold_min']}")
+    check("журнал сохраняет net P&L и оценочные издержки",
+          abs(rec["pnl"] - 0.9) < 1e-6
+          and abs(rec["estimated_cost_rub"] - 0.1) < 1e-6)
+    msk_midnight = datetime(2026, 11, 9, 0, 0, tzinfo=sessions.MSK).timestamp()
+    journal._trades = [
+        {"closed_ts": msk_midnight + 1800, "pnl": 5.0},
+        {"closed_ts": msk_midnight - 1800, "pnl": 50.0},
+    ]
+    msk_now_ts = datetime(2026, 11, 9, 0, 45, tzinfo=sessions.MSK).timestamp()
+    check("дневной P&L и число сделок обрезаются по московской полуночи",
+          abs(journal.today_realized_pnl(msk_now_ts) - 5.0) < 1e-6
+          and journal._today_count(msk_now_ts) == 1,
+          f"pnl={journal.today_realized_pnl(msk_now_ts):.2f}, count={journal._today_count(msk_now_ts)}")
+    journal._trades = [
+        {"ticker": "GAZP", "pnl_pct": -1.0, "entry_hour": "10"},
+        {"ticker": "GAZP", "pnl_pct": -0.5, "entry_hour": "10"},
+    ]
+    ten_msk = datetime(2026, 11, 9, 10, 5, tzinfo=sessions.MSK).timestamp()
+    check("плохие часы входа также вычисляются по времени Москвы",
+          "10:00" in (journal.bad_hour_reason("GAZP", now=ten_msk) or ""))
+
     print("\n" + "=" * 64)
     print(f"ИТОГО: пройдено {len(PASSED)}, провалено {len(FAILED)}")
     if FAILED:

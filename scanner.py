@@ -109,64 +109,6 @@ def _auto_buy_enabled(cfg, state) -> bool:
     return bool(value)
 
 
-def compute_market_regime(liquid_rows, cfg) -> Dict[str, Any]:
-    """Режим рынка по ширине рынка (v1.8.0) - считаем БЕСПЛАТНО: сканер
-    уже видит все ликвидные бумаги в снимке ISS.
-
-    breadth = доля растущих бумаг за день; средний дневной ход - грубый
-    заменитель 'IMOEX vs SMA' (индекс в снимок не входит).
-      risk_off: breadth < BREADTH_RISK_OFF И средняя бумага в минусе за день
-                - покупок нет совсем (движок блокирует входы);
-      risk_on:  breadth > BREADTH_RISK_ON И средняя бумага в плюсе -
-                обычные правила;
-      иначе:    neutral - только лучшие сетапы.
-    Возвращает словарь для state.set_market_regime (без ts - его добавит
-    StateStore).
-    """
-    rows = [r for r in liquid_rows if r.get("day_chg_pct") is not None]
-    if len(rows) < 10:
-        return {}   # слишком мало данных - режим не присваиваем
-    risers = sum(1 for r in rows if float(r["day_chg_pct"]) > 0)
-    breadth = risers / len(rows) * 100.0
-    avg_day = sum(float(r["day_chg_pct"]) for r in rows) / len(rows)
-    if breadth < cfg.breadth_risk_off and avg_day < 0:
-        regime = "risk_off"
-    elif breadth > cfg.breadth_risk_on and avg_day > 0:
-        regime = "risk_on"
-    else:
-        regime = "neutral"
-    return {
-        "regime": regime,
-        "breadth_pct": round(breadth, 1),
-        "avg_day_chg_pct": round(avg_day, 2),
-        "n": len(rows),
-    }
-
-
-def regime_report_line(regime: Dict[str, Any]) -> str:
-    """Человекочитаемая строка режима рынка для отчёта сканера."""
-    if not regime:
-        return ""
-    name = str(regime.get("regime", "neutral"))
-    names = {
-        "risk_off": "🛑 РИСК-ОФФ: рынок слабый, покупки приостановлены "
-                    "(движок пропустит входы до улучшения)",
-        "risk_on": "🟢 РИСК-ОН: рынок широкий, можно работать по обычным "
-                   "правилам",
-        "neutral": "🟡 НЕЙТРАЛЬНО: рынок без перекосов - только лучшие "
-                   "сетапы",
-    }
-    base = names.get(name, f"Режим: {name}")
-    breadth = regime.get("breadth_pct")
-    avg = regime.get("avg_day_chg_pct")
-    details = []
-    if breadth is not None:
-        details.append(f"растут {float(breadth):.0f}% бумаг")
-    if avg is not None:
-        details.append(f"средняя за день {float(avg):+.1f}%")
-    return base + (" (" + ", ".join(details) + ")" if details else "")
-
-
 class MarketScanner:
     """Периодический поиск кандидатов на покупку по всему рынку TQBR."""
 
@@ -277,21 +219,19 @@ class MarketScanner:
         liquid = [row for row in snapshot
                   if row["price"] >= cfg.scan_min_price
                   and row["turnover"] >= cfg.scan_min_turnover * 1e6]
+        # Ширина рынка (breadth) считается по торгующимся бумагам TQBR.
+        # Это только proxy режима рынка, не подмена индекса IMOEX.
+        traded = [row for row in snapshot if float(row.get("turnover", 0) or 0) > 0
+                  and row.get("day_chg_pct") is not None]
+        breadth_pct = (sum(1 for row in traded
+                           if float(row.get("day_chg_pct", 0) or 0) > 0)
+                       / len(traded) * 100.0) if traded else None
+        setter = getattr(self._engine, "set_market_context", None)
+        if callable(setter):
+            setter({"breadth_pct": breadth_pct, "symbols": len(traded),
+                    "source": "MOEX ISS TQBR, оборот > 0"})
         log.info("Сканер: %d бумаг на рынке, %d прошло фильтр ликвидности",
                  len(snapshot), len(liquid))
-        # v1.8.0: режим рынка (breadth) - бесплатно из того же снимка;
-        # движок читает его из state и в risk_off не покупает вовсе.
-        regime: Dict[str, Any] = {}
-        regime_setter = getattr(self._state, "set_market_regime", None)
-        if callable(regime_setter):
-            regime = compute_market_regime(liquid, cfg)
-            if regime:
-                try:
-                    regime_setter(regime)
-                    log.info("Сканер: режим рынка %s (breadth %.0f%%)",
-                             regime["regime"], regime.get("breadth_pct", 0.0))
-                except Exception:  # noqa: BLE001
-                    regime = {}
         # Биржа не отдаёт обороты = торгов сейчас реально нет. v1.7.0:
         # честная диагностика с точным временем (раньше это сообщение
         # приходило и днём - из-за бага чтения оборотов, см. docstring).
@@ -345,8 +285,7 @@ class MarketScanner:
                     "попробую в следующий раз."), [], []
 
         verdicts, advice = await self._ai_verdicts(top)
-        text = self._build_report(top, verdicts, scalp_note, advice=advice,
-                                  regime=regime)
+        text = self._build_report(top, verdicts, scalp_note, advice=advice)
         photos = self._render_photos(top)
         return text, photos, top
 
@@ -467,11 +406,9 @@ class MarketScanner:
     def _build_report(self, top: List[Dict[str, Any]],
                       verdicts: Dict[str, str],
                       scalp_note: str = "",
-                      advice: str = "",
-                      regime: Optional[Dict[str, Any]] = None) -> str:
+                      advice: str = "") -> str:
         cfg = self._cfg
         stamp = time.strftime("%d.%m %H:%M")
-        regime_line = regime_report_line(regime or {})
         lines = [f"🔎 Сканер рынка {stamp} - топ {len(top)} кандидатов "
                  f"на покупку (сортировка - от более интересных к менее):"]
         for i, row in enumerate(top, 1):
@@ -492,10 +429,6 @@ class MarketScanner:
             lines.append("Сильных сигналов на рынке сейчас нет - "
                          "это лучшие из доступных.")
         lines.append("")
-        # v1.8.0: режим рынка - первой строкой после списка (важно раньше деталей).
-        if regime_line:
-            lines.insert(1, regime_line)
-            lines.insert(2, "")
         # v1.7.2: короткий совет ИИ простыми словами - в КОНЦЕ списка.
         if advice:
             lines.append(f"🤖 Совет ИИ простыми словами: {advice}")

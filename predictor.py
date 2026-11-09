@@ -43,6 +43,8 @@ import math
 import time
 from typing import Dict, List, Optional, Sequence, Tuple
 
+import sessions
+
 #: Минимум свечей для прогноза: меньше - данных не доверяем.
 MIN_POINTS = 24
 
@@ -236,7 +238,7 @@ def describe(fc: Dict[str, object], ticker: str) -> str:
     target = float(fc["target"])
     drift = float(fc["drift_pct"])
     h = float(fc["horizon_h"])
-    anchor = time.strftime("%H:%M", time.localtime(float(fc["ts_last"])))
+    anchor = sessions.msk_from_ts(float(fc["ts_last"])).strftime("%H:%M")
     if drift >= 0.3:
         verdict = "ожидаю рост"
     elif drift <= -0.3:

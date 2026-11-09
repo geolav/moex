@@ -178,6 +178,8 @@ class TinkoffClient:
         self._account_id: Optional[str] = None
         self._instruments: Dict[str, Dict[str, Any]] = {}   # ticker -> {figi, lot, name}
         self._ticker_by_figi: Dict[str, str] = {}
+        self._ohlc_cache: Dict[str, List[Dict[str, float]]] = {}
+        self._spread_cache: Dict[str, Tuple[float, float]] = {}
         # Полная вселенная акций основного режима торгов TQBR (~250 бумаг):
         # нужна сканеру и ручным сделкам (/buy любой бумаги без рестарта).
         self._universe: Dict[str, Dict[str, Any]] = {}
@@ -241,6 +243,8 @@ class TinkoffClient:
         self._instruments.clear()
         self._ticker_by_figi.clear()
         self._universe.clear()
+        self._ohlc_cache.clear()
+        self._spread_cache.clear()
 
     async def _connect(self) -> None:
         use_sandbox = self._state.use_sandbox
@@ -440,7 +444,7 @@ class TinkoffClient:
                + "?iss.meta=off&iss.only=securities,marketdata"
                  "&securities.columns=SECID,PREVPRICE"
                  "&marketdata.columns=SECID,LAST,LASTTOPREVPRICE,"
-                 "VALTODAY,TRADINGSTATUS,UPDATETIME")
+                 "VALTODAY,TRADINGSTATUS,UPDATETIME,BID,OFFER")
         if self._http is None:
             raise TinkoffClientError("HTTP-сессия ещё не открыта (client.start())")
         try:
@@ -491,6 +495,12 @@ class TinkoffClient:
                 continue
             secid = str(row[md_idx["SECID"]])
             price = _num(row, md_idx, "LAST") or prev_price.get(secid, 0.0)
+            bid = _num(row, md_idx, "BID")
+            offer = _num(row, md_idx, "OFFER")
+            spread_pct = ((offer - bid) / ((offer + bid) / 2.0) * 100.0
+                          if bid > 0 and offer >= bid else None)
+            if spread_pct is not None:
+                self._spread_cache[secid] = (spread_pct, time.monotonic())
             out.append({
                 "ticker": secid,
                 "price": price,
@@ -498,6 +508,7 @@ class TinkoffClient:
                 "turnover": _num(row, md_idx, "VALTODAY"),
                 "trading_status": _txt(row, md_idx, "TRADINGSTATUS"),
                 "updatetime": _txt(row, md_idx, "UPDATETIME"),
+                "spread_pct": spread_pct,
             })
         # Бумаги, которых нет в marketdata (редкий случай), добавляем из
         # securities с нулевым оборотом - чтобы не терять вселенную.
@@ -533,39 +544,6 @@ class TinkoffClient:
             return None
         price = quotation_to_decimal(response.last_prices[0].price)
         return float(price) if price else None
-
-    async def get_spread_pct(self, ticker: str) -> Optional[float]:
-        """Текущий спред по стакану в процентах от середины (v1.8.0).
-
-        Нужен движку перед покупкой: спред > MAX_SPREAD_PCT - сделку лучше
-        пропустить (издержки съедят ход). None - стакан недоступен/пуст:
-        вызывающий код считает проверку непройденной "по умолчанию ок".
-        """
-        instrument = self._instruments.get(ticker)
-        if instrument is None:
-            return None
-        try:
-            response = await self._call(
-                "get_order_book",
-                lambda: self._api.market_data.get_order_book(
-                    figi=instrument["figi"], depth=1),
-            )
-        except TinkoffClientError as exc:
-            log.debug("%s: стакан недоступен (%s)", ticker, exc)
-            return None
-        bids = list(getattr(response, "bids", []) or [])
-        asks = list(getattr(response, "asks", []) or [])
-        if not bids or not asks:
-            return None
-        try:
-            bid = float(quotation_to_decimal(bids[0].price))
-            ask = float(quotation_to_decimal(asks[0].price))
-        except (TypeError, ValueError, AttributeError, IndexError):
-            return None
-        mid = (bid + ask) / 2.0
-        if mid <= 0 or bid <= 0 or ask <= 0:
-            return None
-        return (ask - bid) / mid * 100.0
 
     async def is_tradable(self, ticker: str) -> Optional[bool]:
         """Открыта ли сейчас торговая сессия по бумаге (v1.6.1).
@@ -659,13 +637,97 @@ class TinkoffClient:
             ),
         )
         pairs: List[Tuple[float, float]] = []
+        ohlc: List[Dict[str, float]] = []
         for candle in response.candles:
             close_dt = candle.time + interval_td
             if close_dt <= now_utc:  # свеча гарантированно закрыта
-                pairs.append((float(close_dt.timestamp()),
-                              float(quotation_to_decimal(candle.close))))
+                close_price = float(quotation_to_decimal(candle.close))
+                pairs.append((float(close_dt.timestamp()), close_price))
+                try:
+                    ohlc.append({
+                        "ts": float(close_dt.timestamp()),
+                        "open": float(quotation_to_decimal(candle.open)),
+                        "high": float(quotation_to_decimal(candle.high)),
+                        "low": float(quotation_to_decimal(candle.low)),
+                        "close": close_price,
+                        "volume": float(getattr(candle, "volume", 0) or 0),
+                    })
+                except (AttributeError, TypeError, ValueError):
+                    # В старых версиях SDK могут отсутствовать OHLC-поля.
+                    ohlc = []
+                    break
         pairs.sort(key=lambda p: p[0])
+        if ohlc:
+            ohlc.sort(key=lambda bar: bar["ts"])
+            self._ohlc_cache[ticker] = ohlc[-250:]
+        else:
+            self._ohlc_cache.pop(ticker, None)
         return pairs
+
+    def get_entry_context(self, ticker: str, lookback: int = 20) -> Optional[Dict[str, Any]]:
+        """OHLCV-признаки по последним ЗАКРЫТЫМ свечам.
+
+        Возвращает отношение объёма последней свечи к среднему объёму
+        предыдущих свечей, локальные уровни и простые признаки структуры.
+        Нет полноценной истории OHLCV — нет контекста (fail-closed).
+        """
+        bars = self._ohlc_cache.get(ticker, [])
+        if len(bars) < max(15, lookback + 2):
+            return None
+        current, previous = bars[-1], bars[-2]
+        prior = bars[-(lookback + 1):-1]
+        volumes = [float(bar.get("volume", 0) or 0) for bar in prior]
+                   
+        positive_volumes = [value for value in volumes if value > 0]
+        current_volume = float(current.get("volume", 0) or 0)
+        avg_volume = (sum(positive_volumes) / len(positive_volumes)
+                      if positive_volumes else 0.0)
+        volume_ratio = (current_volume / avg_volume
+                        if avg_volume > 0 and current_volume > 0 else None)
+        last3 = [float(bar.get("volume", 0) or 0) for bar in bars[-3:]]
+        previous10 = [float(bar.get("volume", 0) or 0)
+                      for bar in bars[-13:-3]]
+        last3_avg = sum(last3) / len(last3) if last3 else 0.0
+        previous10_valid = [value for value in previous10 if value > 0]
+        previous10_avg = (sum(previous10_valid) / len(previous10_valid)
+                          if previous10_valid else 0.0)
+        return {
+            "last_close": float(current.get("close", 0) or 0),
+            "last_high": float(current.get("high", 0) or 0),
+            "last_low": float(current.get("low", 0) or 0),
+            "previous_high": float(previous.get("high", 0) or 0),
+            "previous_low": float(previous.get("low", 0) or 0),
+            "close_above_prev_high": float(current.get("close", 0) or 0)
+                                      > float(previous.get("high", 0) or 0),
+            "higher_low": float(current.get("low", 0) or 0)
+                          > float(previous.get("low", 0) or 0),
+            "volume_ratio": volume_ratio,
+            "pullback_volume_fade": bool(previous10_avg > 0
+                                          and last3_avg < previous10_avg),
+            "avg_volume": avg_volume,
+            "current_volume": current_volume,
+        }
+
+    def get_atr_pct(self, ticker: str, period: int = 14) -> Optional[float]:
+        """ATR(14) в процентах от последнего закрытия; None без OHLC-данных."""
+        bars = self._ohlc_cache.get(ticker, [])
+        if len(bars) < period + 1:
+            return None
+        try:
+            import indicators
+            atr = indicators.atr_from_ohlc(bars, period)
+            close = float(bars[-1]["close"])
+            return atr / close * 100.0 if atr is not None and close > 0 else None
+        except Exception as exc:  # noqa: BLE001 - нет данных = нельзя скальпить
+            log.debug("ATR %s недоступен: %s", ticker, exc)
+            return None
+
+    def get_spread_pct(self, ticker: str, max_age_sec: float = 120.0) -> Optional[float]:
+        """Последний спред из MOEX ISS; устаревшие котировки не используются."""
+        item = self._spread_cache.get(ticker)
+        if not item or time.monotonic() - item[1] > max_age_sec:
+            return None
+        return item[0]
 
     async def get_hourly_history(self, ticker: str, hours_back: float
                                  ) -> List[Tuple[float, float]]:

@@ -219,19 +219,24 @@ def build_score(summary: Dict[str, Optional[float]]) -> float:
     if sma_fast and price:
         fast_hours = float(summary.get("fast_hours") or 24.0) or 24.0
         scale = min(40.0, 7.0 * math.sqrt(24.0 / max(fast_hours, 0.5)))
-        # Насколько цена ниже рабочей средней (до -5%..+5% -> +/-0.35).
-        score += max(-0.35, min(0.35, (sma_fast / price - 1.0) * scale))
+        # Само по себе нахождение ниже SMA НЕ является сигналом покупки:
+        # оно может означать продолжающийся нисходящий тренд. Небольшой
+        # бонус даём только за возврат цены к средней/выше неё.
+        deviation = (price / sma_fast - 1.0) * scale
+        score += max(-0.35, min(0.20, deviation * 0.5))
 
     sma_slow = summary.get("sma_slow", summary.get("sma48"))
     if sma_slow and price:
-        # Медленная средняя - подстраховка: покупаем только если цена ниже
-        # и долгого окна (устойчивое отклонение, а не случайный прокол).
-        score += max(-0.20, min(0.20, (sma_slow / price - 1.0) * 4.0))
+        # Медленная SMA используется как фильтр тренда, а не как аргумент
+        # покупать любой актив, который сильно упал ниже неё.
+        score += max(-0.20, min(0.15, (price / sma_slow - 1.0) * 2.0))
 
     rsi14 = summary.get("rsi14")
     if rsi14 is not None:
         if rsi14 <= 30:
-            score += 0.30 * (30.0 - rsi14) / 30.0      # перепроданность
+            # Перепроданность - не вход. Балл не повышаем без подтверждения
+            # разворота (MACD/цена проверяются отдельным entry-gate).
+            score -= 0.05
         elif rsi14 >= 70:
             score -= 0.30 * (rsi14 - 70.0) / 30.0      # перекупленность
 
@@ -251,15 +256,15 @@ def build_score(summary: Dict[str, Optional[float]]) -> float:
         pct_b = bb.get("pct_b")
         if pct_b is not None:
             if pct_b <= 0.2:
-                score += 0.20                           # у нижней границы коридора
+                score -= 0.05                           # нижняя граница сама по себе не разворот
             elif pct_b >= 0.8:
                 score -= 0.20                           # у верхней границы
 
     chg_24h = summary.get("chg_24h")
-    if chg_24h is not None:
-        # Сильное падение за сутки - слегка усиливаем ставку на отскок,
-        # сильный рост - наоборот (не покупаем "на хаях").
-        score += max(-0.15, min(0.15, -chg_24h / 10.0))
+    if chg_24h is not None and chg_24h <= -3.0:
+        # Большое дневное падение не должно превращаться в бонус на покупку:
+        # само по себе оно не доказывает разворот и повышает риск falling knife.
+        score -= min(0.12, (-float(chg_24h) - 3.0) * 0.02)
 
     return max(-1.0, min(1.0, round(score, 3)))
 
@@ -367,3 +372,30 @@ def describe_for_human(summary: Dict[str, Optional[float]]) -> str:
         parts.append(f"дрожание цены {vol:.1f}%/час " +
                      ("(спокойно)" if vol < 1.0 else "(волатильно)"))
     return "; ".join(parts) if parts else "данных недостаточно"
+
+
+def atr_from_ohlc(bars: Sequence[Dict[str, float]], period: int = 14) -> Optional[float]:
+    """ATR Уайлдера по OHLC-барам; bars должны идти от старых к новым."""
+    if period < 1 or len(bars) < period + 1:
+        return None
+    ranges: List[float] = []
+    previous_close: Optional[float] = None
+    for bar in bars:
+        try:
+            high = float(bar["high"])
+            low = float(bar["low"])
+            close = float(bar["close"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if high <= 0 or low <= 0 or close <= 0 or high < low:
+            return None
+        if previous_close is not None:
+            ranges.append(max(high - low, abs(high - previous_close),
+                              abs(low - previous_close)))
+        previous_close = close
+    if len(ranges) < period:
+        return None
+    value = sum(ranges[:period]) / period
+    for true_range in ranges[period:]:
+        value = (value * (period - 1) + true_range) / period
+    return value

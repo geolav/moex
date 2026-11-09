@@ -228,3 +228,15 @@ def describe_morning_context(ctx: Dict[str, Any]) -> Optional[str]:
 def candle_ts_local(ts: float) -> datetime:
     """Время закрытия свечи по-московски (для фильтров и отладки)."""
     return msk_from_ts(ts)
+
+
+def is_scalp_entry_time(now: Optional[datetime] = None) -> bool:
+    """Строгое окно новых скальп-входов: 10:15-18:20 МСК.
+
+    Не открываемся в первые 15 минут основной сессии, в последние 20 минут
+    и в вечернюю сессию. Это фильтр новых входов; уже открытые позиции
+    продолжают сопровождаться защитными ордерами/логикой движка.
+    """
+    dt = now or msk_now()
+    minute = _minutes_of_day(dt)
+    return 10 * 60 + 15 <= minute < 18 * 60 + 20

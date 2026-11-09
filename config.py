@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import time
+from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -29,12 +30,21 @@ except ImportError:  # pragma: no cover
 
 log = logging.getLogger("config")
 
+
+def _trading_date_msk() -> str:
+    """Календарная дата торгового дня по Москве, независимо от TZ сервера."""
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("Europe/Moscow")).date().isoformat()
+    except Exception:  # pragma: no cover - старые системы без tzdata
+        return datetime.now(timezone(timedelta(hours=3))).date().isoformat()
+
 # Базовый каталог проекта = папка, где лежит этот файл.
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 #: Максимум тикеров ОБЫЧНОГО режима - жёсткое требование по памяти и лимитам
 #: API. v1.6.0: поднято с 5 до 6 - движок ведёт до шести бумаг одновременно.
-#: (В скальп-режиме лимит другой: SCALP_MAX_POSITIONS, по умолчанию 10.)
+#: (В скальп-режиме лимит другой: SCALP_MAX_POSITIONS, по умолчанию 4.)
 MAX_TICKERS = 6
 
 _TRUE_VALUES = {"1", "true", "yes", "on", "y", "t", "да"}
@@ -172,10 +182,11 @@ class BotConfig:
     learning_enabled: bool        # учитывать итоги прошлых сделок
     memory_max_trades: int        # сколько сделок хранить в памяти
     daily_loss_limit_pct: float   # стоп на день: макс. убыток, % от капитала
+    estimated_round_trip_cost_pct: float  # оценка комиссии/издержек вход+выход для P&L
     loss_streak_pause_h: float    # пауза бумаге после 3 убытков подряд, ч
-    sl_confirm_cycles: int        # циклов ниже стопа до продажи (1 = сразу)
-    sl_veto_confidence: float     # уверенность ИИ, чтобы отложить стоп-лосс
-    hard_sl_mult: float           # аварийный стоп = стоп-лосс * этот множитель
+    sl_confirm_cycles: int        # legacy ENV, в v1.8.0 не используется
+    sl_veto_confidence: float     # legacy ENV, ИИ не может откладывать стоп
+    hard_sl_mult: float           # legacy ENV, стоп больше не расширяется множителем
     trailing_activate_pct: float  # с какой прибыли включается трейлинг-стоп
     trailing_drop_pct: float      # откат от максимума прибыли для продажи
     llm_early_sell_min_profit_pct: float  # ИИ продаёт досрочно только в плюс
@@ -189,7 +200,7 @@ class BotConfig:
     chase_bounce_pct: float        # не покупать, если отскок от минимума окна уже >= X%
     morning_anchor_until: int      # до скольки часов утренний якорь на вчерашний день
     # --- Скальп-режим (v1.7.0): /scalp в Telegram -----------------------------
-    scalp_max_positions: int       # сколько бумаг вести одновременно (10)
+    scalp_max_positions: int       # сколько бумаг вести одновременно (жёсткий предел 4)
     scalp_poll_sec: int            # период полных циклов с решениями (5 мин)
     scalp_exit_poll_sec: int       # период быстрой охраны позиций между циклами
     scalp_cooldown_min: int        # кулдаун повторной покупки бумаги, мин
@@ -198,33 +209,22 @@ class BotConfig:
     scalp_take_profit_pct: float
     scalp_trailing_activate_pct: float
     scalp_trailing_drop_pct: float
-    scalp_surge_from_pct: float    # радар разворота агрессивнее, чем в обычном режиме
-    # --- Скальп v1.8.0: параметры по итогам разбора сделок 6-9.11 -------------
-    scalp_max_buys_per_day: int    # максимум входов скальпа за день (8)
-    scalp_stop_cap_pct: float      # потолок стопа скальпа, % (1.0)
-    scalp_stop_min_pct: float      # минимум стопа скальпа, % (0.6)
-    scalp_atr_stop_mult: float     # стоп = max(min, mult * ATR-оценка), %
-    scalp_tp1_r: float             # TP1 = столько R (1.0 = величина риска)
-    scalp_tp1_fraction: float      # доля позиции на TP1 (0.5 = половина)
-    scalp_time_stop_min: int       # тайм-стоп: минуты без движения до выхода
-    scalp_time_stop_min_r: float   # ...если прибыль меньше стольких R (0.3)
-    scalp_daily_loss_pct: float    # дневной стоп скальпа, % капитала (1.0)
-    scalp_streak_pause_min: int    # пауза скальпа после 2 убытков подряд, мин
-    # --- Дисциплина входа и риск (v1.8.0) ------------------------------------
-    stop_cooldown_h: float         # запрет повторного входа после стопа, ч (2)
-    max_per_basket: int            # максимум позиций в одной отрасли (2)
-    no_entry_first_min: int        # не входить первые N минут сессии (15)
-    no_entry_last_min: int         # не входить последние N минут сессии (20)
-    evening_entries: bool          # разрешить входы в вечернюю сессию (нет)
-    risk_per_trade_pct: float      # риск на сделку, % капитала (0.3)
-    min_buy_confidence: float      # минимальная уверенность ИИ для buy (0.60)
-    score_threshold_floor: float   # нижняя граница порога сигнала (0.20)
-    ai_max_per_cycle: int          # максимум обращений к ИИ за цикл (3)
-    commission_pct: float          # комиссия за сторону сделки, % (0.05)
-    max_spread_pct: float          # макс. спред для входа, % (0.1; 0 = выкл)
-    cost_cover_mult: float         # ход до TP1 >= X круговых издержек (3)
-    breadth_risk_off: float        # breadth ниже - риск-офф (35%)
-    breadth_risk_on: float         # breadth выше - риск-он (55%)
+    scalp_surge_from_pct: float    # радар разворота (в скальпе не применяется)
+    scalp_max_entries_per_day: int
+    scalp_risk_per_trade_pct: float
+    scalp_daily_loss_limit_pct: float
+    scalp_max_position_pct: float
+    scalp_min_stop_pct: float
+    scalp_atr_multiplier: float
+    scalp_max_stop_pct: float
+    scalp_max_spread_pct: float
+    scalp_round_trip_cost_pct: float
+    scalp_min_reward_cost_multiple: float
+    scalp_time_stop_min: int
+    scalp_min_progress_r: float
+    scalp_loss_pause_minutes: int
+    scalp_stop_cooldown_min: int
+    scalp_max_sector_positions: int
     # --- Сканер рынка (scanner.py) -------------------------------------------
     scan_enabled: bool            # фоновый поиск кандидатов раз в N минут
     scan_interval_min: int        # период сканирования рынка, минут
@@ -328,11 +328,13 @@ def load_config() -> BotConfig:
         max_buys_per_day=_env_int("MAX_BUYS_PER_DAY", 25, low=1, high=100),
         learning_enabled=_env_bool("LEARNING", True),
         memory_max_trades=_env_int("MEMORY_MAX_TRADES", 400, low=20, high=5000),
-        daily_loss_limit_pct=_env_float("DAILY_LOSS_LIMIT_PCT", 2.0,
+        daily_loss_limit_pct=_env_float("DAILY_LOSS_LIMIT_PCT", 1.5,
                                         low=0.0, high=100.0),
+        estimated_round_trip_cost_pct=_env_float(
+            "ESTIMATED_ROUND_TRIP_COST_PCT", 0.10, low=0.0, high=3.0),
         loss_streak_pause_h=_env_float("LOSS_STREAK_PAUSE_H", 4.0,
                                        low=0.0, high=168.0),
-        sl_confirm_cycles=_env_int("SL_CONFIRM_CYCLES", 1, low=1, high=10),
+        sl_confirm_cycles=_env_int("SL_CONFIRM_CYCLES", 2, low=1, high=10),
         sl_veto_confidence=_env_float("SL_VETO_CONFIDENCE", 0.60,
                                       low=0.0, high=1.0),
         hard_sl_mult=_env_float("HARD_SL_MULT", 1.5, low=1.0, high=5.0),
@@ -352,17 +354,17 @@ def load_config() -> BotConfig:
                                     low=0.0, high=50.0),
         morning_anchor_until=_env_int("MORNING_ANCHOR_UNTIL", 13,
                                       low=10, high=17),
-        scalp_max_positions=_env_int("SCALP_MAX_POSITIONS", 10,
-                                     low=2, high=20),
+        scalp_max_positions=_env_int("SCALP_MAX_POSITIONS", 4,
+                                     low=1, high=4),
         scalp_poll_sec=_env_int("SCALP_POLL_SEC", 300, low=60, high=3600),
-        scalp_exit_poll_sec=_env_int("SCALP_EXIT_POLL_SEC", 150,
-                                     low=60, high=1800),
+        scalp_exit_poll_sec=_env_int("SCALP_EXIT_POLL_SEC", 60,
+                                     low=30, high=1800),
         scalp_cooldown_min=_env_int("SCALP_COOLDOWN_MIN", 20,
                                     low=0, high=600),
         scalp_harvest_tiers=parse_harvest_tiers(
             _env_str("SCALP_HARVEST_TIERS", "2.0:0.4,3.0:0.25,5.0:0.15")),
-        scalp_stop_loss_pct=_env_float("SCALP_STOP_LOSS_PCT", 2.0,
-                                       low=0.1, high=50.0),
+        scalp_stop_loss_pct=_env_float("SCALP_STOP_LOSS_PCT", 1.0,
+                                       low=0.1, high=1.0),
         scalp_take_profit_pct=_env_float("SCALP_TAKE_PROFIT_PCT", 3.0,
                                          low=0.1, high=100.0),
         scalp_trailing_activate_pct=_env_float("SCALP_TRAILING_ACTIVATE", 1.0,
@@ -371,51 +373,35 @@ def load_config() -> BotConfig:
                                            low=0.1, high=100.0),
         scalp_surge_from_pct=_env_float("SCALP_SURGE_FROM_PCT", 1.5,
                                         low=0.3, high=100.0),
-        # v1.8.0: скальп по правилам разбора логов - 3-4 позиции, не 10.
-        scalp_max_buys_per_day=_env_int("SCALP_MAX_BUYS_PER_DAY", 8,
-                                        low=1, high=100),
-        scalp_stop_cap_pct=_env_float("SCALP_STOP_CAP_PCT", 1.0,
-                                      low=0.2, high=10.0),
-        scalp_stop_min_pct=_env_float("SCALP_STOP_MIN_PCT", 0.6,
-                                      low=0.1, high=10.0),
-        scalp_atr_stop_mult=_env_float("SCALP_ATR_STOP_MULT", 1.2,
-                                       low=0.5, high=5.0),
-        scalp_tp1_r=_env_float("SCALP_TP1_R", 1.0, low=0.3, high=5.0),
-        scalp_tp1_fraction=_env_float("SCALP_TP1_FRACTION", 0.5,
+        scalp_max_entries_per_day=_env_int("SCALP_MAX_ENTRIES_PER_DAY", 8,
+                                           low=1, high=8),
+        scalp_risk_per_trade_pct=_env_float("SCALP_RISK_PER_TRADE_PCT", 0.3,
+                                            low=0.05, high=0.3),
+        scalp_daily_loss_limit_pct=_env_float("SCALP_DAILY_LOSS_LIMIT_PCT", 1.0,
+                                              low=0.1, high=1.0),
+        scalp_max_position_pct=_env_float("SCALP_MAX_POSITION_PCT", 15.0,
+                                          low=1.0, high=15.0),
+        scalp_min_stop_pct=_env_float("SCALP_MIN_STOP_PCT", 0.6,
                                       low=0.1, high=1.0),
-        scalp_time_stop_min=_env_int("SCALP_TIME_STOP_MIN", 45,
-                                     low=5, high=600),
-        scalp_time_stop_min_r=_env_float("SCALP_TIME_STOP_MIN_R", 0.3,
-                                         low=0.0, high=5.0),
-        scalp_daily_loss_pct=_env_float("SCALP_DAILY_LOSS_PCT", 1.0,
-                                        low=0.0, high=50.0),
-        scalp_streak_pause_min=_env_int("SCALP_STREAK_PAUSE_MIN", 60,
-                                        low=0, high=1440),
-        stop_cooldown_h=_env_float("STOP_COOLDOWN_H", 2.0,
-                                   low=0.0, high=72.0),
-        max_per_basket=_env_int("MAX_PER_BASKET", 2, low=1, high=10),
-        no_entry_first_min=_env_int("NO_ENTRY_FIRST_MIN", 15,
-                                    low=0, high=60),
-        no_entry_last_min=_env_int("NO_ENTRY_LAST_MIN", 20,
-                                   low=0, high=60),
-        evening_entries=_env_bool("EVENING_ENTRIES", False),
-        risk_per_trade_pct=_env_float("RISK_PER_TRADE_PCT", 0.3,
-                                      low=0.05, high=5.0),
-        min_buy_confidence=_env_float("MIN_BUY_CONFIDENCE", 0.60,
-                                      low=0.0, high=1.0),
-        score_threshold_floor=_env_float("SCORE_THRESHOLD_FLOOR", 0.20,
-                                         low=0.0, high=1.0),
-        ai_max_per_cycle=_env_int("AI_MAX_PER_CYCLE", 3, low=1, high=30),
-        commission_pct=_env_float("COMMISSION_PCT", 0.05,
-                                  low=0.0, high=1.0),
-        max_spread_pct=_env_float("MAX_SPREAD_PCT", 0.1,
-                                  low=0.0, high=5.0),
-        cost_cover_mult=_env_float("COST_COVER_MULT", 3.0,
-                                   low=1.0, high=20.0),
-        breadth_risk_off=_env_float("BREADTH_RISK_OFF", 35.0,
-                                    low=0.0, high=100.0),
-        breadth_risk_on=_env_float("BREADTH_RISK_ON", 55.0,
-                                   low=0.0, high=100.0),
+        scalp_atr_multiplier=_env_float("SCALP_ATR_MULTIPLIER", 1.2,
+                                        low=0.5, high=3.0),
+        scalp_max_stop_pct=_env_float("SCALP_MAX_STOP_PCT", 1.0,
+                                      low=0.1, high=1.0),
+        scalp_max_spread_pct=_env_float("SCALP_MAX_SPREAD_PCT", 0.1,
+                                        low=0.01, high=0.1),
+        scalp_round_trip_cost_pct=_env_float("SCALP_ROUND_TRIP_COST_PCT", 0.1,
+                                             low=0.0, high=1.0),
+        scalp_min_reward_cost_multiple=_env_float("SCALP_MIN_REWARD_COST_MULTIPLE", 3.0,
+                                                  low=1.0, high=10.0),
+        scalp_time_stop_min=_env_int("SCALP_TIME_STOP_MIN", 45, low=5, high=240),
+        scalp_min_progress_r=_env_float("SCALP_MIN_PROGRESS_R", 0.3,
+                                        low=0.0, high=2.0),
+        scalp_loss_pause_minutes=_env_int("SCALP_LOSS_PAUSE_MIN", 60,
+                                          low=5, high=360),
+        scalp_stop_cooldown_min=_env_int("SCALP_STOP_COOLDOWN_MIN", 120,
+                                         low=30, high=1440),
+        scalp_max_sector_positions=_env_int("SCALP_MAX_SECTOR_POSITIONS", 2,
+                                            low=1, high=4),
         scan_enabled=_env_bool("SCAN_ENABLED", True),
         scan_interval_min=_env_int("SCAN_INTERVAL_MIN", 10, low=5, high=1440),
         scan_min_turnover=_env_float("SCAN_MIN_TURNOVER_MLN", 50.0,
@@ -429,12 +415,9 @@ def load_config() -> BotConfig:
         scan_auto_buy_per_scan=_env_int("SCAN_AUTO_BUY_PER_SCAN", 1,
                                         low=1, high=5),
         rate_limit_rpm=_env_int("RATE_LIMIT_RPM", 90, low=5, high=250),
-        # v1.8.0: несколько лент - одна 404-т больше не оставляет бота без
-        # новостей (раньше РБК отдал 404 и весь сентимент считался нейтральным).
         news_rss_urls=_env_urls(
             "NEWS_RSS_URLS",
-            ("https://www.interfax.ru/rss.asp",
-             "https://rssexport.rbc.ru/rbcnews/news/30/full"),
+            ("https://www.interfax.ru/rss.asp",),
         ),
         http_timeout_sec=_env_int("HTTP_TIMEOUT_SEC", 15, low=5, high=120),
         sandbox_start_balance=_env_float("SANDBOX_START_BALANCE", 100_000.0, low=1000.0),
@@ -470,21 +453,18 @@ class StateStore:
         "last_audit_ts": 0,
         "sandbox_confirm_ts": 0,  # время выдачи подтверждения перехода в реал
         "price_history": {},      # ticker -> [[ts, price], ...] для /stats
-        "aggressiveness": 45,     # 0..100 - решительность торговли (/set_aggressiveness)
-        "activity": 55,           # 0..100 - масштаб времени стратегии (/set_activity)
-        "max_invested_pct": 45,   # потолок доли ВСЕХ денег в акциях (/set_invested)
+        "aggressiveness": 50,     # 0..100 - решительность торговли (/set_aggressiveness)
+        "activity": 50,           # 0..100 - масштаб времени стратегии (/set_activity)
+        "max_invested_pct": 30,   # потолок доли ВСЕХ денег в акциях (/set_invested)
         "decision_log": [],       # последние решения трейдера (память для LLM)
         "last_buy_ts": {},        # ticker -> unix-ts последней покупки (кулдаун)
         "daily_buys": {"date": "", "count": 0},  # покупки за сегодня
-        "watchlist": [],          # тикеры под управлением бота (до 6/10)
+        "watchlist": [],          # тикеры под управлением бота (до 6; scalp cap 4)
         "scalp_mode": False,      # v1.7.0: скальп-режим (/scalp в Telegram)
         "scan_auto_buy": True,    # v1.7.1: автопокупка кандидатов сканера (/autobuy)
-        # --- v1.8.0: дисциплина по итогам разбора сделок ------------------------
-        "stop_cooldown": {},      # ticker -> unix-ts, до которого после стопа нельзя покупать
-        "market_regime": {},      # {regime, breadth_pct, avg_day_chg_pct, ts, n} (сканер)
-        "scalp_pause_until": 0,   # unix-ts: глобальная пауза скальп-покупок
-        "scalp_loss_streak": 0,   # убытков подряд в скальп-режиме
-        "v18_tuned": False,       # разовая миграция настроек v1.8.0 выполнена
+        "stop_cooldowns": {},     # тикер -> unix-ts запрета входа после стопа
+        "scalp_pause_until": 0,   # глобальная пауза после серии убыточных скальпов
+        "realized_pnl_today": {"date": "", "value": 0.0},
     }
 
     def __init__(self, path: str, initial_overrides: Optional[Dict[str, Any]] = None):
@@ -559,6 +539,41 @@ class StateStore:
     def drop_position(self, ticker: str) -> None:
         self._data["positions"].pop(ticker, None)
         self.save()
+
+    def stop_cooldown_until(self, ticker: str) -> float:
+        return float(self._data.get("stop_cooldowns", {}).get(ticker, 0) or 0)
+
+    def set_stop_cooldown_until(self, ticker: str, ts: float) -> None:
+        self._data.setdefault("stop_cooldowns", {})[ticker] = float(ts)
+        self.save()
+
+    @property
+    def scalp_pause_until(self) -> float:
+        return float(self._data.get("scalp_pause_until", 0) or 0)
+
+    def set_scalp_pause_until(self, ts: float) -> None:
+        self._data["scalp_pause_until"] = float(ts)
+        self.save()
+
+    def realized_pnl_today(self) -> float:
+        """Реализованный P&L с начала текущего календарного дня по Москве."""
+        today = _trading_date_msk()
+        value = self._data.get("realized_pnl_today", {})
+        if not isinstance(value, dict) or value.get("date") != today:
+            self._data["realized_pnl_today"] = {"date": today, "value": 0.0}
+            self.save()
+            return 0.0
+        return float(value.get("value", 0.0) or 0.0)
+
+    def add_realized_pnl_today(self, amount: float) -> float:
+        """Добавляет закрытый P&L и возвращает дневную сумму."""
+        today = _trading_date_msk()
+        current = self.realized_pnl_today()
+        self._data["realized_pnl_today"] = {
+            "date": today, "value": current + float(amount),
+        }
+        self.save()
+        return current + float(amount)
 
     # --- журнал действий и аудит -----------------------------------------------
     def record_action(self, text: str) -> None:
@@ -704,114 +719,18 @@ class StateStore:
         self.save()
 
     def buys_today(self) -> int:
-        """Сколько покупок уже сделано сегодня (сброс в полночь)."""
-        today = time.strftime("%Y-%m-%d")
+        """Сколько покупок уже сделано сегодня по московскому времени."""
+        today = _trading_date_msk()
         record = self._data.get("daily_buys", {})
         if record.get("date") != today:
             return 0
         return int(record.get("count", 0))
 
     def record_buy_today(self) -> None:
-        today = time.strftime("%Y-%m-%d")
+        today = _trading_date_msk()
         record = self._data.get("daily_buys", {})
         if record.get("date") != today:
             self._data["daily_buys"] = {"date": today, "count": 1}
         else:
             record["count"] = int(record.get("count", 0)) + 1
         self.save()
-
-    # --- v1.8.0: кулдаун после стоп-лосса ---------------------------------------
-    def stop_cooldown_until(self, ticker: str) -> float:
-        """До какого unix-ts бумаге после стоп-лосса запрещены покупки."""
-        return float(self._data.get("stop_cooldown", {}).get(ticker, 0))
-
-    def set_stop_cooldown(self, ticker: str, until_ts: float) -> None:
-        """Запрет повторного входа после стопа (STOP_COOLDOWN_H, по умолчанию 2 ч).
-
-        Прошедшие запреты подчищаются, чтобы словарь не рос."""
-        store = self._data.setdefault("stop_cooldown", {})
-        now = time.time()
-        for key in [k for k, v in store.items() if float(v) < now]:
-            del store[key]
-        if until_ts > now:
-            store[ticker] = float(until_ts)
-        self.save()
-
-    # --- v1.8.0: режим рынка (считает сканер, использует движок) ---------------
-    def set_market_regime(self, data: Dict[str, Any]) -> None:
-        record = dict(data)
-        record["ts"] = int(time.time())
-        self._data["market_regime"] = record
-        self.save()
-
-    def market_regime(self, max_age_sec: float = 2700.0) -> Dict[str, Any]:
-        """Последний режим рынка от сканера; устаревший (>45 мин) - пустой словарь.
-
-        Пустой словарь = режим неизвестен = движок трактует как neutral.
-        """
-        raw = self._data.get("market_regime") or {}
-        try:
-            if time.time() - float(raw.get("ts", 0)) > max_age_sec:
-                return {}
-        except (TypeError, ValueError):
-            return {}
-        return dict(raw)
-
-    # --- v1.8.0: пауза и серии убытков скальпа ----------------------------------
-    def set_scalp_pause(self, until_ts: float) -> None:
-        self._data["scalp_pause_until"] = float(until_ts)
-        self.save()
-
-    def scalp_paused_until(self) -> float:
-        return float(self._data.get("scalp_pause_until", 0) or 0)
-
-    def record_scalp_result(self, pnl: float, pause_min: int) -> Optional[int]:
-        """Учитывает закрытие скальп-сделки. Возвращает длину серии (или None).
-
-        2 убытка подряд -> пауза скальп-покупок на pause_min минут,
-        серия сбрасывается; прибыль сбрасывает серию сразу.
-        """
-        streak = int(self._data.get("scalp_loss_streak", 0) or 0)
-        if pnl >= 0:
-            if streak:
-                self._data["scalp_loss_streak"] = 0
-                self.save()
-            return 0
-        streak += 1
-        self._data["scalp_loss_streak"] = streak
-        if streak >= 2 and pause_min > 0:
-            self.set_scalp_pause(time.time() + pause_min * 60.0)
-            self._data["scalp_loss_streak"] = 0
-            self.save()
-            return streak
-        self.save()
-        return streak
-
-    # --- v1.8.0: разовая миграция настроек по итогам разбора сделок ------------
-    def apply_v18_tuning(self) -> List[str]:
-        """Один раз приводит настройки к рекомендуемым разбором логов.
-
-        Разбор сделок 6-9.11: агрессивность 80 и активность 100 давали порог
-        сигнала 0.11 и покупки почти без фильтра. Рекомендация: агрессивность
-        40-50, активность 50-60, вложенность 40-50%. Излишне высокие значения
-        аккуратно снижаю (ВАЖНЫЕ только ВЫШЕ диапазона - осторожные настройки
-        владельца не трогаю). Возвращает список человекочитаемых изменений.
-        """
-        changes: List[str] = []
-        if self._data.get("v18_tuned"):
-            return changes
-        if int(self._data.get("aggressiveness", 45) or 0) > 50:
-            old = self._data.get("aggressiveness")
-            self._data["aggressiveness"] = 45
-            changes.append(f"агрессивность {old} -> 45 (рекомендация 40-50)")
-        if int(self._data.get("activity", 55) or 0) > 60:
-            old = self._data.get("activity")
-            self._data["activity"] = 55
-            changes.append(f"активность {old} -> 55 (рекомендация 50-60)")
-        if int(self._data.get("max_invested_pct", 45) or 0) > 50:
-            old = self._data.get("max_invested_pct")
-            self._data["max_invested_pct"] = 45
-            changes.append(f"вложенность {old}% -> 45% (рекомендация 40-50%)")
-        self._data["v18_tuned"] = True
-        self.save()
-        return changes

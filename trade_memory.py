@@ -28,7 +28,10 @@ import json
 import logging
 import os
 import time
+from datetime import datetime
 from typing import Any, Dict, List, Optional
+
+import sessions
 
 log = logging.getLogger("trade_memory")
 
@@ -86,7 +89,8 @@ class TradeMemory:
                lots: int, lot_size: int, reason: str, profit_pct: float,
                entry_ts_str: str = "", closed_ts: Optional[float] = None,
                signal_score: Optional[float] = None,
-               llm_confidence: Optional[float] = None) -> Dict[str, Any]:
+               llm_confidence: Optional[float] = None,
+               cost_rub: float = 0.0) -> Dict[str, Any]:
         """
         Запоминает одну закрытую сделку. Возвращает словарь-запись.
 
@@ -97,8 +101,11 @@ class TradeMemory:
         entry_ts = closed_ts
         if entry_ts_str:
             try:
-                entry_ts = time.mktime(
-                    time.strptime(entry_ts_str, "%Y-%m-%d %H:%M:%S"))
+                # Новые entry_ts сохраняются в московском времени; парсим
+                # их явно в MSK, чтобы TZ хоста/VPS не менял час входа.
+                entry_dt = datetime.strptime(
+                    entry_ts_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=sessions.MSK)
+                entry_ts = entry_dt.timestamp()
             except (ValueError, TypeError):
                 entry_ts = closed_ts
         entry_price = float(entry_price or 0.0)
@@ -106,7 +113,9 @@ class TradeMemory:
         lot_size = int(lot_size or 1)
         lots = int(lots or 0)
         shares = lots * lot_size
-        pnl = (exit_price - entry_price) * shares if entry_price > 0 else 0.0
+        gross_pnl = (exit_price - entry_price) * shares if entry_price > 0 else 0.0
+        cost_rub = max(0.0, float(cost_rub or 0.0))
+        pnl = gross_pnl - cost_rub
         record: Dict[str, Any] = {
             "closed_ts": round(closed_ts, 1),
             "entry_ts": round(entry_ts, 1),
@@ -116,10 +125,12 @@ class TradeMemory:
             "lots": lots,
             "shares": shares,
             "pnl": round(pnl, 2),
+            "gross_pnl": round(gross_pnl, 2),
+            "estimated_cost_rub": round(cost_rub, 2),
             "pnl_pct": round(float(profit_pct), 3),
             "reason": str(reason),
-            "entry_hour": time.strftime("%H", time.localtime(entry_ts)),
-            "entry_weekday": time.strftime("%a", time.localtime(entry_ts)),
+            "entry_hour": sessions.msk_from_ts(entry_ts).strftime("%H"),
+            "entry_weekday": sessions.msk_from_ts(entry_ts).strftime("%a"),
             "hold_min": max(0, int((closed_ts - entry_ts) / 60.0)),
             "signal_score": (round(float(signal_score), 3)
                              if signal_score is not None else None),
@@ -183,11 +194,16 @@ class TradeMemory:
                if h >= 0 and len(pnls) >= min_trades and all(p < 0 for p in pnls)]
         return bad
 
+    def _today_start_epoch(self, now: Optional[float] = None) -> float:
+        """Unix timestamp московской полуночи для указанного момента."""
+        current = sessions.msk_from_ts(
+            float(now if now is not None else time.time()))
+        midnight = current.replace(hour=0, minute=0, second=0, microsecond=0)
+        return midnight.timestamp()
+
     def today_realized_pnl(self, now: Optional[float] = None) -> float:
-        """Суммарный реализованный результат с локальной полуночи, руб."""
-        now = float(now if now is not None else time.time())
-        midnight = time.mktime(time.strptime(
-            time.strftime("%Y-%m-%d", time.localtime(now)), "%Y-%m-%d"))
+        """Суммарный реализованный net-результат с полуночи по Москве, руб."""
+        midnight = self._today_start_epoch(now)
         return sum(float(t.get("pnl", 0)) for t in self._trades
                    if float(t.get("closed_ts", 0)) >= midnight)
 
@@ -220,7 +236,7 @@ class TradeMemory:
                         ) -> Optional[str]:
         """Причина пропуска покупки в текущий час или None."""
         now = float(now if now is not None else time.time())
-        hour = int(time.strftime("%H", time.localtime(now)))
+        hour = sessions.msk_from_ts(now).hour
         if hour in self.worst_hours(ticker):
             return (f"в {hour:02d}:00 мои прошлые покупки этой бумаги пока "
                     f"каждый раз заканчивались убытком - в этот час не покупаю")
@@ -251,8 +267,8 @@ class TradeMemory:
         tail = trades[-3:]
         parts = []
         for trade in tail:
-            closed = time.strftime(
-                "%d.%m %H:%M", time.localtime(float(trade.get("closed_ts", 0))))
+            closed = sessions.msk_from_ts(
+                float(trade.get("closed_ts", 0))).strftime("%d.%m %H:%M")
             parts.append(f"{closed} {trade.get('reason')} "
                          f"{float(trade.get('pnl_pct', 0)):+.1f}%")
         if parts:
@@ -318,8 +334,8 @@ class TradeMemory:
         if tail:
             lines.append("Последние сделки:")
             for trade in tail:
-                closed = time.strftime(
-                    "%d.%m %H:%M", time.localtime(float(trade.get("closed_ts", 0))))
+                closed = sessions.msk_from_ts(
+                    float(trade.get("closed_ts", 0))).strftime("%d.%m %H:%M")
                 emoji = "✅" if float(trade.get("pnl_pct", 0)) > 0 else "🔻"
                 lines.append(
                     f"• {closed} {trade.get('ticker')} - "
@@ -347,7 +363,6 @@ class TradeMemory:
 
     def _today_count(self, now: Optional[float] = None) -> int:
         now = float(now if now is not None else time.time())
-        midnight = time.mktime(time.strptime(
-            time.strftime("%Y-%m-%d", time.localtime(now)), "%Y-%m-%d"))
+        midnight = self._today_start_epoch(now)
         return sum(1 for t in self._trades
                    if float(t.get("closed_ts", 0)) >= midnight)

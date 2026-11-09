@@ -134,31 +134,14 @@ def _print_banner(config: BotConfig, state: StateStore) -> None:
              config.chase_bounce_pct, config.morning_anchor_until)
     tiers_txt = ", ".join(f">={p:g}%:{d:g}п.п." for p, d in config.harvest_tiers) \
         if config.harvest_tiers else "выкл"
-    log.info("Умная фиксация прибыли (HARVEST_TIERS): %s | SL подтверждение %d цикл(а)",
-             tiers_txt, config.sl_confirm_cycles)
+    log.info("Умная фиксация прибыли (HARVEST_TIERS): %s | жёсткий stop-loss без LLM-вмешательства",
+             tiers_txt)
     log.info("Обучение на ошибках: %s | дневной лимит убытка %.1f%% | "
              "пауза бумаге после 3 убытков %.1f ч",
              "вкл" if config.learning_enabled else "выкл",
              config.daily_loss_limit_pct, config.loss_streak_pause_h)
-    # v1.8.0: дисциплина по итогам разбора сделок 6-9.11.
-    log.info("Дисциплина v1.8.0: стоп БЕЗ вето ИИ | кулдаун после стопа %.1f ч | "
-             "входы: не первые %d мин, не последние %d мин, вечерка %s | "
-             "корзин лимит %d | риск на сделку %.2f%% | бюджет ИИ %d/цикл",
-             config.stop_cooldown_h, config.no_entry_first_min,
-             config.no_entry_last_min,
-             "разрешена" if config.evening_entries else "запрещена",
-             config.max_per_basket, config.risk_per_trade_pct,
-             config.ai_max_per_cycle)
-    log.info("Скальп v1.8.0: до %d позиций | до %d входов/день | стоп "
-             "%.1f-%.1f%% | TP1 %.1fR половиной + безубыток | тайм-стоп %d мин | "
-             "дневной стоп %.1f%%",
-             config.scalp_max_positions, config.scalp_max_buys_per_day,
-             config.scalp_stop_min_pct, config.scalp_stop_cap_pct,
-             config.scalp_tp1_r, config.scalp_time_stop_min,
-             config.scalp_daily_loss_pct)
-    log.info("Groq-модель: %s | аудит каждые %d сек (разбор сделок: %s)",
-             config.groq_model, config.audit_interval_sec,
-             "вкл" if config.auditor_enabled_default else "выкл")
+    log.info("Groq-модель: %s | аудит каждые %d сек",
+             config.groq_model, config.audit_interval_sec)
     log.info("=" * 60)
 
 
@@ -226,10 +209,7 @@ async def async_main() -> int:
 
     engine = TradingEngine(config, state, client, analyst, notify_admin,
                            memory=memory)
-    # v1.8.0: аудитор разбирает СДЕЛКИ (Промпт 3: метрики/нарушения/вердикт),
-    # а не только хвост лога - ему нужны движок и память сделок.
-    auditor = AIAuditor(config, state, analyst, notify_admin,
-                        engine=engine, memory=memory)
+    auditor = AIAuditor(config, state, analyst, notify_admin)
 
     async def send_admin_photos(caption: str, pngs: list,
                                 reply_markup=None) -> None:
@@ -300,19 +280,6 @@ async def async_main() -> int:
         # v1.7.2: сразу вспоминаем, чем торгуем (позиции под охраной с
         # первой минуты, а не когда сканер случайно встретит бумагу).
         remember_traded_tickers(client, engine, state)
-        # v1.8.0: разовая подстройка настроек (агрессивность/активность/
-        # вложенность - по итогам разбора сделок 6-9.11) и сверка позиций
-        # с реальным портфелем: средневзвешенная цена входа вместо цены
-        # последней докупки (кейс VKCO: +0.52% при реальных -1.73%).
-        tuning = state.apply_v18_tuning()
-        if tuning:
-            log.info("Настройки приведены к рекомендациям разбора: %s",
-                     "; ".join(tuning))
-        try:
-            reconcile_report = await engine.reconcile_portfolio()
-        except Exception as exc:  # noqa: BLE001 - сверка не роняет старт
-            log.warning("Сверка с портфелем не удалась: %s", exc)
-            reconcile_report = ""
         await analyst.start()
         log.info("Все компоненты инициализированы, запускаю фоновые задачи")
 
@@ -346,17 +313,11 @@ async def async_main() -> int:
                          else "")
             autobuy_txt = (" Автопокупка кандидатов сканера: вкл (/autobuy)."
                            if config.scan_auto_buy else "")
-            tuning_txt = ("\n⚙️ Настройки приведены к рекомендациям разбора "
-                          "сделок: " + "; ".join(tuning) + "." if tuning else "")
-            reconcile_txt = (f"\n🧮 Сверка позиций с портфелем: {reconcile_report}."
-                             if reconcile_report else "")
             await notify_admin(
                 f"Бот запущен (v{VERSION}). Режим: {mode}. "
                 f"Тикеры: {', '.join(engine.watchlist())}. "
                 f"Торговля: {'вкл' if state.trading_enabled else 'выкл'}. "
                 f"{scan_txt}.{scalp_txt}{autobuy_txt} "
-                f"Дисциплина v1.8.0: жёсткий стоп, fail-closed, кулдаун после "
-                f"стопа, размер по риску.{tuning_txt}{reconcile_txt} "
                 f"Команды теперь есть кнопками: /help.")
         except Exception as exc:  # noqa: BLE001 - Telegram мог быть недоступен
             log.warning("Приветствие в Telegram не отправлено: %s", exc)
