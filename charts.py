@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import io
 import logging
+import math
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -21,6 +22,23 @@ log = logging.getLogger("charts")
 
 #: Панелей (графиков) на одной картинке по умолчанию: 6 тикеров -> 2 фото.
 DEFAULT_PER_PHOTO = 3
+
+
+def _clean_points(points: Sequence[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    """Отбрасывает битые точки (None/нечисловые ts или цена, price <= 0).
+
+    v1.9.0: графики не должны падать целиком из-за одной плохой точки,
+    случайно попавшей в state.json или пришедшей с биржи.
+    """
+    clean: List[Tuple[float, float]] = []
+    for point in points or []:
+        try:
+            ts, price = float(point[0]), float(point[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if math.isfinite(ts) and math.isfinite(price) and price > 0:
+            clean.append((ts, price))
+    return clean
 
 
 def sma_series(points: Sequence[Tuple[float, float]], period: int
@@ -64,12 +82,26 @@ def render_group_pngs(series: List[Dict[str, Any]], *,
     photos: List[bytes] = []
     for offset in range(0, len(series), per_photo):
         chunk = series[offset:offset + per_photo]
-        n = len(chunk)
+        # v1.9.0: чистим точки заранее и не рисуем панели без данных.
+        clean_chunk = []
+        for item in chunk:
+            pts = _clean_points(item.get("points") or [])
+            if len(pts) < 2:
+                continue
+            item = dict(item)
+            item["points"] = pts
+            sma = item.get("sma")
+            if sma:
+                item["sma"] = _clean_points(sma)
+            clean_chunk.append(item)
+        if not clean_chunk:
+            continue
+        n = len(clean_chunk)
         fig, axes = plt.subplots(
             n, 1, figsize=(7.0, max(3.0, 2.1 * n)), constrained_layout=True)
         axes = [axes] if n == 1 else list(axes)
 
-        for ax, item in zip(axes, chunk):
+        for ax, item in zip(axes, clean_chunk):
             pts = item.get("points") or []
             xs: List[datetime] = []
             if len(pts) >= 2:
@@ -101,9 +133,11 @@ def render_group_pngs(series: List[Dict[str, Any]], *,
         buf = io.BytesIO()
         try:
             fig.savefig(buf, format="png", dpi=100)
+            photos.append(buf.getvalue())
+        except Exception as exc:  # noqa: BLE001 - одна картинка не решает
+            log.warning("Не удалось нарисовать группу графиков: %s", exc)
         finally:
             plt.close(fig)
-        photos.append(buf.getvalue())
     return photos
 
 
@@ -117,7 +151,7 @@ def build_chart_items(history_by_ticker: Dict[str, Sequence[Tuple[float, float]]
     """
     items: List[Dict[str, Any]] = []
     for ticker, points in history_by_ticker.items():
-        pts = [(float(ts), float(p)) for ts, p in points]
+        pts = _clean_points(points)
         if len(pts) < 2:
             continue
         item: Dict[str, Any] = {"ticker": ticker, "points": pts, "sma": None}
@@ -140,7 +174,7 @@ def render_forecast_png(history: Sequence[Tuple[float, float]],
     history - [(ts, price)] прошлые свечи; fc - словарь из predictor.forecast
     (ключи path/band_low/band_high). matplotlib недоступен -> None.
     """
-    pts = [(float(ts), float(p)) for ts, p in history if p]
+    pts = _clean_points(history)
     path = fc.get("path") or []
     low = fc.get("band_low") or []
     high = fc.get("band_high") or []

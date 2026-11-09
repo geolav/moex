@@ -534,10 +534,11 @@ class MarketScanner:
             lines.append("")
         if scalp_note:
             lines.append(scalp_note.strip())
-        lines.append("Кнопки: «Купить ТИКЕР» - сразу 1 лот своими руками; "
+        lines.append("Кнопки: «Купить ТИКЕР» - куплю своими руками столько "
+                     "лотов, сколько допускают лимиты и риск для этой цены; "
                      "«Торгуй ТИКЕР» - отдать боту под автоторговлю. "
-                     "Вручную: /buy ТИКЕР ШТ, /watch ТИКЕР • "
-                     "графики моих бумаг: /charts")
+                     "Вручную: /buy ТИКЕР [ШТ] (без числа объём посчитает бот), "
+                     "/watch ТИКЕР • графики моих бумаг: /charts")
         if _auto_buy_enabled(self._cfg, self._state):
             lines.append(f"🤖 Автопокупка вкл: до "
                          f"{getattr(self._cfg, 'scan_auto_buy_per_scan', 1)} "
@@ -547,19 +548,28 @@ class MarketScanner:
         return "\n".join(lines)
 
     def _render_photos(self, top: List[Dict[str, Any]]) -> List[bytes]:
-        """2 фото графиков кандидатов (3 панели на фото, 15-мин свечи)."""
-        subtitles: Dict[str, str] = {}
-        histories: Dict[str, List[Tuple[float, float]]] = {}
-        for row in top:
-            histories[row["ticker"]] = list(row["history"])
-            subtitles[row["ticker"]] = (
-                f"сигнал {row['score']:+.2f}, {row['day_chg_pct']:+.1f}% за день")
-        items = charts.build_chart_items(histories, sma_period=_SCAN_FAST_N,
-                                         subtitles=subtitles)
-        return charts.render_group_pngs(
-            items, per_photo=max(1, self._cfg.scan_report_top // 2),
-            suptitle="Топ кандидатов сканера (15-мин свечи, ~26 ч, "
-                     "пунктир - рабочая средняя 4 ч)")
+        """2 фото графиков кандидатов (3 панели на фото, 15-мин свечи).
+
+        v1.9.0: любые проблемы отрисовки не роняют отчёт сканера - вместо
+        фото уйдёт текст с кнопками.
+        """
+        try:
+            subtitles: Dict[str, str] = {}
+            histories: Dict[str, List[Tuple[float, float]]] = {}
+            for row in top:
+                histories[row["ticker"]] = list(row["history"])
+                subtitles[row["ticker"]] = (
+                    f"сигнал {row['score']:+.2f}, {row['day_chg_pct']:+.1f}% за день")
+            items = charts.build_chart_items(histories, sma_period=_SCAN_FAST_N,
+                                             subtitles=subtitles)
+            return charts.render_group_pngs(
+                items, per_photo=max(1, self._cfg.scan_report_top // 2),
+                suptitle="Топ кандидатов сканера (15-мин свечи, ~26 ч, "
+                         "пунктир - рабочая средняя 4 ч)")
+        except Exception as exc:  # noqa: BLE001 - отчёт важнее картинок
+            log.warning("Сканер: не удалось нарисовать графики (%s) - "
+                        "отчёт уйдёт текстом", exc)
+            return []
 
     async def _deliver(self, text: str, photos: List[bytes],
                        top: Optional[List[Dict[str, Any]]] = None) -> None:

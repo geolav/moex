@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import time
 from datetime import datetime, timezone, timedelta
@@ -183,7 +184,8 @@ class BotConfig:
     learning_enabled: bool        # учитывать итоги прошлых сделок
     memory_max_trades: int        # сколько сделок хранить в памяти
     daily_loss_limit_pct: float   # стоп на день: макс. убыток, % от капитала
-    estimated_round_trip_cost_pct: float  # оценка комиссии/издержек вход+выход для P&L
+    estimated_round_trip_cost_pct: float  # комиссия вход+выход (песочница T-Invest: 0,05% за исполнение -> 0,10% круг); спред и проскальзывание добавляются отдельно
+    slippage_pct: float           # v1.9.0: оценка проскальзывания за круг, % (добавляется к комиссии и спреду в проверках издержек)
     loss_streak_pause_h: float    # пауза бумаге после 3 убытков подряд, ч
     sl_confirm_cycles: int        # legacy ENV, в v1.8.0 не используется
     sl_veto_confidence: float     # legacy ENV, ИИ не может откладывать стоп
@@ -341,6 +343,7 @@ def load_config() -> BotConfig:
                                         low=0.0, high=100.0),
         estimated_round_trip_cost_pct=_env_float(
             "ESTIMATED_ROUND_TRIP_COST_PCT", 0.10, low=0.0, high=3.0),
+        slippage_pct=_env_float("SLIPPAGE_PCT", 0.05, low=0.0, high=1.0),
         loss_streak_pause_h=_env_float("LOSS_STREAK_PAUSE_H", 4.0,
                                        low=0.0, high=168.0),
         sl_confirm_cycles=_env_int("SL_CONFIRM_CYCLES", 2, low=1, high=10),
@@ -402,7 +405,10 @@ def load_config() -> BotConfig:
                                         low=0.01, high=0.1),
         scalp_round_trip_cost_pct=_env_float("SCALP_ROUND_TRIP_COST_PCT", 0.1,
                                              low=0.0, high=1.0),
-        scalp_min_reward_cost_multiple=_env_float("SCALP_MIN_REWARD_COST_MULTIPLE", 3.0,
+        # v1.9.0: минимум 4.0 по правилу «издержки не съедают больше ~25-30%
+        # цели» (fortraders scalp-trading-ai): при цели 1R и издержках c
+        # безубыточная вероятность = (R+c)/(2R); при R>=4c она <= 62.5%.
+        scalp_min_reward_cost_multiple=_env_float("SCALP_MIN_REWARD_COST_MULTIPLE", 4.0,
                                                   low=1.0, high=10.0),
         scalp_time_stop_min=_env_int("SCALP_TIME_STOP_MIN", 45, low=5, high=240),
         scalp_min_progress_r=_env_float("SCALP_MIN_PROGRESS_R", 0.3,
@@ -638,10 +644,23 @@ class StateStore:
         self.save()
 
     def price_history(self, ticker: str, hours: float = 6.0) -> List[Tuple[float, float]]:
-        """Точки (ts, price) за последние `hours` часов, старые - обрезаются."""
+        """Точки (ts, price) за последние `hours` часов, старые - обрезаются.
+
+        v1.9.0: битые точки (None/нечисловые цена или время, попавшие в
+        state.json от старых версий) пропускаются, а не роняют /stats и
+        построение графиков.
+        """
         cutoff = time.time() - max(0.5, hours) * 3600.0
         raw = self._data.get("price_history", {}).get(ticker, [])
-        return [(float(ts), float(p)) for ts, p in raw if float(ts) >= cutoff]
+        out: List[Tuple[float, float]] = []
+        for point in raw:
+            try:
+                ts, price = float(point[0]), float(point[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if math.isfinite(ts) and math.isfinite(price) and ts >= cutoff:
+                out.append((ts, price))
+        return out
 
     # --- агрессивность торговли -------------------------------------------------
     def aggressiveness(self) -> int:

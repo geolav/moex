@@ -1,5 +1,5 @@
 """
-dry_run_test.py - самопроверка всего бота v1.8.3 на МАКЕТАХ без сети и токенов.
+dry_run_test.py - самопроверка всего бота v1.9.0 на МАКЕТАХ без сети и токенов.
 
 Проверяет ключевую логику ДО выхода на реальные деньги:
   1. торговый движок: сигнал + сентимент + LLM 'buy' -> покупка;
@@ -14,7 +14,9 @@ dry_run_test.py - самопроверка всего бота v1.8.3 на МА�
      финальный ответ; parse_decision_json;
   8. ИИ-аудитор: tail 50 строк лога -> вердикт -> сообщение админу;
   9. очистка логов (cleanup.run_cleanup);
- 10. фактическое потребление ОЗУ процессом (VmRSS из /proc).
+ 10. фактическое потребление ОЗУ процессом (VmRSS из /proc);
+ 12. v1.9.0: полные круговые издержки (комиссия 0,05%x2 + спред + проскальзывание),
+     безубыточная вероятность сделки, умный объём для кнопки/`/buy ТИКЕР`.
 
 Запуск: python dry_run_test.py
 SDK Т-Инвестиций НЕ обязателен: tinkoff_client импортируется с заглушками
@@ -82,6 +84,7 @@ def make_test_config(tmp: str) -> BotConfig:
         trade_cooldown_min=120, max_buys_per_day=25,
         learning_enabled=True, memory_max_trades=400,
         daily_loss_limit_pct=1.5, estimated_round_trip_cost_pct=0.1,
+        slippage_pct=0.05,
         loss_streak_pause_h=4.0,
         sl_confirm_cycles=2, sl_veto_confidence=0.60,
         hard_sl_mult=1.5, trailing_activate_pct=2.0, trailing_drop_pct=1.5,
@@ -239,7 +242,7 @@ class FakeAnalyst:
 
 async def main() -> int:
     print("=" * 64)
-    print("DRY-RUN самопроверка MOEX Trading Bot v1.8.3 (моки, без сети)")
+    print("DRY-RUN самопроверка MOEX Trading Bot v1.9.0 (моки, без сети)")
     print("=" * 64)
 
     tmp = tempfile.mkdtemp(prefix="bot_dryrun_")
@@ -267,6 +270,29 @@ async def main() -> int:
           f"plan={local_plan}")
     check("без ATR локальный план не выдумывается",
           engine._standard_trade_plan({}) is None)
+
+    # --- v1.9.0: полные круговые издержки и безубыточная вероятность --------
+    print("\n[0b] v1.9.0: издержки = комиссия 0,05%x2 + спред + проскальзывание")
+    summary_probe: dict = {}
+    cost = engine._effective_round_trip_cost("SBER", summary_probe)
+    # cfg fake: commission 0.10 + slippage 0.05 + спред FakeClient 0.05 = 0.20
+    check("круговые издержки = комиссия+спред+проскальзывание",
+          abs(cost - 0.20) < 1e-9 and abs(summary_probe["round_trip_cost_pct"] - 0.20) < 1e-9,
+          f"cost={cost}")
+    be = engine._breakeven_confidence(0.6, 0.6, 0.2)
+    check("безубыточная вероятность при TP1=1R и издержках 0.2% равна 0.8/1.2",
+          abs(be - 0.8 / 1.2) < 1e-9, f"be={be:.3f}")
+    check("безубыточная вероятность растёт при жирных издержках",
+          engine._breakeven_confidence(0.6, 0.6, 0.4) > be)
+
+    # --- v1.9.0: умный объём для кнопки/`/buy ТИКЕР` -------------------------
+    print("\n[0c] v1.9.0: smart_buy_units считает лоты по лимиту на сделку")
+    units, note = await engine.smart_buy_units("SBER")
+    # cash 50000, лимит 10% -> 5000 бюджет, лот 2500 -> 2 лота = 20 шт
+    check("умный объём: 2 лота (20 шт) при бюджете 5000 из 50000",
+          units == 20, f"units={units}, note={note[:80]}")
+    check("умный объём: пояснение содержит логику расчёта",
+          "лимит на сделку" in note and "10%" in note, note[:120])
 
     # --- Тест 1: активность 50, сигнал + сентимент + LLM 'buy' -> покупка ----
     print("\n[1] Активность 50: подтверждённый reversal по OHLCV, LLM 'buy' -> ПОКУПКА")

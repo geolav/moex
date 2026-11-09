@@ -712,6 +712,14 @@ class AIAnalyst:
                 "allowed_setups": list(row.get("allowed_setups") or []),
                 "signal": round(float(row.get("score") or 0.0), 3),
                 "rsi": round(float(summary.get("rsi14") or 0.0), 1),
+                "rsi7": round(float(summary.get("rsi7")), 1)
+                    if summary.get("rsi7") is not None else None,
+                "ema9_vs_ema21": ("up" if float(summary.get("ema9")) > float(summary.get("ema21"))
+                                  else "down")
+                    if summary.get("ema9") is not None
+                    and summary.get("ema21") is not None else None,
+                "bb_squeeze": bool(summary.get("bb_squeeze"))
+                    if summary.get("bb_squeeze") is not None else None,
                 "macd_hist": round(float(macd.get("histogram") or 0.0), 5),
                 "macd_prev": round(float(macd.get("histogram_prev") or 0.0), 5),
                 "price_vs_sma_fast_pct": round((price / float(fast) - 1.0) * 100.0, 3)

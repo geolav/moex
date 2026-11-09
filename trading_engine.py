@@ -684,10 +684,16 @@ class TradingEngine:
         LLM выбирает направление/сетап, но не определяет размер риска и
         уровни защиты. Для net R:R >= 2 требуется TP >= 2*stop + 3*cost,
         где cost — оценка полного оборота в процентах.
+
+        v1.9.0: если в сводке есть точная круговая стоимость (комиссия
+        песочницы 0,05% за сторону + спред + проскальзывание), используется
+        она, а не грубый конфиг-постоянный ESTIMATED_ROUND_TRIP_COST_PCT.
         """
         try:
             atr_pct = float(summary.get("atr_pct") or 0.0)
-            cost_pct = max(0.0, float(self._cfg.estimated_round_trip_cost_pct))
+            summary_cost = summary.get("round_trip_cost_pct")
+            cost_pct = (float(summary_cost) if summary_cost is not None
+                        else max(0.0, float(self._cfg.estimated_round_trip_cost_pct)))
             max_stop = min(
                 float(self._cfg.stop_loss_pct),
                 (float(self._cfg.take_profit_pct) - 3.0 * cost_pct) / 2.0,
@@ -705,6 +711,49 @@ class TradingEngine:
                 or (target_pct - cost_pct) < 2.0 * (stop_pct + cost_pct) - 1e-9):
             return None
         return round(stop_pct, 4), round(target_pct, 4)
+
+    def _effective_round_trip_cost(self, ticker: str,
+                                   summary: Dict[str, Any]) -> float:
+        """Полная круговая стоимость сделки в % (v1.9.0).
+
+        Комиссия песочницы T-Invest 0,05% за каждое исполненное поручение
+        -> 0,10% за круг. Сверху добавляются фактический спред (если он
+        известен) и оценочное проскальзывание (SLIPPAGE_PCT). Оценка
+        сохраняется в summary["round_trip_cost_pct"] и участвует во всех
+        проверках издержек и в расчёте безубыточной вероятности.
+        """
+        base = max(0.0, float(self._cfg.estimated_round_trip_cost_pct))
+        slip = max(0.0, float(getattr(self._cfg, "slippage_pct", 0.0) or 0.0))
+        spread_getter = getattr(self._client, "get_spread_pct", None)
+        try:
+            spread = float(spread_getter(ticker)) if callable(spread_getter) else None
+        except Exception:  # noqa: BLE001 - спред не обязан быть доступен
+            spread = None
+        if spread is None:
+            spread = summary.get("spread_pct")
+        spread = max(0.0, float(spread)) if spread is not None else 0.0
+        if spread > 0:
+            summary["spread_pct"] = spread
+        cost = base + slip + spread
+        summary["round_trip_cost_pct"] = round(cost, 4)
+        return cost
+
+    def _breakeven_confidence(self, stop_pct: float, tp_pct: float,
+                              cost_pct: float) -> float:
+        """Минимальная вероятность, при которой сделка имеет нулевое матожидание.
+
+        Математика из скилла fortraders scalp-trading-ai: чистый плюс
+        win = TP − cost, чистый минус loss = stop + cost (стоп срабатывает
+        уже после потраченных издержек). Безубыточная вероятность
+        p* = loss / (win + loss). Сделка имеет положительное ожидание только
+        если реальная вероятность добраться до TP выше p*; движок требует
+        запас в CONFIDENCE_MARGIN (0.05).
+        """
+        win = float(tp_pct) - float(cost_pct)
+        loss = float(stop_pct) + float(cost_pct)
+        if win <= 0 or loss <= 0:
+            return 1.0
+        return loss / (win + loss)
 
     async def _evaluate_entry(self, ticker: str, price: float) -> None:
         # Для автоматических входов LLM доступен только пакетно: не более 2-3
@@ -857,7 +906,8 @@ class TradingEngine:
             stop_pct = min(self._cfg.scalp_max_stop_pct,
                            max(self._cfg.scalp_min_stop_pct,
                                self._cfg.scalp_atr_multiplier * float(atr_pct)))
-            round_trip_cost = float(spread_pct) + self._cfg.scalp_round_trip_cost_pct
+            round_trip_cost = (float(spread_pct) + self._cfg.scalp_round_trip_cost_pct
+                               + max(0.0, float(getattr(self._cfg, "slippage_pct", 0.0) or 0.0)))
             if float(spread_pct) > self._cfg.scalp_max_spread_pct:
                 log.info("%s: спред %.3f%% выше лимита %.3f%%",
                          ticker, float(spread_pct), self._cfg.scalp_max_spread_pct)
@@ -1001,6 +1051,10 @@ class TradingEngine:
             # Уровни защиты рассчитывает код. Сохраняем совместимость с
             # отдельными legacy-ответами LLM, если они содержат полный план,
             # но пакетный анализатор намеренно не тратит токены на sizing.
+            # v1.9.0: полная круговая стоимость (комиссия 0,05%×2 + спред +
+            # проскальзывание) считается ДО плана - стоп/цель подгоняются
+            # под реальные издержки конкретной бумаги.
+            self._effective_round_trip_cost(ticker, summary)
             ai_stop = float(decision.get("stop_pct") or 0.0)
             ai_target = float(decision.get("tp1_pct") or 0.0)
             if ai_stop > 0 and ai_target > 0:
@@ -1027,6 +1081,31 @@ class TradingEngine:
                 decision["stop_pct"], decision["tp1_pct"] = local_plan
                 log.info("%s: локальный ATR-план: стоп %.2f%%, цель %.2f%% (net R:R≥2)",
                          ticker, *local_plan)
+
+        # Шаг 3 (v1.9.0, скилл fortraders): проверка безубыточной вероятности.
+        # win = TP1 − издержки, loss = стоп + издержки;
+        # p* = loss / (win + loss). Если уверенность ИИ не выше p* + запас,
+        # математическое ожидание сделки неположительное - вход отменяется.
+        # Это детерминированный фильтр: ИИ не может его обойти.
+        be_stop = (float(summary.get("planned_stop_pct") or 0.0)
+                   if self.scalp_mode() else float(decision.get("stop_pct") or 0.0))
+        be_tp = be_stop if self.scalp_mode() else float(decision.get("tp1_pct") or 0.0)
+        be_cost = float(summary.get("round_trip_cost_pct")
+                        or self._cfg.estimated_round_trip_cost_pct)
+        be_conf = self._breakeven_confidence(be_stop, be_tp, be_cost)
+        summary["breakeven_confidence"] = round(be_conf, 3)
+        if be_conf >= 1.0 or decision["confidence"] < be_conf + 0.05:
+            log.info("%s: уверенность %.2f не покрывает безубыточную вероятность "
+                     "%.2f (стоп %.2f%%, TP %.2f%%, издержки %.2f%%) - вход отменён",
+                     ticker, decision["confidence"], be_conf, be_stop, be_tp, be_cost)
+            await self._notify_skip(
+                ticker, score,
+                f"сигнал был ({score:+.2f}), но математика против: при стопе "
+                f"{be_stop:.2f}% и издержках {be_cost:.2f}% нужно быть правым "
+                f"минимум в {be_conf:.0%} случаев, а ИИ уверен лишь на "
+                f"{decision['confidence']:.0%}. Сделка не имеет положительного "
+                f"ожидания - пропускаю.")
+            return
 
         # Рынок без подтверждённого risk-on трактуем как neutral: размер
         # позиции уменьшается вдвое вне зависимости от пожелания LLM.
@@ -1597,6 +1676,84 @@ class TradingEngine:
         await self._safe_notify(friendly)
 
     # --------------------------------------------------------- ручные сделки
+    async def smart_buy_units(self, ticker: str) -> Tuple[int, str]:
+        """Логичный объём покупки по кнопке сканера и /buy ТИКЕР без числа (v1.9.0).
+
+        Считает тот же бюджет, что и автоторговля: лимит на сделку от
+        свободных средств, лимит вложенности, а в скальпе - риск на сделку
+        по ATR-стопу. Затем переводит бюджет в целые лоты. Возвращает
+        (штук_для_покупки, пояснение); 0 - покупать нельзя (пояснение -
+        почему и что сделать).
+        """
+        ticker = (ticker or "").strip().upper()
+        lot_size = self._client.get_lot_size(ticker) or 1
+        price = await self._client.get_price(ticker)
+        if not price or price <= 0:
+            return 0, (f"❌ {ticker}: не удалось получить цену - размер "
+                       f"позиции не посчитать.")
+        lot_cost = price * lot_size
+        try:
+            portfolio = await self._client.get_portfolio_summary()
+        except Exception as exc:  # noqa: BLE001
+            return 0, f"❌ Счёт недоступен ({exc}) - размер не посчитать."
+        cash = float(portfolio.get("cash", 0) or 0)
+        invested = 0.0
+        for t, pos in self._state.positions.items():
+            sz = self._client.get_lot_size(t) or 1
+            invested += int(pos.get("lots", 0) or 0) * sz * \
+                float(pos.get("entry_price", 0) or 0)
+        total_money = float(portfolio.get("total", 0) or 0) or (cash + invested)
+        if cash <= 0:
+            return 0, (f"❌ {ticker}: свободных средств нет "
+                       f"({_fmt_rub(cash)} ₽).")
+        invested_cap_pct = min(float(self._state.max_invested_pct()), 70.0) \
+            if self.scalp_mode() else float(self._state.max_invested_pct())
+        room = total_money * invested_cap_pct / 100.0 - invested
+        budget = min(cash, max(room, 0.0))
+        reasons: List[str] = []
+        if self.scalp_mode():
+            atr_getter = getattr(self._client, "get_atr_pct", None)
+            atr_pct = atr_getter(ticker, 14) if callable(atr_getter) else None
+            if atr_pct and atr_pct > 0:
+                stop_pct = min(self._cfg.scalp_max_stop_pct,
+                               max(self._cfg.scalp_min_stop_pct,
+                                   self._cfg.scalp_atr_multiplier * float(atr_pct)))
+                open_risk = self._open_scalp_risk_pct(total_money)
+                remaining = max(0.0, self._cfg.scalp_max_portfolio_risk_pct - open_risk)
+                risk_pct = min(self._cfg.scalp_risk_per_trade_pct, remaining)
+                if risk_pct <= 0:
+                    return 0, (f"❌ {ticker}: лимит суммарного риска скальпа "
+                               f"{self._cfg.scalp_max_portfolio_risk_pct:.2f}% уже "
+                               f"выбран ({open_risk:.2f}%).")
+                risk_sized = total_money * risk_pct / 100.0 / (stop_pct / 100.0)
+                budget = min(budget, risk_sized,
+                             total_money * self._cfg.scalp_max_position_pct / 100.0)
+                reasons.append(
+                    f"риск на сделку {risk_pct:.2f}% equity при стопе "
+                    f"{stop_pct:.2f}% -> номинал до {_fmt_rub(risk_sized)} ₽")
+            else:
+                budget = min(budget, cash * self._cfg.max_position_pct / 100.0)
+                reasons.append(f"лимит на сделку {self._cfg.max_position_pct:.0f}% "
+                               f"свободных (ATR недоступен)")
+        else:
+            budget = min(budget, cash * self._cfg.max_position_pct / 100.0)
+            reasons.append(f"лимит на сделку {self._cfg.max_position_pct:.0f}% "
+                           f"свободных средств")
+        lots = int(budget // lot_cost) if lot_cost > 0 else 0
+        if lots < 1:
+            return 0, (f"❌ {ticker}: бюджет по правилам риска {_fmt_rub(budget)} ₽ "
+                       f"меньше стоимости 1 лота ({_fmt_rub(lot_cost)} ₽: "
+                       f"цена {price:.2f} ₽ × лот {lot_size} шт). "
+                       f"Свободно {_fmt_rub(cash)} ₽.")
+        units = lots * lot_size
+        cap_note = (f", запас вложенности {_fmt_rub(max(room, 0.0))} ₽"
+                    if room > 0 else "")
+        explanation = (f"Считаю объём по правилам риска ({'; '.join(reasons)}"
+                       f"{cap_note}): покупаю {lots} лот(а) = {units} шт "
+                       f"≈{_fmt_rub(units * price)} ₽ из {_fmt_rub(budget)} ₽ "
+                       f"доступных.")
+        return units, explanation
+
     async def force_buy(self, ticker: str, units: int) -> str:
         """Ручная покупка по приказу владельца (/buy ТИКЕР ШТ).
 
@@ -1910,6 +2067,9 @@ class TradingEngine:
                          f"{float(summary['atr_pct']):.3f}%.")
         if summary.get("spread_pct") is not None:
             lines.append(f"Спред: {float(summary['spread_pct']):.3f}%.")
+        if summary.get("round_trip_cost_pct") is not None:
+            lines.append(f"Круговые издержки (комиссия 0,05%×2 + спред + проскальзывание): "
+                         f"{float(summary['round_trip_cost_pct']):.3f}%.")
         if summary.get("volume_ratio") is not None:
             lines.append(f"Объём последней закрытой свечи / средний объём предыдущих 20: "
                          f"{float(summary['volume_ratio']):.2f}x.")
@@ -1922,6 +2082,11 @@ class TradingEngine:
             lines.append(f"Плановый stop: {float(summary['planned_stop_pct']):.3f}%; "
                          f"estimated round-trip costs: "
                          f"{float(summary.get('round_trip_cost_pct') or 0):.3f}%.")
+        if summary.get("breakeven_confidence") is not None:
+            lines.append(f"Безубыточная вероятность сделки (p* = (стоп+издержки)/" 
+                         f"((TP-издержки)+(стоп+издержки))): "
+                         f"{float(summary['breakeven_confidence']):.2f}. Покупать стоит "
+                         f"только при уверенности заметно выше этого уровня.")
         if summary:
             sma_fast = summary.get("sma_fast")
             if sma_fast:
@@ -1937,6 +2102,19 @@ class TradingEngine:
             if rsi14 is not None:
                 lines.append(f"RSI-14: {rsi14:.1f} (меньше 30 = перепродан, "
                              f"больше 70 = перекуплен)")
+            rsi7 = summary.get("rsi7")
+            if rsi7 is not None:
+                side = "перекуплен" if rsi7 >= 80 else "перепродан" if rsi7 <= 20 else ""
+                lines.append(f"RSI-7 (быстрый, скальп-вариант): {rsi7:.1f}"
+                             + (f" ({side} по скальп-уровням 80/20)" if side else ""))
+            ema9, ema21 = summary.get("ema9"), summary.get("ema21")
+            if ema9 and ema21:
+                lines.append(f"EMA9/EMA21 (локальный тренд): {ema9:.2f}/{ema21:.2f} - "
+                             + ("быстрая выше медленной: локально вверх" if ema9 > ema21
+                                else "быстрая ниже медленной: локально вниз"))
+            if summary.get("bb_squeeze"):
+                lines.append("Сжатие полос (bb_squeeze): да - рынок копит импульс; "
+                             "пробой без объёма в сжатии считается слабым.")
             macd_d = summary.get("macd")
             if macd_d:
                 lines.append(f"MACD-гистограмма: {macd_d['histogram']:+.2f} "

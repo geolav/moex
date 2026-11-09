@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import io
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -74,7 +75,7 @@ import predictor
 
 log = logging.getLogger("telegram")
 
-VERSION = "1.8.3"
+VERSION = "1.9.0"
 
 HELP_TEXT = (
     "Команды (можно не печатать - жмите кнопки на клавиатуре ниже чата):\n"
@@ -695,17 +696,36 @@ def create_router(ctx: AppContext) -> Router:
     @router.message(Command("buy"))
     async def cmd_buy(message: Message,
                       command: Optional[CommandObject] = None) -> None:
-        """Ручная покупка: /buy SBER 100 (тикер + количество в штуках)."""
+        """Ручная покупка: /buy SBER 100 или /buy SBER (объём посчитает бот)."""
         if not is_admin(message):
             return
-        ticker, units, err = _parse_ticker_qty(command)
+        ticker, units, err = _parse_ticker_qty(command, allow_empty=True)
+        smart = False
+        size_note = ""
+        if err is None and units is None:
+            # v1.9.0: /buy ТИКЕР без количества - объём считает бот по правилам
+            # риска (тот же расчёт, что и для кнопки «Купить» в отчёте сканера).
+            smart = True
+            try:
+                units, size_note = await ctx.engine.smart_buy_units(ticker)
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Расчёт размера /buy %s не удался", ticker)
+                await message.answer(f"❌ Не удалось посчитать объём: {exc}")
+                return
+            if units <= 0:
+                await message.answer(size_note)
+                return
         if err:
             await message.answer(err)
             return
         wait = await message.answer(
-            f"🛒 Покупаю {ticker} ({units} шт) маркет-ордером...")
+            f"🛒 Покупаю {ticker} ({units} шт"
+            + (", объём по правилам риска" if smart else "")
+            + ") маркет-ордером...")
         try:
             text = await ctx.engine.force_buy(ticker, units)
+            if smart:
+                text = f"{size_note}\n\n{text}"
         except Exception as exc:  # noqa: BLE001
             log.exception("Ручная покупка /buy не удалась")
             text = f"❌ Ошибка: {exc}"
@@ -1117,21 +1137,37 @@ def create_router(ctx: AppContext) -> Router:
     # ------------------------------------------------- кнопки под сообщениями
     @router.callback_query(F.data.startswith("buy:"))
     async def cb_buy(callback: CallbackQuery) -> None:
-        """Кнопка «Купить ТИКЕР» в отчёте сканера: покупка 1 лота."""
+        """Кнопка «Купить ТИКЕР» в отчёте сканера (v1.9.0).
+
+        Покупает не 1 лот, а ЛОГИЧНЫЙ ОБЪЁМ: бот считает бюджет по тем же
+        правилам, что и для автоторговли (лимит на сделку от свободных
+        средств, лимит вложенности, в скальпе - риск по ATR-стопу), и
+        переводит его в целые лоты. Итог и логика расчёта приходят в ответе.
+        """
         user = getattr(callback, "from_user", None)
         if getattr(user, "id", None) != admin_id:
             await callback.answer("Только для администратора", show_alert=True)
             return
         ticker = (callback.data or "").split(":", 1)[1].strip().upper()
-        lot = ctx.client.get_lot_size(ticker) or 1
-        await callback.answer(f"Покупаю {ticker} ({lot} шт)...")
+        await callback.answer(f"Считаю объём по {ticker}...")
         try:
-            text = await ctx.engine.force_buy(ticker, lot)
+            units, size_note = await ctx.engine.smart_buy_units(ticker)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Расчёт объёма кнопки %s не удался", ticker)
+            units, size_note = 0, f"❌ Не удалось посчитать объём: {exc}"
+        if units <= 0:
+            try:
+                await callback.message.answer(size_note[:4000])
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Не удалось отправить ответ по объёму: %s", exc)
+            return
+        try:
+            text = await ctx.engine.force_buy(ticker, units)
         except Exception as exc:  # noqa: BLE001
             log.exception("Кнопочная покупка %s не удалась", ticker)
             text = f"❌ Ошибка: {exc}"
         try:
-            await callback.message.answer(text[:4000])
+            await callback.message.answer(f"{size_note}\n\n{text}"[:4000])
         except Exception as exc:  # noqa: BLE001
             log.warning("Не удалось отправить результат покупки: %s", exc)
 
@@ -1289,7 +1325,12 @@ def _count_trades_in_window(ctx: AppContext, hours: float) -> Optional[int]:
 
 def _render_chart(series: List[Tuple[str, list]], hours: float,
                   positions: Dict[str, dict]) -> Optional[bytes]:
-    """Рисует PNG-график цен; если matplotlib нет - вернёт None (текст-фолбэк)."""
+    """Рисует PNG-график цен; если matplotlib нет - вернёт None (текст-фолбэк).
+
+    v1.9.0: панели с пустой/битой историей пропускаются, нечисловые точки
+    отбрасываются, а любая ошибка отрисовки возвращает None (текст-фолбэк)
+    вместо крэша всей команды.
+    """
     if not series:
         return None
     try:
@@ -1300,57 +1341,75 @@ def _render_chart(series: List[Tuple[str, list]], hours: float,
         log.warning("matplotlib недоступен, график не строю: %s", exc)
         return None
 
-    n = len(series)
+    # Чистим серии заранее: панель с менее чем 2 валидными точками не рисуем.
+    clean_series: List[Tuple[str, list]] = []
+    for ticker, hist in series:
+        try:
+            points = [(float(ts), float(p)) for ts, p in (hist or [])
+                      if ts is not None and p is not None]
+        except (TypeError, ValueError):
+            continue
+        points = [(ts, p) for ts, p in points
+                  if math.isfinite(ts) and math.isfinite(p) and p > 0]
+        if len(points) >= 2:
+            clean_series.append((ticker, points))
+    if not clean_series:
+        return None
+
+    n = len(clean_series)
     fig, axes = plt.subplots(
         n, 1, figsize=(7.0, max(3.0, 2.2 * n)), constrained_layout=True)
     axes = [axes] if n == 1 else list(axes)
 
     now_dt = datetime.now()
-    for ax, (ticker, hist) in zip(axes, series):
-        xs = [datetime.fromtimestamp(ts) for ts, _ in hist]
-        ys = [p for _, p in hist]
-        ax.plot(xs, ys, lw=1.6, color="#1f77b4")
-        ax.set_title(ticker, fontsize=10, loc="left")
-        ax.set_ylabel("цена, ₽", fontsize=8)
-        ax.grid(alpha=0.3)
-        ax.tick_params(labelsize=8)
-        # Ось времени - строго запрошенное окно: левый край - начало окна,
-        # правый - сейчас. Тогда масштаб всегда честный относительно
-        # подписи "за N часов" (свечи с биржи приходят с запасом).
-        ax.set_xlim(left=min(xs[0], now_dt - timedelta(hours=hours)),
-                    right=now_dt)
-        # Линия цены покупки и момент покупки, если позиция открыта.
-        pos = positions.get(ticker)
-        if pos:
-            entry = float(pos.get("entry_price", 0) or 0) or None
-            if entry:
-                ax.axhline(entry, ls="--", lw=1.0, color="#d62728")
-            try:
-                buy_dt = datetime.strptime(
-                    str(pos.get("entry_ts", "")), "%Y-%m-%d %H:%M:%S")
-            except ValueError:
-                buy_dt = None
-            if buy_dt and xs[0] <= buy_dt <= xs[-1]:
-                ax.axvline(buy_dt, ls=":", lw=1.4, color="#ff7f0e")
-                ytop = ax.get_ylim()[1]
-                ax.annotate("покупка", xy=(buy_dt, ytop),
-                            xytext=(3, -2), textcoords="offset points",
-                            fontsize=8, color="#ff7f0e", va="top")
-    fig.suptitle(f"Цены за последние {hours:.0f} ч "
-                 "(пунктир - цена покупки, оранжевая линия - момент покупки)",
-                 fontsize=11)
-    # Наклон подписей времени (autofmt_xdate несовместим с constrained_layout).
-    for ax in axes:
-        for label in ax.get_xticklabels():
-            label.set_rotation(20)
-            label.set_ha("right")
-
-    buf = io.BytesIO()
     try:
+        for ax, (ticker, hist) in zip(axes, clean_series):
+            xs = [datetime.fromtimestamp(ts) for ts, _ in hist]
+            ys = [p for _, p in hist]
+            ax.plot(xs, ys, lw=1.6, color="#1f77b4")
+            ax.set_title(ticker, fontsize=10, loc="left")
+            ax.set_ylabel("цена, ₽", fontsize=8)
+            ax.grid(alpha=0.3)
+            ax.tick_params(labelsize=8)
+            # Ось времени - строго запрошенное окно: левый край - начало окна,
+            # правый - сейчас. Тогда масштаб всегда честный относительно
+            # подписи "за N часов" (свечи с биржи приходят с запасом).
+            ax.set_xlim(left=min(xs[0], now_dt - timedelta(hours=hours)),
+                        right=now_dt)
+            # Линия цены покупки и момент покупки, если позиция открыта.
+            pos = positions.get(ticker)
+            if pos:
+                entry = float(pos.get("entry_price", 0) or 0) or None
+                if entry:
+                    ax.axhline(entry, ls="--", lw=1.0, color="#d62728")
+                try:
+                    buy_dt = datetime.strptime(
+                        str(pos.get("entry_ts", "")), "%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    buy_dt = None
+                if buy_dt and xs[0] <= buy_dt <= xs[-1]:
+                    ax.axvline(buy_dt, ls=":", lw=1.4, color="#ff7f0e")
+                    ytop = ax.get_ylim()[1]
+                    ax.annotate("покупка", xy=(buy_dt, ytop),
+                                xytext=(3, -2), textcoords="offset points",
+                                fontsize=8, color="#ff7f0e", va="top")
+        fig.suptitle(f"Цены за последние {hours:.0f} ч "
+                     "(пунктир - цена покупки, оранжевая линия - момент покупки)",
+                     fontsize=11)
+        # Наклон подписей времени (autofmt_xdate несовместим с constrained_layout).
+        for ax in axes:
+            for label in ax.get_xticklabels():
+                label.set_rotation(20)
+                label.set_ha("right")
+
+        buf = io.BytesIO()
         fig.savefig(buf, format="png", dpi=110)
+        return buf.getvalue()
+    except Exception as exc:  # noqa: BLE001 - график не должен ломать /stats
+        log.warning("Не удалось нарисовать график цен: %s", exc)
+        return None
     finally:
         plt.close(fig)
-    return buf.getvalue()
 
 
 # ---------------------------------------------------------------------------
@@ -1372,15 +1431,18 @@ def _parse_ticker_qty(command: Optional[CommandObject], *,
             "/buy SBER 100\n"
             "/sell GAZP 30\n\n"
             "Количество - в ШТУКАХ, бот сам пересчитает в лоты "
-            "(1 лот SBER = 10 шт). Для /sell можно опустить количество - "
-            "продаст всё, что есть.")
+            "(1 лот SBER = 10 шт). Можно /buy SBER без числа - тогда объём "
+            "бот посчитает сам по правилам риска. Для /sell можно опустить "
+            "количество - продаст всё, что есть.")
     parts = args.split()
     ticker = parts[0].upper()
     if len(parts) < 2:
         if allow_empty:
             return ticker, None, None
         return None, None, (
-            f"Укажите ещё количество штук: /buy {ticker} 100")
+            f"Укажите ещё количество штук: /buy {ticker} 100\n"
+            f"(или пришлите /buy {ticker} без числа - объём посчитает бот "
+            f"по правилам риска)")
     if not parts[1].isdigit():
         return None, None, (
             "Количество должно быть целым числом штук: "

@@ -163,6 +163,15 @@ def summarize_generic(closes: Sequence[float], price: float,
     как обычно: на внутридневных свечах они автоматически становятся
     внутридневными, на часовых ведут себя по-старому.
     Изменения цены за 1/6/24 ч пересчитываются из шага свечей.
+
+    v1.9.0 (по скиллам скальпинга: gerchik, litefinance, tradermonty):
+      - ema9/ema21 - быстрые экспоненциальные средние (классика скальпа:
+        9/21 пересечение задаёт локальный тренд быстрее, чем SMA);
+      - rsi7 - быстрый RSI (в скальпе применяют период 7 и уровни 80/20
+        вместо 14 и 70/30 - сигналы раньше, но шумнее);
+      - bb_squeeze - сжатие полос Боллинджера (сравнение свежего
+        дрожания цены с более длинным окном): после сжатия обычно идёт
+        импульс, поэтому пробой внутри сжатия требует объёма, а не веры.
     """
     slow_n = max(fast_n * 2, fast_n + 2)
     per_hour = max(1, round(1.0 / step_h)) if step_h > 0 else 1
@@ -171,6 +180,16 @@ def summarize_generic(closes: Sequence[float], price: float,
     # дрожания за свечу (std умножается на корень из числа свечей в часе).
     vol_hour = (vol_candle * math.sqrt(per_hour)) if (vol_candle is not None and
                                                       step_h < 1.0) else vol_candle
+    # v1.9.0: быстрые EMA (9/21 - классика скальпинга из скиллов).
+    ema9 = None
+    ema21 = None
+    try:
+        ema9_row = ema(closes, 9) if len(closes) >= 9 else None
+        ema21_row = ema(closes, 21) if len(closes) >= 21 else None
+        ema9 = round(float(ema9_row[-1]), 4) if ema9_row else None
+        ema21 = round(float(ema21_row[-1]), 4) if ema21_row else None
+    except (TypeError, ValueError):
+        ema9 = ema21 = None
     return {
         "fast_n": fast_n,
         "slow_n": slow_n,
@@ -179,15 +198,47 @@ def summarize_generic(closes: Sequence[float], price: float,
         "per_hour": per_hour,
         "sma_fast": sma(closes, fast_n),
         "sma_slow": sma(closes, slow_n),
+        "ema9": ema9,
+        "ema21": ema21,
         "rsi14": rsi(closes, 14),
+        "rsi7": rsi(closes, 7) if len(closes) >= 8 else None,
         "macd": macd(closes),
         "bollinger": bollinger(closes),
+        "bb_squeeze": _bb_squeeze(closes),
         "chg_1h": change_pct(closes, per_hour),
         "chg_6h": change_pct(closes, per_hour * 6),
         "chg_24h": change_pct(closes, per_hour * 24),
         "volatility": vol_hour,
         "price": price,
     }
+
+
+def _std(values: Sequence[float]) -> Optional[float]:
+    """Среднеквадратичное отклонение (несмещённое деление на N - как в BB)."""
+    n = len(values)
+    if n < 2:
+        return None
+    mean = sum(values) / n
+    return math.sqrt(sum((v - mean) ** 2 for v in values) / n)
+
+
+def _bb_squeeze(closes: Sequence[float], *, fresh_n: int = 20,
+                base_n: int = 60, ratio: float = 0.75) -> Optional[bool]:
+    """Сжатие волатильности (v1.9.0): True = полосы сжаты.
+
+    По скиллам (gerchik: «сжатие полос - предстоящий импульс»): сравниваем
+    свежее дрожание цены (last fresh_n свечей) с базовым окном (base_n).
+    Сжатие означает, что рынок копит движение: пробой без объёма внутри
+    сжатия считается слабым, а само сжатие - предупреждением, что ход
+    может начаться в любую сторону.
+    """
+    if len(closes) < base_n:
+        return None
+    fresh = _std(closes[-fresh_n:])
+    base = _std(closes[-base_n:])
+    if not fresh or not base or base <= 0:
+        return None
+    return bool(fresh / base < ratio)
 
 
 def summarize(closes: Sequence[float], price: float) -> Dict[str, Optional[float]]:
@@ -376,6 +427,17 @@ def describe_for_human(summary: Dict[str, Optional[float]]) -> str:
             parts.append("цена у нижней границы своего обычного коридора")
         elif pct_b >= 0.8:
             parts.append("цена у верхней границы своего обычного коридора")
+    # v1.9.0: быстрые EMA 9/21 - локальный тренд человеческими словами.
+    ema9, ema21 = summary.get("ema9"), summary.get("ema21")
+    if ema9 and ema21:
+        if ema9 > ema21 and price >= ema9:
+            parts.append("локальный тренд вверх (EMA9 выше EMA21, цена над обеими)")
+        elif ema9 < ema21 and price <= ema9:
+            parts.append("локальный тренд вниз (EMA9 ниже EMA21, цена под обеими)")
+        else:
+            parts.append("EMA9/EMA21 переплетены - локально боковик")
+    if summary.get("bb_squeeze"):
+        parts.append("полосы сжаты - рынок копит импульс, ход может начаться резко")
     vol = summary.get("volatility")
     if vol is not None:
         parts.append(f"дрожание цены {vol:.1f}%/час " +
