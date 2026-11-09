@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from typing import Awaitable, Callable, Optional
 
@@ -48,6 +49,36 @@ def tail_lines(path: str, count: int = 50) -> str:
     if size > _TAIL_WINDOW_BYTES and lines:
         lines = lines[1:]
     return "\n".join(lines[-count:])
+
+
+def local_audit(log_text: str) -> str:
+    """Детерминированный аудит последних логов без расхода Groq tokens."""
+    lines = [line for line in (log_text or "").splitlines() if line.strip()]
+    if not lines:
+        return "Лог пуст - анализировать нечего."
+    text = "\n".join(lines).lower()
+    findings = []
+    checks = [
+        ("Groq TPD/rate limit", r"tokens per day|\btpd\b|rate.?limit|429"),
+        ("ошибки/исключения", r"\b(error|critical|traceback)\b|exception"),
+        ("сбои T-Invest/MOEX", r"tinkoff.*(недоступ|ошиб|timeout)|moex iss.*http [45]"),
+        ("отказы/неисполнения заявок", r"order.*(reject|отклон)|заявк.*(отклон|ошиб)"),
+        ("fail-closed AI", r"fail.?closed|ии недоступен|пакетный ии-анализ.*пропущен"),
+    ]
+    for label, pattern in checks:
+        count = len(re.findall(pattern, text, re.IGNORECASE))
+        if count:
+            findings.append(f"{label}: {count}")
+    buy_count = len(re.findall(r"\bпокупк|\bbuy\b", text))
+    sell_count = len(re.findall(r"\bпродаж|\bsell\b", text))
+    stop_count = len(re.findall(r"стоп-лосс|hard stop|скальп: стоп", text))
+    if not findings:
+        status = "критичных шаблонных ошибок в последнем фрагменте не найдено"
+    else:
+        status = "; ".join(findings)
+    return (f"Локальный аудит ({len(lines)} строк): {status}. "
+            f"События в логе: покупки/сигналы≈{buy_count}, продажи≈{sell_count}, "
+            f"стопы≈{stop_count}. Это поиск известных шаблонов, не семантическая проверка ИИ.")
 
 
 class AIAuditor:
@@ -107,7 +138,10 @@ class AIAuditor:
             log.info("Аудит: лог пуст, пропускаю запрос к Groq")
         else:
             self._checks_done += 1
-            verdict = await self._analyst.audit_logs(log_text)
+            if getattr(self._cfg, "auditor_llm_enabled", False):
+                verdict = await self._analyst.audit_logs(log_text)
+            else:
+                verdict = local_audit(log_text)
 
         self._state.set_audit_result(verdict)
         if notify:

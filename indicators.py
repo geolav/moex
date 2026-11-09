@@ -18,7 +18,7 @@ indicators.py - технические индикаторы на чистом Py
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 # ---------------------------------------------------------------------------
 # Базовые средние.
@@ -196,6 +196,15 @@ def summarize(closes: Sequence[float], price: float) -> Dict[str, Optional[float
     data["sma24"] = data["sma_fast"]
     data["sma48"] = data["sma_slow"]
     return data
+
+
+def candidate_rank_score(summary: Dict[str, Any], score: float,
+                        turnover: float = 0.0) -> float:
+    """Математический рейтинг 0..100 для предварительного отбора сканером."""
+    from candidate_selector import rank_candidate
+    return rank_candidate({"summary": summary, "score": score,
+                           "turnover": turnover,
+                           "price": summary.get("price")})
 
 
 def build_score(summary: Dict[str, Optional[float]]) -> float:
@@ -399,3 +408,66 @@ def atr_from_ohlc(bars: Sequence[Dict[str, float]], period: int = 14) -> Optiona
     for true_range in ranges[period:]:
         value = (value * (period - 1) + true_range) / period
     return value
+
+
+def detect_entry_setups(closes: List[float], price: float,
+                        summary: Dict[str, Any],
+                        entry_context: Optional[Dict[str, Any]],
+                        fast_n: int, *, scalp_mode: bool = False,
+                        market_breadth_pct: Optional[float] = None
+                        ) -> Tuple[List[str], int]:
+    """Общая детерминированная проверка pullback/breakout/reversal.
+
+    Одинаковая функция применяется сканером и движком: ИИ не выбирает
+    сетапы из воздуха, а лишь оценивает уже подтверждённые кодом варианты.
+    Возвращает (разрешённые сетапы, число reversal-подтверждений).
+    """
+    if not entry_context or entry_context.get("volume_ratio") is None:
+        return [], 0
+    try:
+        volume_ratio = float(entry_context["volume_ratio"])
+        if not math.isfinite(volume_ratio) or volume_ratio < 0:
+            return [], 0
+    except (TypeError, ValueError):
+        return [], 0
+
+    setups: List[str] = []
+    macd_data = summary.get("macd") or {}
+    hist = macd_data.get("histogram")
+    hist_prev = macd_data.get("histogram_prev")
+    sma_fast_value = summary.get("sma_fast")
+    sma_slow_value = summary.get("sma_slow")
+    previous_fast = sma(closes[:-fast_n], fast_n) if fast_n > 0 and len(closes) >= 2 * fast_n else None
+    macd_ok = hist is not None and hist_prev is not None and float(hist) >= float(hist_prev)
+    trend_ok = bool(sma_fast_value and sma_slow_value and previous_fast
+                    and price > float(sma_slow_value)
+                    and float(sma_fast_value) >= float(sma_slow_value)
+                    and float(sma_fast_value) > float(previous_fast) and macd_ok)
+    if trend_ok and bool(entry_context.get("pullback_volume_fade")):
+        setups.append("pullback")
+
+    last_closed = float(entry_context.get("last_close") or 0.0)
+    extension_pct = ((price / last_closed - 1.0) * 100.0
+                     if last_closed > 0 else float("inf"))
+    atr_for_setup = float(summary.get("atr_pct") or 0.0)
+    if (bool(entry_context.get("close_above_prev_high"))
+            and volume_ratio >= 1.5 and atr_for_setup > 0
+            and 0 <= extension_pct <= 0.8 * atr_for_setup):
+        setups.append("breakout")
+
+    rsi_previous = rsi(closes[:-1], 14) if len(closes) > 15 else None
+    rsi_current = summary.get("rsi14")
+    reversal_checks = [
+        bool(entry_context.get("close_above_prev_high")),
+        bool(entry_context.get("higher_low")),
+        bool(rsi_previous is not None and rsi_current is not None
+             and rsi_previous < 35 and float(rsi_current) > rsi_previous),
+        volume_ratio >= 1.3,
+    ]
+    reversal_min = 3 if scalp_mode else 2
+    reversal_market_ok = (not scalp_mode or (market_breadth_pct is not None
+                                               and float(market_breadth_pct) > 55.0))
+    reversal_count = sum(reversal_checks)
+    if reversal_count >= reversal_min and reversal_market_ok:
+        setups.append("reversal")
+    return setups, reversal_count

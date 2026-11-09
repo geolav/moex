@@ -44,7 +44,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 #: Максимум тикеров ОБЫЧНОГО режима - жёсткое требование по памяти и лимитам
 #: API. v1.6.0: поднято с 5 до 6 - движок ведёт до шести бумаг одновременно.
-#: (В скальп-режиме лимит другой: SCALP_MAX_POSITIONS, по умолчанию 4.)
+#: (В скальп-режиме лимит другой: SCALP_MAX_POSITIONS, по умолчанию 8.)
 MAX_TICKERS = 6
 
 _TRUE_VALUES = {"1", "true", "yes", "on", "y", "t", "да"}
@@ -157,6 +157,7 @@ class BotConfig:
     use_sandbox: bool             # стартовый режим (далее живёт в state.json)
     trading_enabled_default: bool
     auditor_enabled_default: bool
+    auditor_llm_enabled: bool
 
     # --- Стратегия ---
     trading_tickers: Tuple[str, ...]
@@ -200,7 +201,7 @@ class BotConfig:
     chase_bounce_pct: float        # не покупать, если отскок от минимума окна уже >= X%
     morning_anchor_until: int      # до скольки часов утренний якорь на вчерашний день
     # --- Скальп-режим (v1.7.0): /scalp в Telegram -----------------------------
-    scalp_max_positions: int       # сколько бумаг вести одновременно (жёсткий предел 4)
+    scalp_max_positions: int       # сколько скальп-позиций вести одновременно (до 8)
     scalp_poll_sec: int            # период полных циклов с решениями (5 мин)
     scalp_exit_poll_sec: int       # период быстрой охраны позиций между циклами
     scalp_cooldown_min: int        # кулдаун повторной покупки бумаги, мин
@@ -212,6 +213,7 @@ class BotConfig:
     scalp_surge_from_pct: float    # радар разворота (в скальпе не применяется)
     scalp_max_entries_per_day: int
     scalp_risk_per_trade_pct: float
+    scalp_max_portfolio_risk_pct: float  # суммарный плановый риск открытых скальп-позиций
     scalp_daily_loss_limit_pct: float
     scalp_max_position_pct: float
     scalp_min_stop_pct: float
@@ -232,7 +234,13 @@ class BotConfig:
     scan_min_price: float         # отсечь «копеечные» бумаги, руб
     scan_deep_n: int              # сколько бумаг глубоко считать по свечам
     scan_report_top: int          # сколько кандидатов присылать в отчёте
-    scan_llm: bool                # ИИ-комментарий по кандидатам (1 запрос)
+    scan_llm: bool                # пакетная оценка 2-3 лучших кандидатов (1 запрос на скан)
+    scan_ai_candidates: int       # сколько лучших кандидатов отправлять ИИ за один запрос
+    scan_min_candidate_rank: float  # минимальный математический рейтинг кандидата 0..100
+    ai_batch_decision_ttl_sec: int  # срок действия пакетного вердикта ИИ
+    ai_min_request_interval_sec: int  # защита от повторных /scan и лишних Groq-запросов
+    ai_batch_required: bool       # запрет индивидуальных LLM-вызовов для автопокупок
+    groq_daily_token_budget: int  # локальный дневной лимит токенов с запасом до квоты Groq
     scan_auto_buy: bool           # v1.7.1: бот сам покупает лучших кандидатов
     scan_auto_buy_per_scan: int   # v1.7.1: максимум автопокупок за один скан
 
@@ -282,7 +290,7 @@ def load_config() -> BotConfig:
     if not sandbox_token and not tinkoff_token:
         problems.append("TINKOFF_SANDBOX_TOKEN / TINKOFF_TOKEN - не задан ни один токен")
     if not groq_key:
-        problems.append("GROQ_API_KEY - не задан (нужен для сентимента и аудитора)")
+        problems.append("GROQ_API_KEY - не задан (нужен для финального выбора кандидатов и /ask)")
     if not tg_token:
         problems.append("TELEGRAM_BOT_TOKEN - не задан (нужен для управления)")
     if not admin_raw.isdigit():
@@ -311,6 +319,7 @@ def load_config() -> BotConfig:
         use_sandbox=_env_bool("USE_SANDBOX", True),
         trading_enabled_default=_env_bool("TRADING_ENABLED", False),
         auditor_enabled_default=_env_bool("AUDITOR_ENABLED", True),
+        auditor_llm_enabled=_env_bool("AUDITOR_LLM_ENABLED", False),
         trading_tickers=tickers,
         sma_period=_env_int("SMA_PERIOD", 24, low=2, high=500),
         # v1.7.0: 300 -> 180 сек - бот смотрит акции чаще (правка владельца).
@@ -354,8 +363,8 @@ def load_config() -> BotConfig:
                                     low=0.0, high=50.0),
         morning_anchor_until=_env_int("MORNING_ANCHOR_UNTIL", 13,
                                       low=10, high=17),
-        scalp_max_positions=_env_int("SCALP_MAX_POSITIONS", 4,
-                                     low=1, high=4),
+        scalp_max_positions=_env_int("SCALP_MAX_POSITIONS", 8,
+                                     low=1, high=8),
         scalp_poll_sec=_env_int("SCALP_POLL_SEC", 300, low=60, high=3600),
         scalp_exit_poll_sec=_env_int("SCALP_EXIT_POLL_SEC", 60,
                                      low=30, high=1800),
@@ -373,10 +382,12 @@ def load_config() -> BotConfig:
                                            low=0.1, high=100.0),
         scalp_surge_from_pct=_env_float("SCALP_SURGE_FROM_PCT", 1.5,
                                         low=0.3, high=100.0),
-        scalp_max_entries_per_day=_env_int("SCALP_MAX_ENTRIES_PER_DAY", 8,
-                                           low=1, high=8),
-        scalp_risk_per_trade_pct=_env_float("SCALP_RISK_PER_TRADE_PCT", 0.3,
+        scalp_max_entries_per_day=_env_int("SCALP_MAX_ENTRIES_PER_DAY", 40,
+                                           low=1, high=60),
+        scalp_risk_per_trade_pct=_env_float("SCALP_RISK_PER_TRADE_PCT", 0.05,
                                             low=0.05, high=0.3),
+        scalp_max_portfolio_risk_pct=_env_float(
+            "SCALP_MAX_PORTFOLIO_RISK_PCT", 0.40, low=0.10, high=2.0),
         scalp_daily_loss_limit_pct=_env_float("SCALP_DAILY_LOSS_LIMIT_PCT", 1.0,
                                               low=0.1, high=1.0),
         scalp_max_position_pct=_env_float("SCALP_MAX_POSITION_PCT", 15.0,
@@ -410,9 +421,19 @@ def load_config() -> BotConfig:
         scan_deep_n=_env_int("SCAN_DEEP_N", 20, low=5, high=60),
         scan_report_top=_env_int("SCAN_REPORT_TOP", 6, low=3, high=10),
         scan_llm=_env_bool("SCAN_LLM", True),
+        scan_ai_candidates=_env_int("SCAN_AI_CANDIDATES", 3, low=1, high=3),
+        scan_min_candidate_rank=_env_float("SCAN_MIN_CANDIDATE_RANK", 48.0,
+                                           low=0.0, high=100.0),
+        ai_batch_decision_ttl_sec=_env_int("AI_BATCH_DECISION_TTL_SEC", 900,
+                                           low=60, high=1800),
+        ai_min_request_interval_sec=_env_int("AI_MIN_REQUEST_INTERVAL_SEC", 600,
+                                             low=60, high=1800),
+        ai_batch_required=_env_bool("AI_BATCH_REQUIRED", True),
+        groq_daily_token_budget=_env_int("GROQ_DAILY_TOKEN_BUDGET", 120000,
+                                         low=10000, high=190000),
         # v1.7.1: автопокупка кандидатов сканера (переключение - /autobuy).
         scan_auto_buy=_env_bool("SCAN_AUTO_BUY", True),
-        scan_auto_buy_per_scan=_env_int("SCAN_AUTO_BUY_PER_SCAN", 1,
+        scan_auto_buy_per_scan=_env_int("SCAN_AUTO_BUY_PER_SCAN", 2,
                                         low=1, high=5),
         rate_limit_rpm=_env_int("RATE_LIMIT_RPM", 90, low=5, high=250),
         news_rss_urls=_env_urls(
@@ -693,7 +714,7 @@ class StateStore:
     # --- скальп-режим (v1.7.0) --------------------------------------------------
     @property
     def scalp_mode(self) -> bool:
-        """Включён ли скальп-режим (много мелких сделок, 10 бумаг)."""
+        """Включён ли скальп-режим (много мелких сделок, до 8 бумаг)."""
         return bool(self._data.get("scalp_mode", False))
 
     def set_scalp_mode(self, value: bool) -> None:

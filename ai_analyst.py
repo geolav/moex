@@ -1,20 +1,15 @@
 """
-ai_analyst.py - ИИ-аналитик на бесплатном Groq API.
+ai_analyst.py — компактный слой Groq для финального решения по MOEX.
 
-Две функции:
-  1. analyze_sentiment(news_text) -> float от -1.0 до 1.0
-     (тональность новостей для торговой стратегии);
-  2. audit_logs(log_text) -> краткий вердикт для ИИ-аудитора логов.
+В штатной автоторговле вызывается один раз на скан: получает до трёх
+кандидатов, уже отобранных локальной математикой и прошедших OHLCV-фильтр.
+Новости, рейтинг, сетапы, sizing, стопы, выходы и аудит работают локально.
+Ручной /ask остаётся отдельным пользовательским вызовом.
 
-Особенности:
-- модель по умолчанию: llama-3.1-8b-instant (free-тариф Groq: 30 RPM /
-  14 400 RPD; старая llama3-8b-8192 выведена из эксплуатации Groq);
-- все запросы с retry и экспоненциальной задержкой; при RateLimitError
-  уважаем заголовок retry-after;
-- торговые решения принимаются только из валидного JSON (иначе HOLD);
-- максимум ~500 токенов на ответ - экономия лимитов TPD.
-
-Модуль потребляет ~10 МБ ОЗУ (httpx под капотом), клиент создаётся один раз.
+Защита квоты: персистентный дневной token budget, резерв до запроса,
+учёт фактического usage, ограничение частоты пакетных запросов, короткий
+JSON-ответ, низкий reasoning_effort для GPT-OSS и жёсткий
+max_completion_tokens. Сбой/исчерпание бюджета = fail-closed (без покупки).
 """
 from __future__ import annotations
 
@@ -22,6 +17,11 @@ import asyncio
 import json
 import logging
 import re
+import math
+import os
+import time
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from groq import (
@@ -117,6 +117,8 @@ _SCAN_SYSTEM_PROMPT = (
     '{"verdicts": {"TICKER1": "вердикт", "TICKER2": "вердикт"}, '
     '"advice": "короткое резюме простыми словами"}'
 )
+
+_CANDIDATE_BATCH_SYSTEM_PROMPT = ""
 
 # Промпт "трейдера". v1.7.2 - МАКСИМАЛЬНО ПОДРОБНАЯ база знаний: вшита
 # выжимка открытых трейдер-скиллов, которые скидывал владелец (ссылки в
@@ -241,6 +243,7 @@ def _load_prompt_file(name: str, fallback: str = "") -> str:
 _TRADER_SYSTEM_PROMPT = _load_prompt_file("trader_system_ru.md", _TRADER_SYSTEM_PROMPT)
 _SCALP_SYSTEM_PROMPT = _load_prompt_file("scalp_system_ru.md")
 _AUDITOR_SYSTEM_PROMPT = _load_prompt_file("trade_auditor_ru.md", _AUDIT_SYSTEM_PROMPT)
+_CANDIDATE_BATCH_SYSTEM_PROMPT = _load_prompt_file("candidate_batch_ru.md")
 
 
 def parse_decision_json(raw_text: str) -> Optional[dict]:
@@ -359,23 +362,140 @@ def parse_sentiment_float(raw_text: str) -> float:
     return max(-1.0, min(1.0, value))
 
 
+class DailyTokenBudget:
+    """Персистентный локальный предохранитель от исчерпания Groq TPD.
+
+    Счётчик фактического usage сохраняется между перезапусками. Для запроса
+    заранее резервируется консервативная оценка prompt + completion; после
+    ответа резерв заменяется реальным total_tokens из ответа Groq.
+    """
+
+    def __init__(self, path: str, limit: int) -> None:
+        self.path = Path(path)
+        self.limit = max(1, int(limit))
+        self._lock = asyncio.Lock()
+        self._pending = 0
+        self._day = datetime.now(timezone.utc).date().isoformat()
+        self._used = 0
+        self._blocked_until = 0.0
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            if data.get("date_utc") == self._day:
+                self._used = max(0, int(data.get("used_tokens", 0)))
+                # Если процесс оборвался во время API-запроса, считаем сохранённый
+                # резерв израсходованным: запрос мог успеть попасть в Groq.
+                interrupted_reservation = max(0, int(data.get("reserved_tokens", 0)))
+                self._used += interrupted_reservation
+                self._blocked_until = max(0.0, float(data.get("blocked_until", 0) or 0))
+                if interrupted_reservation:
+                    self._save()
+        except FileNotFoundError:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Счётчик Groq token budget не прочитан (%s); начинаю локальный учёт с 0", exc)
+
+    def _rollover(self) -> None:
+        day = datetime.now(timezone.utc).date().isoformat()
+        if day != self._day:
+            self._day = day
+            self._used = 0
+            self._pending = 0
+            self._blocked_until = 0.0
+            self._save()
+
+    def _save(self, model: str = "") -> None:
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "date_utc": self._day,
+                "used_tokens": int(self._used),
+                "reserved_tokens": int(self._pending),
+                "daily_budget": int(self.limit),
+                "blocked_until": float(self._blocked_until),
+                "model": model,
+                "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+            }
+            tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(tmp, self.path)
+        except Exception as exc:  # noqa: BLE001
+            log.error("Не удалось сохранить счётчик Groq token budget: %s", exc)
+
+    async def reserve(self, estimated_tokens: int) -> Tuple[bool, str]:
+        estimated = max(1, int(estimated_tokens))
+        async with self._lock:
+            self._rollover()
+            now = __import__("time").time()
+            if self._blocked_until > now:
+                return False, f"Groq временно заблокирован ещё {int(self._blocked_until - now)} сек"
+            available = self.limit - self._used - self._pending
+            if estimated > available:
+                return False, (f"локальный дневной бюджет Groq: использовано {self._used}, "
+                               f"зарезервировано {self._pending}, запрос ≈{estimated}, "
+                               f"лимит {self.limit} токенов")
+            self._pending += estimated
+            # Фиксируем резерв ДО отправки запроса, чтобы рестарт не обнулил
+            # потенциально уже потраченные токены.
+            self._save()
+            return True, ""
+
+    async def settle(self, reserved_tokens: int, actual_tokens: int, model: str) -> None:
+        async with self._lock:
+            self._rollover()
+            self._pending = max(0, self._pending - max(0, int(reserved_tokens)))
+            self._used += max(0, int(actual_tokens))
+            self._save(model)
+            log.info("Groq token budget: запрос %d токенов; сегодня %d/%d (резерв %.0f%%)",
+                     max(0, int(actual_tokens)), self._used, self.limit,
+                     max(0.0, (1.0 - self.limit / 200000.0) * 100.0))
+
+    async def release(self, reserved_tokens: int) -> None:
+        async with self._lock:
+            self._pending = max(0, self._pending - max(0, int(reserved_tokens)))
+            self._save()
+
+    async def charge_estimate(self, reserved_tokens: int, model: str) -> None:
+        """Консервативно учитывает резерв, если API мог обработать запрос,
+        но клиент не получил надёжного ответа (timeout/обрыв/HTTP 5xx)."""
+        async with self._lock:
+            self._pending = max(0, self._pending - max(0, int(reserved_tokens)))
+            self._used += max(0, int(reserved_tokens))
+            self._save(model)
+            log.warning("Groq ответ не подтверждён; резерв %d токенов учтён как расход", reserved_tokens)
+
+    async def block(self, seconds: float, model: str) -> None:
+        async with self._lock:
+            self._rollover()
+            now = __import__("time").time()
+            self._blocked_until = max(self._blocked_until, now + max(30.0, seconds))
+            self._save(model)
+
+    def status(self) -> Dict[str, int]:
+        self._rollover()
+        return {"used_tokens": self._used, "budget_tokens": self.limit,
+                "remaining_tokens": max(0, self.limit - self._used - self._pending)}
+
+
 class AIAnalyst:
-    """Обёртка над AsyncGroq с retry-логикой и двумя задачами."""
+    """Обёртка над AsyncGroq с общим дневным бюджетом токенов."""
 
     def __init__(self, config) -> None:
         self._cfg = config
         self._client: Optional[AsyncGroq] = None
+        data_dir = getattr(config, "data_dir", os.path.join(os.path.dirname(__file__), "data"))
+        usage_path = os.path.join(data_dir, "groq_usage.json")
+        self._budget = DailyTokenBudget(usage_path,
+                                        getattr(config, "groq_daily_token_budget", 120000))
+        self._candidate_call_lock = asyncio.Lock()
+        self._last_candidate_call_monotonic = 0.0
 
     # --- жизненный цикл ------------------------------------------------------
     async def start(self) -> None:
-        # max_retries=0: ретраи делаем сами (контроль задержек и логов).
-        # GROQ_BASE_URL: если с VPS Groq отвечает 403/блокируется по гео,
-        # укажите адрес реверс-прокси (Deno Deploy/Cloudflare Worker) на api.groq.com.
-        # ВАЖНО: БЕЗ суффикса /openai/v1 - SDK Groq добавляет его сам!
-        #   GROQ_BASE_URL=https://<имя>.deno.dev
-        import os as _os
-
-        base_url = _os.getenv("GROQ_BASE_URL", "").strip().rstrip("/") or None
+        # max_retries=0: ретраи и бюджет контролируются здесь, а не SDK.
+        base_url = os.getenv("GROQ_BASE_URL", "").strip().rstrip("/") or None
         if base_url:
             log.info("Groq API работает через прокси: %s", base_url)
         self._client = AsyncGroq(
@@ -384,109 +504,124 @@ class AIAnalyst:
             timeout=self._cfg.http_timeout_sec,
             max_retries=0,
         )
-        log.info("AIAnalyst готов (модель %s)", self._cfg.groq_model)
+        usage = self._budget.status()
+        log.info("AIAnalyst готов (модель %s; бюджет Groq %d/%d токенов уже использован)",
+                 self._cfg.groq_model, usage["used_tokens"], usage["budget_tokens"])
 
     async def close(self) -> None:
         if self._client is not None:
             await self._client.close()
             self._client = None
 
-    # --- низкоуровневый вызов с retry -----------------------------------------
-    async def _chat(self, system: str, user: str, *, max_tokens: int, temperature: float,
-                    tries: int = 3) -> str:
+    @staticmethod
+    def _estimate_tokens(system: str, user: str, max_tokens: int) -> int:
+        # Консервативная оценка для русского текста + запас на reasoning.
+        prompt_estimate = math.ceil((len(system) + len(user)) / 2.7 * 1.15)
+        completion_estimate = math.ceil(max_tokens * 1.25)
+        return max(100, prompt_estimate + completion_estimate)
+
+    # --- низкоуровневый вызов -------------------------------------------------
+    async def _chat(self, system: str, user: str, *, max_tokens: int,
+                    temperature: float, tries: int = 2,
+                    response_format: Optional[Dict[str, Any]] = None) -> str:
         if self._client is None:
             raise AnalystError("AIAnalyst не запущен (вызовите start())")
 
         model = self._cfg.groq_model
-        # gpt-oss сначала "думает" - reasoning-токены расходуют лимит ответа,
-        # и при маленьком max_tokens content приходит ПУСТЫМ (finish_reason
-        # ='length'), а бот показывал заглушку 'Не смог сформулировать ответ'.
-        # Просим низкие рассуждения точечно: llama такой параметр не знает
-        # и вернул бы 400.
-        extra: Dict[str, str] = {}
+        extra: Dict[str, Any] = {}
         if "gpt-oss" in (model or "").lower():
             extra["reasoning_effort"] = "low"
-
+            extra["include_reasoning"] = False
+        if response_format is not None:
+            extra["response_format"] = response_format
         messages: list[Dict[str, str]] = [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ]
         delay = 2.0
         last_exc: Optional[Exception] = None
-        empty_streak = 0
-        tokens_eff = max_tokens
 
-        for attempt in range(1, tries + 1):
+        for attempt in range(1, max(1, tries) + 1):
+            reserved = self._estimate_tokens(system, user, max_tokens)
+            allowed, why = await self._budget.reserve(reserved)
+            if not allowed:
+                raise AnalystError("Groq запрос не отправлен: " + why)
             try:
                 response = await self._client.chat.completions.create(
                     model=model,
                     messages=messages,  # type: ignore[arg-type]
                     temperature=temperature,
-                    max_tokens=tokens_eff,
+                    max_completion_tokens=max_tokens,
                     **extra,
                 )
+                usage = getattr(response, "usage", None)
+                actual = getattr(usage, "total_tokens", None) if usage is not None else None
+                if actual is None and usage is not None:
+                    actual = ((getattr(usage, "prompt_tokens", 0) or 0)
+                              + (getattr(usage, "completion_tokens", 0) or 0))
+                await self._budget.settle(reserved, int(actual or reserved), model)
+
                 choice = response.choices[0]
                 content = (choice.message.content or "").strip()
                 if content:
-                    log.debug("Groq ответил за попытку %d: %.120r", attempt, content)
                     return content
-
-                # Пустой content: весь лимит токенов ушёл на рассуждения.
-                # На следующей попытке даём в 2.5 раза больше токенов и
-                # требуем финальный ответ сразу.
-                empty_streak += 1
-                reasoning = (getattr(choice.message, "reasoning", "") or "").strip()
-                log.warning(
-                    "Groq вернул пустой content (попытка %d/%d, finish_reason=%s, "
-                    "reasoning=%d симв., лимит был %d ток.)",
-                    attempt, tries, getattr(choice, "finish_reason", "?"),
-                    len(reasoning), tokens_eff)
-                # Поле reasoning не является торговым ответом и не должно
-                # никогда подменять content: при пустом content продолжаем
-                # retry, затем analyze_market вернёт HOLD (fail-closed).
-                tokens_eff = int(tokens_eff * 2.5) + 100
-                if len(messages) == 2:
-                    messages.append({
-                        "role": "system",
-                        "content": "Финальный ответ обязателен: сразу дай ответ, "
-                                   "без внутренних рассуждений.",
-                    })
-
-            except AuthenticationError as exc:
-                # Ключ неверный - повторять бессмысленно.
-                raise AnalystError(f"Groq: неверный API-ключ: {exc}") from exc
-
-            except (BadRequestError, NotFoundError) as exc:
-                raise AnalystError(f"Groq: плохой запрос/модель ({exc})") from exc
+                finish = getattr(choice, "finish_reason", "unknown")
+                raise AnalystError(
+                    f"Groq вернул пустой content (finish_reason={finish}); "
+                    "повтор не выполняю, чтобы не расходовать квоту")
 
             except RateLimitError as exc:
-                # Лимит free-тарифа: жду сколько велит retry-after, иначе дольше обычного.
-                retry_after = _extract_retry_after(exc)
-                wait = max(retry_after or 0.0, delay * 4.0)
+                await self._budget.release(reserved)
+                message = str(exc)
+                retry_after = _extract_retry_after(exc) or 0.0
+                if re.search(r"tokens per day|\bTPD\b", message, re.IGNORECASE):
+                    cooldown = max(retry_after, 300.0)
+                    await self._budget.block(cooldown, model)
+                    raise AnalystError(
+                        f"Groq достиг TPD; запросы приостановлены на {int(cooldown)} сек") from exc
                 last_exc = exc
-                log.warning("Groq RateLimit (попытка %d/%d), жду %.0f сек: %s",
-                            attempt, tries, wait, exc)
+                if attempt >= max(1, tries):
+                    break
+                wait = max(retry_after, delay)
+                log.warning("Groq rate limit (не TPD), повтор через %.0f сек", wait)
                 await asyncio.sleep(wait)
+                delay *= 2.0
+
+            except (AuthenticationError, BadRequestError, NotFoundError) as exc:
+                await self._budget.release(reserved)
+                raise AnalystError(f"Groq: ошибка конфигурации/запроса: {exc}") from exc
 
             except (APIConnectionError, APITimeoutError, InternalServerError) as exc:
+                await self._budget.charge_estimate(reserved, model)
                 last_exc = exc
-                log.warning("Groq сеть/сервер (попытка %d/%d): %s", attempt, tries, exc)
+                if attempt >= max(1, tries):
+                    break
                 await asyncio.sleep(delay)
+                delay *= 2.0
+
+            except AnalystError:
+                # Пустой ответ уже учтён как usage; budget отказов ничего не резервирует.
+                raise
+
             except APIStatusError as exc:
                 status = getattr(exc, "status_code", 0) or 0
                 if status >= _RETRYABLE_STATUS_MIN:
-                    last_exc = exc
-                    log.warning("Groq HTTP %d (попытка %d/%d)", status, attempt, tries)
-                    await asyncio.sleep(delay)
+                    await self._budget.charge_estimate(reserved, model)
                 else:
-                    raise AnalystError(f"Groq HTTP {status}: {exc}") from exc
+                    await self._budget.release(reserved)
+                if status >= _RETRYABLE_STATUS_MIN and attempt < max(1, tries):
+                    last_exc = exc
+                    await asyncio.sleep(delay)
+                    delay *= 2.0
+                    continue
+                raise AnalystError(f"Groq HTTP {status}: {exc}") from exc
 
-            delay *= 2.0  # экспоненциальная задержка: 2, 4, 8 сек
+            except Exception:
+                # Неизвестная ошибка могла произойти после отправки запроса;
+                # удерживаем консервативную оценку, чтобы не превысить TPD.
+                await self._budget.charge_estimate(reserved, model)
+                raise
 
-        if last_exc is None:
-            raise AnalystError(
-                f"Модель {model} три раза вернула пустой ответ "
-                f"(лимит последней попытки: {tokens_eff} ток.) - попробуйте позже")
         raise AnalystError(f"Groq не ответил после {tries} попыток: {last_exc}")
 
     # --- публичные задачи -------------------------------------------------------
@@ -557,6 +692,129 @@ class AIAnalyst:
             "size_mult": 0.5 if decision.get("size_mult") == 0.5 else 1.0,
         }
 
+    async def analyze_candidates(self, rows: List[Dict[str, Any]],
+                                 scalp_mode: bool = False) -> Dict[str, dict]:
+        """Оценивает до трёх уже отфильтрованных кандидатов одним Groq-запросом."""
+        if not rows:
+            return {}
+        compact: List[Dict[str, Any]] = []
+        for row in rows[:3]:
+            summary = row.get("summary") or {}
+            macd = summary.get("macd") or {}
+            bb = summary.get("bollinger") or {}
+            fast = summary.get("sma_fast")
+            slow = summary.get("sma_slow")
+            price = float(row.get("price") or 0.0)
+            compact.append({
+                "ticker": str(row.get("ticker", ""))[:16],
+                "price": round(price, 4),
+                "rank": round(float(row.get("rank_score") or 0.0), 1),
+                "allowed_setups": list(row.get("allowed_setups") or []),
+                "signal": round(float(row.get("score") or 0.0), 3),
+                "rsi": round(float(summary.get("rsi14") or 0.0), 1),
+                "macd_hist": round(float(macd.get("histogram") or 0.0), 5),
+                "macd_prev": round(float(macd.get("histogram_prev") or 0.0), 5),
+                "price_vs_sma_fast_pct": round((price / float(fast) - 1.0) * 100.0, 3)
+                    if fast and price > 0 else None,
+                "price_vs_sma_slow_pct": round((price / float(slow) - 1.0) * 100.0, 3)
+                    if slow and price > 0 else None,
+                "chg_1h_pct": round(float(summary.get("chg_1h") or 0.0), 3),
+                "volatility_pct_h": round(float(summary.get("volatility") or 0.0), 3),
+                "atr_pct": round(float(row.get("atr_pct") or 0.0), 3),
+                "spread_pct": round(float(row.get("spread_pct") or 0.0), 3)
+                    if row.get("spread_pct") is not None else None,
+                "volume_ratio": round(float((row.get("entry_context") or {}).get("volume_ratio") or 0.0), 2),
+                "turnover_mln": round(float(row.get("turnover") or 0.0) / 1_000_000.0, 1),
+                "day_change_pct": round(float(row.get("day_chg_pct") or 0.0), 2),
+                "bollinger_pct_b": round(float(bb.get("pct_b") or 0.0), 2)
+                    if bb.get("pct_b") is not None else None,
+            })
+        user = json.dumps({
+            "mode": "scalp" if scalp_mode else "intraday",
+            "market_breadth_pct": self._candidate_breadth(rows),
+            "candidates": compact,
+        }, ensure_ascii=False, separators=(",", ":"))
+        async with self._candidate_call_lock:
+            now = time.monotonic()
+            min_interval = int(getattr(self._cfg, "ai_min_request_interval_sec", 600))
+            elapsed = now - self._last_candidate_call_monotonic
+            if self._last_candidate_call_monotonic and elapsed < min_interval:
+                log.info("Пакетный Groq-запрос пропущен: антиспам-интервал ещё %.0f сек",
+                         min_interval - elapsed)
+                return {}
+            self._last_candidate_call_monotonic = now
+            try:
+                raw = await self._chat(
+                    _CANDIDATE_BATCH_SYSTEM_PROMPT,
+                    user,
+                    max_tokens=280,
+                    temperature=0.0,
+                    tries=1,
+                    response_format={"type": "json_object"},
+                )
+            except AnalystError as exc:
+                log.warning("Пакетный ИИ-анализ кандидатов пропущен: %s", exc)
+                return {}
+        allowed_by_ticker = {
+            str(row.get("ticker", "")).upper(): set(row.get("allowed_setups") or [])
+            for row in rows[:3]
+        }
+        parsed = self._parse_candidate_batch(raw, allowed_by_ticker)
+        log.info("Пакетный ИИ-анализ: обработано %d кандидатов, валидных решений %d",
+                 len(compact), len(parsed))
+        return parsed
+
+    @staticmethod
+    def _candidate_breadth(rows: List[Dict[str, Any]]) -> Optional[float]:
+        values = [row.get("market_breadth_pct") for row in rows
+                  if row.get("market_breadth_pct") is not None]
+        return round(float(values[0]), 1) if values else None
+
+    @staticmethod
+    def _parse_candidate_batch(raw: str, allowed_by_ticker: Dict[str, set]) -> Dict[str, dict]:
+        text = (raw or "").strip()
+        start, end = text.find("{"), text.rfind("}")
+        if start < 0 or end <= start:
+            return {}
+        try:
+            payload = json.loads(text[start:end + 1])
+        except json.JSONDecodeError:
+            return {}
+        decisions = payload.get("decisions") if isinstance(payload, dict) else None
+        if not isinstance(decisions, dict):
+            return {}
+        result: Dict[str, dict] = {}
+        allowed_setups = {"pullback", "breakout", "reversal", "none"}
+        for ticker, confirmed_setups in allowed_by_ticker.items():
+            item = decisions.get(ticker)
+            if not isinstance(item, dict):
+                continue
+            action = str(item.get("action", "hold")).lower()
+            if action not in {"buy", "hold"}:
+                action = "hold"
+            try:
+                confidence = float(item.get("confidence", 0.0))
+            except (TypeError, ValueError):
+                confidence = 0.0
+            confidence = max(0.0, min(1.0, confidence))
+            setup = str(item.get("setup", "none")).lower()
+            if setup not in allowed_setups:
+                setup = "none"
+            # ИИ не может одобрить buy без сетапа и достаточной уверенности.
+            if action == "buy" and (setup == "none" or confidence < 0.62
+                                    or setup not in confirmed_setups):
+                action = "hold"
+            result[ticker] = {
+                "action": action,
+                "confidence": confidence,
+                "setup": setup,
+                "stop_pct": 0.0,
+                "tp1_pct": 0.0,
+                "size_mult": 1.0,
+                "reason": str(item.get("reason", "нет обоснования"))[:120],
+            }
+        return result
+
     async def scan_verdicts(self, rows: List[Dict[str, Any]]) -> Dict[str, str]:
         """
         Короткие вердикты ИИ по кандидатам сканера рынка (ОДНИМ запросом).
@@ -619,7 +877,7 @@ class AIAnalyst:
         raw = await self._chat(
             _ASK_SYSTEM_PROMPT,
             f"Сводка:\n{ctx_text}\n\nВопрос владельца: {q}",
-            max_tokens=800,
+            max_tokens=450,
             temperature=0.4,
         )
         return raw.strip() or "Не смог сформулировать ответ - попробуй переформулировать вопрос."

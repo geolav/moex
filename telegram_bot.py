@@ -37,12 +37,12 @@ v1.7.2:
   /watchlist       - бумаги под автоматической торговлей;
   /watch ТИКЕР     - добавить бумагу под управление;
   /unwatch ТИКЕР   - убрать бумагу из управления;
-  /scalp [on|off]  - СКАЛЬП-РЕЖИМ: до 4 позиций, риск 0.3% equity,
+  /scalp [on|off]  - СКАЛЬП-РЕЖИМ: до 8 позиций, риск 0.05% equity,
                      ATR-стоп 0.6-1.0%, TP1=1R, частичный выход и time-stop;
   /toggle_trading  - включить/выключить автоматическую торговлю;
   /toggle_sandbox  - переключить песочница <-> реальный счёт
                      (переход в реал требует подтверждения "/toggle_sandbox confirm");
-  /toggle_auditor  - включить/выключить ИИ-аудитора логов;
+  /toggle_auditor  - включить/выключить локальную проверку логов;
   /audit [строк]   - запустить ИИ-проверку логов прямо сейчас;
   /ask вопрос      - задать короткий вопрос ИИ-трейдеру (почему купил /
                      не купил и т.п.);
@@ -74,7 +74,7 @@ import predictor
 
 log = logging.getLogger("telegram")
 
-VERSION = "1.8.0"
+VERSION = "1.8.1"
 
 HELP_TEXT = (
     "Команды (можно не печатать - жмите кнопки на клавиатуре ниже чата):\n"
@@ -90,13 +90,13 @@ HELP_TEXT = (
     "/watchlist - бумаги под автоматической торговлей\n"
     "/watch MTSS - добавить бумагу, /unwatch MTSS - убрать\n"
     "/autobuy - автопокупка кандидатов сканера: вкл/выкл\n"
-    "/scalp - СКАЛЬП-РЕЖИМ: до 4 бумаг, риск 0.3% на сделку, стоп по ATR\n"
+    "/scalp - СКАЛЬП-РЕЖИМ: до 8 бумаг, риск 0.05% на сделку, общий риск 0.40%, стоп по ATR\n"
     "/memory - что бот выучил из своих сделок (винрейт, уроки, плохие часы)\n"
     "/reset_memory - забыть всю память сделок (начать учиться заново)\n"
     "/toggle_trading - вкл/выкл автоматическую торговлю\n"
     "/toggle_sandbox - переключить песочница/реальный счёт\n"
-    "/toggle_auditor - вкл/выкл ИИ-аудитора логов\n"
-    "/audit - ИИ-проверка логов прямо сейчас\n"
+    "/toggle_auditor - вкл/выкл локальную проверку логов (без Groq по умолчанию)\n"
+    "/audit - локальная проверка логов прямо сейчас\n"
     "/audit 150 - то же, но по последним 150 строкам (10-200)\n"
     "/ask почему не покупаешь GAZP? - вопрос ИИ-трейдеру\n"
     "/set_aggressiveness 70 - решительность торговли 0-100\n"
@@ -114,11 +114,11 @@ HELP_TEXT = (
     "кнопками. Кнопка «Купить» - сразу 1 лот своими руками; «Торгуй» - "
     "отдать бумагу под автоторговлю; /buy - купить указанное количество.\n"
     "• Автопокупка со сканера (/autobuy) - по итогам каждого скана бот "
-    "может САМ купить до одного лучшего кандидата (лимит настраивается в "
+    "может САМ купить до двух лучших кандидатов (лимит настраивается в "
     ".env). Это не шальная сделка: кандидат прогоняется через ВСЕ обычные "
     "проверки - порог сигнала, анти-погоня, новости, вердикт ИИ, дневные "
     "лимиты и бюджет. Выключить: /autobuy off.\n"
-    "• Скальп-режим (/scalp) - до 4 позиций, риск 0.3% equity на сделку, "
+    "• Скальп-режим (/scalp) - до 8 позиций, риск 0.05% equity на сделку, "
     "ATR-стоп 0.6–1.0%, TP1=1R с частичной фиксацией, break-even и ATR-трейлинг; "
     "тайм-стоп 45 минут; новые входы только 10:15–18:20 МСК.\n"
     "• Радар разворота (защита прибыли) - если бумага сильно выросла "
@@ -196,7 +196,7 @@ BOT_COMMANDS = [
     ("buy", "купить: /buy SBER 100 (штуки)"),
     ("sell", "продать: /sell GAZP 30 (или всё)"),
     ("watchlist", "список бумаг под автоторговлей"),
-    ("scalp", "скальп-режим: до 4 позиций, риск 0.3%, ATR-стоп"),
+    ("scalp", "скальп-режим: до 8 позиций, риск 0.05%, общий риск 0.40%, ATR-стоп"),
     ("memory", "что бот выучил из сделок"),
     ("toggle_trading", "вкл/выкл автоторговлю"),
     ("toggle_sandbox", "песочница ↔ реальный счёт"),
@@ -619,21 +619,22 @@ def create_router(ctx: AppContext) -> Router:
         new_value = not ctx.state.auditor_enabled
         ctx.state.set_auditor_enabled(new_value)
         if new_value:
+            mode = ("Groq" if ctx.config.auditor_llm_enabled
+                    else "локальная проверка без Groq")
             await message.answer(
-                f"✅ ИИ-аудитор ВКЛЮЧЁН: раз в "
+                f"✅ Аудитор логов ВКЛЮЧЁН ({mode}): раз в "
                 f"{ctx.config.audit_interval_sec // 60} мин он читает журнал "
                 f"работы бота ({ctx.config.audit_log_lines} строк) и присылает "
                 f"сюда вывод - всё ли в порядке.")
         else:
             await message.answer(
-                "⏸ ИИ-аудитор ВЫКЛЮЧЕН (расходы на Groq прекратятся). "
-                "Сам бот продолжит работать как раньше.")
+                "⏸ Аудитор логов ВЫКЛЮЧЕН. Сам бот продолжит работать как раньше.")
 
     # --------------------------------------------------------------- /audit
     @router.message(Command("audit"))
     async def cmd_audit(message: Message,
                         command: Optional[CommandObject] = None) -> None:
-        """Ручная ИИ-проверка логов: всё ли нормально, исправились ли ошибки."""
+        """Ручная локальная проверка логов: всё ли нормально, исправились ли ошибки."""
         if not is_admin(message):
             return
         lines = ctx.config.audit_log_lines
@@ -1002,7 +1003,7 @@ def create_router(ctx: AppContext) -> Router:
     @router.message(Command("scalp"))
     async def cmd_scalp(message: Message,
                         command: Optional[CommandObject] = None) -> None:
-        """Скальп-режим с ограниченным риском и максимум 4 позициями."""
+        """Скальп-режим с ограниченным риском и максимум 8 позициями."""
         if not is_admin(message):
             return
         args = (command.args or "").strip().lower() if command else ""
@@ -1033,14 +1034,15 @@ def create_router(ctx: AppContext) -> Router:
                 f"{ctx.config.poll_interval_sec // 60} мин.")
             return
         # Лимит вложенности не повышается автоматически: в скальпе он
-        # дополнительно ограничен 50% equity и 15% на бумагу.
-        cap_note = (f"• Лимит вложенности {min(ctx.state.max_invested_pct(), 50)}% equity; "
+        # дополнительно ограничен 70% equity и 15% номинала на бумагу.
+        cap_note = (f"• Лимит вложенности {min(ctx.state.max_invested_pct(), 70)}% equity; "
                     "автоматически не повышается.\n")
         await message.answer(
             "⚡ СКАЛЬП-РЕЖИМ ВКЛЮЧЁН — строгие правила входа и выхода:\n"
             f"• максимум {ctx.config.scalp_max_positions} позиции одновременно, "
             f"{ctx.config.scalp_max_entries_per_day} входов в день;\n"
             f"• риск на сделку {ctx.config.scalp_risk_per_trade_pct:.2f}% equity, "
+            f"суммарный открытый риск ≤{ctx.config.scalp_max_portfolio_risk_pct:.2f}%; "
             f"не более {ctx.config.scalp_max_position_pct:.0f}% equity на бумагу;\n"
             f"• ATR-стоп clamp({ctx.config.scalp_atr_multiplier:.1f}×ATR, "
             f"{ctx.config.scalp_min_stop_pct:.1f}–{ctx.config.scalp_max_stop_pct:.1f}%), "

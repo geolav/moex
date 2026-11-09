@@ -8,19 +8,20 @@ scanner.py - сканер рынка Мосбиржи: раз в SCAN_INTERVAL_M
      Без ключей и без лимитов.
   2. Отсекаем неликвид: оборот < SCAN_MIN_TURNOVER_MLN млн руб/день,
      цена < SCAN_MIN_PRICE руб. (Остаётся "почти весь" ликвидный рынок.)
-  3. Собираем пул для глубокого анализа: топ по обороту (ядро рынка) +
-     самые упавшие за день + самые выросшие (dedup, до SCAN_DEEP_N бумаг).
-     Бумаги с открытыми позициями пропускаем.
-  4. По каждой бумаге пул - свечи 15 мин за ~26 ч через T-Invest API и ТОТ ЖЕ
-     индикаторный score, что и у торгового движка (indicators.build_score):
-     сканер ищет кандидатов в стиле стратегии - откат с шансом на отскок.
-  5. Топ SCAN_REPORT_TOP кандидатов - в Telegram: текст-отчёт + 2 фото
-     графиков (3 графика на фото) + короткий вердикт ИИ одним общим
-     запросом (SCAN_LLM) + КНОПКИ "купить"/"под управление" (v1.7.0).
+  3. Локальная формула ранжирует весь ликвидный снимок по обороту (40%),
+     спреду (30%), умеренности дневного движения (20%) и направлению (10%).
+     Для свечного анализа выбираются только лучшие SCAN_DEEP_N бумаг.
+  4. По этому пулу локальный код анализирует свечи 15 мин за ~26 ч,
+     индикаторы и подтверждённые pullback / breakout / reversal-сетапы.
+     Отдельная техническая формула ранжирует кандидатов; падающий тренд,
+     ухудшающийся MACD и перекупленность получают штрафы.
+  5. В Groq уходит максимум 3 лучших бумаги, уже прошедших локальные фильтры,
+     одним компактным JSON-запросом на скан. Остальной рейтинг/отчёт/графики
+     формируются локально; отказ ИИ блокирует автопокупку.
 
 СКАЛЬП-РЕЖИМ (v1.7.0): если он включён (/scalp), сканер сам обновляет список
 бумаг под управлением движка: тикеры с открытыми позициями остаются, свободные
-слоты занимают лучшие кандидаты (до 10 бумаг) - так бот торгует весь рынок,
+слоты занимают лучшие кандидаты (до 8 бумаг) - так бот торгует весь рынок,
 а не только ручной список.
 
 АВТОПОКУПКА (v1.7.1, SCAN_AUTO_BUY, переключение /autobuy): после отправки
@@ -51,6 +52,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 import indicators
 import charts
 import sessions
+from candidate_selector import rank_market_snapshot, select_top_candidates
 
 log = logging.getLogger("scanner")
 
@@ -183,7 +185,7 @@ class MarketScanner:
                 return "⏳ Сканер уже работает - подождите минуту."
             return ""
         async with self._busy:
-            text, photos, top = await self._scan_and_render()
+            text, photos, top, ai_candidates = await self._scan_and_render()
             # Ночной/праздничный "рынок не торгуется" в авто-режиме шлём
             # не чаще раза в 3 часа (правка v1.7.0: не спамить каждые 10 мин).
             if (not manual and text.startswith("😴")
@@ -196,12 +198,12 @@ class MarketScanner:
             if text.startswith("😴"):
                 self._last_closed_notify = time.monotonic()
             # v1.7.1: автопокупка - лучшего кандидата можно купить самому.
-            await self._maybe_auto_buy(top, manual=manual)
+            await self._maybe_auto_buy(ai_candidates, manual=manual)
             return text
 
     # ------------------------------------------------------------------ анализ
     async def _scan_and_render(self
-                               ) -> Tuple[str, List[bytes], List[Dict[str, Any]]]:
+                               ) -> Tuple[str, List[bytes], List[Dict[str, Any]], List[Dict[str, Any]]]:
         cfg = self._cfg
         # В скальп-режиме пул кандидатов НЕ режем по старому watchlist:
         # сканер сам решает, чем бот будет торговать, а позиции всегда
@@ -212,9 +214,12 @@ class MarketScanner:
         try:
             snapshot = await self._client.get_market_snapshot()
         except Exception as exc:  # noqa: BLE001
+            clear_batch = getattr(self._engine, "clear_ai_batch_decisions", None)
+            if callable(clear_batch):
+                clear_batch()
             log.warning("Сканер: рынок недоступен (%s) - пропуск", exc)
             return (f"🔎 Сканер рынка: сейчас не удалось получить данные рынка "
-                    f"({exc}) - попробую в следующий раз."), [], []
+                    f"({exc}) - попробую в следующий раз."), [], [], []
 
         liquid = [row for row in snapshot
                   if row["price"] >= cfg.scan_min_price
@@ -236,32 +241,72 @@ class MarketScanner:
         # честная диагностика с точным временем (раньше это сообщение
         # приходило и днём - из-за бага чтения оборотов, см. docstring).
         if sum(float(row.get("turnover", 0) or 0) for row in snapshot) < 1.0:
+            clear_batch = getattr(self._engine, "clear_ai_batch_decisions", None)
+            if callable(clear_batch):
+                clear_batch()
             log.info("Сканер: рынок не торгуется (обороты обнулены) - пауза")
             return ("😴 По данным Мосбиржи обороты сейчас нулевые - торгов нет, "
                     "сканер поищет кандидатов после открытия. "
-                    + sessions.session_hint()), [], []
+                    + sessions.session_hint()), [], [], []
         if not liquid:
+            clear_batch = getattr(self._engine, "clear_ai_batch_decisions", None)
+            if callable(clear_batch):
+                clear_batch()
             return ("🔎 Сканер рынка: подходящих бумаг не нашёл "
-                    "(фильтр ликвидности слишком строгий или рынок спит)."), [], []
+                    "(фильтр ликвидности слишком строгий или рынок спит)."), [], [], []
 
-        by_turnover = sorted(liquid, key=lambda r: r["turnover"], reverse=True)
-        fallers = sorted(liquid, key=lambda r: r["day_chg_pct"])[:5]
-        risers = sorted(liquid, key=lambda r: r["day_chg_pct"], reverse=True)[:5]
-
-        pool: List[Dict[str, Any]] = []
-        seen: set[str] = set()
-        for row in by_turnover[:10] + fallers + risers:
+        # Этап 1: дешёвый рейтинг ВСЕХ ликвидных бумаг по одному снимку MOEX.
+        # По нему выбираем небольшой пул свечного анализа; крайние падения
+        # больше не попадают в пул автоматически только потому, что они fallers.
+        pre_ranked: List[Dict[str, Any]] = []
+        for row in liquid:
             ticker = row["ticker"]
-            if ticker in seen or ticker in managed:
+            if ticker in managed:
                 continue
-            seen.add(ticker)
-            pool.append(row)
-            if len(pool) >= cfg.scan_deep_n:
-                break
+            snapshot_rank = rank_market_snapshot(
+                row, min_turnover=cfg.scan_min_turnover * 1_000_000.0)
+            if snapshot_rank <= 0:
+                continue
+            pre_ranked.append({**row, "snapshot_rank": snapshot_rank})
+        pre_ranked.sort(key=lambda r: (r["snapshot_rank"], r["turnover"]), reverse=True)
+        pool = pre_ranked[:cfg.scan_deep_n]
+        log.info("Сканер: быстрый математический фильтр из %d ликвидных бумаг выбрал %d для анализа свечей",
+                 len(liquid), len(pool))
 
-        scored = await self._deep_analyze(pool)
-        scored.sort(key=lambda r: r["score"], reverse=True)
+        scored = await self._deep_analyze(pool, breadth_pct=breadth_pct)
+        scored.sort(key=lambda r: (r.get("rank_score", 0.0), r["score"]), reverse=True)
         top = scored[:cfg.scan_report_top]
+        ai_candidates = select_top_candidates(
+            scored,
+            limit=getattr(cfg, "scan_ai_candidates", 3),
+            min_rank=getattr(cfg, "scan_min_candidate_rank", 48.0),
+            require_spread=self._engine_scalp(),
+            max_spread_pct=getattr(cfg, "scalp_max_spread_pct", 0.10),
+        )
+        # Breadth добавляется в компактный payload для пакетной оценки.
+        for row in ai_candidates:
+            row["market_breadth_pct"] = breadth_pct
+
+        # Один batch-запрос на весь скан: максимум 2-3 кандидата.
+        # Решения сохраняются в движке; он повторно проверит текущие данные,
+        # OHLCV-сетап, ATR, спред, cooldown и риск до любого ордера.
+        set_batch = getattr(self._engine, "set_ai_batch_decisions", None)
+        if callable(set_batch):
+            set_batch({}, ai_candidates)
+        decisions: Dict[str, dict] = {}
+        if cfg.scan_llm and ai_candidates and self._analyst is not None:
+            batch_method = getattr(self._analyst, "analyze_candidates", None)
+            if callable(batch_method):
+                try:
+                    decisions = await batch_method(
+                        ai_candidates, scalp_mode=self._engine_scalp()) or {}
+                except Exception as exc:  # noqa: BLE001 - отказ ИИ = нет автопокупки
+                    log.warning("Сканер: пакетное решение ИИ недоступно (%s)", exc)
+                    decisions = {}
+        if callable(set_batch):
+            set_batch(decisions, ai_candidates)
+        log.info("Сканер: математический рейтинг посчитал %d бумаг; ИИ получил %d кандидата(ов), ответов %d",
+                 len(scored), len(ai_candidates), len(decisions))
 
         # Скальп-режим: лучшие кандидаты автоматически занимают свободные
         # слоты под управлением движка (позиции остаются под охраной).
@@ -282,12 +327,12 @@ class MarketScanner:
             return (scalp_note
                     + "🔎 Сканер рынка: кандидатов на покупку сейчас нет "
                     "(рынок без перекосов или свечей не хватило) - "
-                    "попробую в следующий раз."), [], []
+                    "попробую в следующий раз."), [], [], ai_candidates
 
-        verdicts, advice = await self._ai_verdicts(top)
+        verdicts, advice = self._local_verdicts(top, decisions, ai_candidates)
         text = self._build_report(top, verdicts, scalp_note, advice=advice)
         photos = self._render_photos(top)
-        return text, photos, top
+        return text, photos, top, ai_candidates
 
     async def _maybe_auto_buy(self, top: List[Dict[str, Any]],
                               *, manual: bool = False) -> None:
@@ -354,53 +399,79 @@ class MarketScanner:
             summary = indicators.summarize_generic(
                 closes, price, fast_n=_SCAN_FAST_N, step_h=_SCAN_STEP_H)
             score = indicators.build_score(summary)
+            rank_score = indicators.candidate_rank_score(summary, score, row.get("turnover", 0))
+            atr_getter = getattr(self._client, "get_atr_pct", None)
+            spread_getter = getattr(self._client, "get_spread_pct", None)
+            atr_pct = atr_getter(ticker, 14) if callable(atr_getter) else None
+            spread_pct = spread_getter(ticker) if callable(spread_getter) else None
+            if spread_pct is None:
+                spread_pct = row.get("spread_pct")
+            context_getter = getattr(self._client, "get_entry_context", None)
+            entry_context = context_getter(ticker, 20) if callable(context_getter) else None
+            if atr_pct is not None and atr_pct > 0:
+                summary["atr_pct"] = float(atr_pct)
+            setups, reversal_confirmations = indicators.detect_entry_setups(
+                closes, price, summary, entry_context, _SCAN_FAST_N,
+                scalp_mode=self._engine_scalp(), market_breadth_pct=breadth_pct)
+            # Scalp требует ATR и известный спред: без них нельзя честно
+            # вычислить stop/ожидаемую выгоду.
+            if self._engine_scalp() and (atr_pct is None or atr_pct <= 0
+                                         or spread_pct is None):
+                setups = []
+            snapshot_rank = float(row.get("snapshot_rank", 0.0) or 0.0)
+            final_rank = 0.85 * rank_score + 0.15 * snapshot_rank
             scored.append({**row, "price": price, "score": score,
+                           "rank_score": round(final_rank, 2),
+                           "indicator_rank": rank_score, "atr_pct": atr_pct,
+                           "spread_pct": spread_pct, "entry_context": entry_context,
+                           "allowed_setups": setups,
+                           "reversal_confirmations": reversal_confirmations,
                            "summary": summary, "history": history})
         log.info("Сканер: глубоко проанализировано %d из %d бумаг пула",
                  len(scored), len(pool))
         return scored
 
-    async def _ai_verdicts(self, top: List[Dict[str, Any]]
-                           ) -> Tuple[Dict[str, str], str]:
-        """ИИ-комментарий по кандидатам - ОДНИМ запросом к Groq.
-
-        v1.7.2: возвращает (вердикты, совет). Совет - короткое резюме
-        простыми словами для конца отчёта (что советует покупать и в каких
-        количествах). Старые аналитики (тесты/фолбэк) без нового метода
-        дают только вердикты без совета.
-        """
-        if not (self._cfg.scan_llm and top and self._analyst is not None):
-            return {}, ""
-        rows = []
-        for r in top:
-            s = r["summary"]
-            sma_fast = s.get("sma_fast") or 0.0
-            vs_sma = ((r["price"] / sma_fast - 1.0) * 100.0) if sma_fast else 0.0
-            rows.append({
-                "ticker": r["ticker"],
-                "price": r["price"],
-                "score": r["score"],
-                "rsi": float(s.get("rsi14") or 0.0),
-                "day_chg_pct": r["day_chg_pct"],
-                "vs_sma_pct": vs_sma,
-                "turnover_txt": _fmt_turnover(r["turnover"]),
-            })
-        method = getattr(self._analyst, "scan_verdicts_with_advice", None)
-        if method is not None:
-            try:
-                verdicts, advice = await method(rows)
-                return dict(verdicts or {}), str(advice or "")
-            except Exception as exc:  # noqa: BLE001 - ИИ не обязателен
-                log.info("Сканер: ИИ-комментарии недоступны (%s)", exc)
-                return {}, ""
-        legacy = getattr(self._analyst, "scan_verdicts", None)
-        if legacy is None:
-            return {}, ""
-        try:
-            return dict(await legacy(rows) or {}), ""
-        except Exception as exc:  # noqa: BLE001
-            log.info("Сканер: ИИ-комментарии недоступны (%s)", exc)
-            return {}, ""
+    def _local_verdicts(self, top: List[Dict[str, Any]],
+                        decisions: Dict[str, dict],
+                        ai_candidates: List[Dict[str, Any]]) -> Tuple[Dict[str, str], str]:
+        """Локальные пояснения для отчёта; отдельный LLM-вызов не нужен."""
+        ai_tickers = {row["ticker"] for row in ai_candidates}
+        verdicts: Dict[str, str] = {}
+        buy_tickers: List[str] = []
+        for row in top:
+            ticker = row["ticker"]
+            decision = decisions.get(ticker)
+            if decision:
+                action = str(decision.get("action", "hold")).upper()
+                confidence = float(decision.get("confidence", 0.0))
+                reason = str(decision.get("reason", ""))[:100]
+                verdicts[ticker] = f"ИИ: {action} ({confidence:.0%}) - {reason}"
+                if decision.get("action") == "buy":
+                    buy_tickers.append(ticker)
+                continue
+            summary = row.get("summary") or {}
+            rank = float(row.get("rank_score", 0.0) or 0.0)
+            macd = summary.get("macd") or {}
+            hist = macd.get("histogram")
+            prev = macd.get("histogram_prev")
+            if rank >= 65 and hist is not None and prev is not None and hist >= prev:
+                reason = "математический рейтинг высокий, импульс не ухудшается"
+            elif hist is not None and prev is not None and hist < prev:
+                reason = "импульс ослабевает; автоматический вход не подтверждён"
+            elif summary.get("rsi14") is not None and float(summary["rsi14"]) >= 75:
+                reason = "перекупленность; риск покупки на локальном максимуме"
+            else:
+                reason = "нужен дополнительный сигнал; автоматический вход не подтверждён"
+            verdicts[ticker] = f"Рейтинг {rank:.1f}/100: {reason}"
+        if buy_tickers:
+            advice = "ИИ допустил к дальнейшей кодовой проверке: " + ", ".join(buy_tickers) + "."
+        elif ai_tickers:
+            advice = (f"ИИ пакетно проверил {len(ai_tickers)} лучших кандидата(ов); "
+                      "положительного подтверждения для покупки нет.")
+        else:
+            advice = ("Кандидатов, прошедших математический порог, нет; "
+                      "ИИ-запрос не выполнялся.")
+        return verdicts, advice
 
     # ------------------------------------------------------------------ вывод
     def _build_report(self, top: List[Dict[str, Any]],
@@ -423,7 +494,7 @@ class MarketScanner:
             lines.append(head)
             verdict = verdicts.get(row["ticker"])
             if verdict:
-                lines.append(f"    ИИ: «{verdict}»")
+                lines.append(f"    Оценка: {verdict}")
         best = top[0]
         if best["score"] < 0.15:
             lines.append("Сильных сигналов на рынке сейчас нет - "
@@ -431,7 +502,7 @@ class MarketScanner:
         lines.append("")
         # v1.7.2: короткий совет ИИ простыми словами - в КОНЦЕ списка.
         if advice:
-            lines.append(f"🤖 Совет ИИ простыми словами: {advice}")
+            lines.append(f"🧮 Итог отбора: {advice}")
             lines.append("")
         if scalp_note:
             lines.append(scalp_note.strip())
@@ -443,7 +514,7 @@ class MarketScanner:
             lines.append(f"🤖 Автопокупка вкл: до "
                          f"{getattr(self._cfg, 'scan_auto_buy_per_scan', 1)} "
                          f"лучш(его/их) кандидата(ов) могу купить сам - только "
-                         f"если сигнал, новости, ИИ и лимиты все за "
+                         f"если математические фильтры, пакетный вердикт ИИ и лимиты все за "
                          f"(/autobuy off - выключить).")
         return "\n".join(lines)
 

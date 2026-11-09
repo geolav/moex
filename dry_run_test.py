@@ -1,5 +1,5 @@
 """
-dry_run_test.py - самопроверка всего бота v1.8.0 на МАКЕТАХ без сети и токенов.
+dry_run_test.py - самопроверка всего бота v1.8.1 на МАКЕТАХ без сети и токенов.
 
 Проверяет ключевую логику ДО выхода на реальные деньги:
   1. торговый движок: сигнал + сентимент + LLM 'buy' -> покупка;
@@ -8,7 +8,7 @@ dry_run_test.py - самопроверка всего бота v1.8.0 на МА�
   4. вердикт LLM 'hold' -> покупка отложена, админу уходит объяснение
      (не чаще раза в 30 минут на тикер);
   5. активность: таймфреймы, пороги, кулдаун, лимиты, TTL кэша LLM;
- 11. новая проверка OHLCV-setups и риск-логика v1.8.0;
+ 11. новая проверка OHLCV-setups и риск-логика v1.8.1;
   6. индикаторы на любом таймфрейме + адаптивная оценка отката;
   7. ai_analyst: пустой content (gpt-oss) -> ретрай с большим лимитом ->
      финальный ответ; parse_decision_json;
@@ -36,11 +36,13 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
 
 import config  # noqa: F401  - проверяем, что модуль импортируется без ошибок
-from ai_analyst import AIAnalyst, parse_decision_json  # noqa: E402
-from ai_auditor import AIAuditor, tail_lines  # noqa: E402
+from ai_analyst import AIAnalyst, DailyTokenBudget, parse_decision_json  # noqa: E402
+from ai_auditor import AIAuditor, local_audit, tail_lines  # noqa: E402
 from cleanup import run_cleanup  # noqa: E402
 from config import BotConfig, StateStore  # noqa: E402
 import indicators  # noqa: E402
+from candidate_selector import rank_candidate, rank_market_snapshot, select_top_candidates  # noqa: E402
+from news_filter import classify_headlines  # noqa: E402
 from trading_engine import TradingEngine  # noqa: E402
 from trade_memory import TradeMemory  # noqa: E402
 import sessions  # noqa: E402
@@ -65,7 +67,7 @@ def make_test_config(tmp: str) -> BotConfig:
         groq_api_key="test-groq", telegram_bot_token="123:test",
         telegram_admin_id=42,
         use_sandbox=True, trading_enabled_default=True,
-        auditor_enabled_default=True,
+        auditor_enabled_default=True, auditor_llm_enabled=False,
         trading_tickers=("SBER", "GAZP"),
         sma_period=24, poll_interval_sec=60,
         max_position_pct=10.0, stop_loss_pct=3.0, take_profit_pct=5.0,
@@ -86,13 +88,14 @@ def make_test_config(tmp: str) -> BotConfig:
         # None вместо числа ломал вход: None > 0 в анти-погоне и др.)
         surge_sense_from_pct=3.0, chase_guard_pct=0.0, chase_bounce_pct=0.0,
         morning_anchor_until=13,
-        scalp_max_positions=4, scalp_poll_sec=300, scalp_exit_poll_sec=60,
+        scalp_max_positions=8, scalp_poll_sec=300, scalp_exit_poll_sec=60,
         scalp_cooldown_min=20,
         scalp_harvest_tiers=((5.0, 0.15), (3.0, 0.25), (2.0, 0.4)),
         scalp_stop_loss_pct=1.0, scalp_take_profit_pct=2.0,
         scalp_trailing_activate_pct=1.0, scalp_trailing_drop_pct=0.5,
         scalp_surge_from_pct=1.5,
-        scalp_max_entries_per_day=8, scalp_risk_per_trade_pct=0.3,
+        scalp_max_entries_per_day=40, scalp_risk_per_trade_pct=0.05,
+        scalp_max_portfolio_risk_pct=0.40,
         scalp_daily_loss_limit_pct=1.0, scalp_max_position_pct=15.0,
         scalp_min_stop_pct=0.6, scalp_atr_multiplier=1.2,
         scalp_max_stop_pct=1.0, scalp_max_spread_pct=0.1,
@@ -102,12 +105,18 @@ def make_test_config(tmp: str) -> BotConfig:
         scalp_max_sector_positions=2,
         scan_enabled=False, scan_interval_min=10, scan_min_turnover=50.0,
         scan_min_price=5.0, scan_deep_n=20, scan_report_top=6, scan_llm=False,
+        scan_ai_candidates=3, scan_min_candidate_rank=48.0,
+        ai_batch_decision_ttl_sec=900, ai_min_request_interval_sec=600,
+        ai_batch_required=False,
+        groq_daily_token_budget=120000,
+        scan_auto_buy=False, scan_auto_buy_per_scan=2,
         rate_limit_rpm=90,
         news_rss_urls=("https://example.invalid/rss",), http_timeout_sec=5,
         sandbox_start_balance=100000.0, cleanup_keep_days=14,
         cleanup_max_logs_mb=20, log_level="INFO",
         base_dir=tmp, logs_dir=os.path.join(tmp, "logs"),
         state_file=os.path.join(tmp, "state.json"),
+        data_dir=os.path.join(tmp, "data"),
     )
     os.makedirs(values["logs_dir"], exist_ok=True)
     return BotConfig(**values)
@@ -219,7 +228,7 @@ class FakeAnalyst:
 
 async def main() -> int:
     print("=" * 64)
-    print("DRY-RUN самопроверка MOEX Trading Bot v1.8.0 (моки, без сети)")
+    print("DRY-RUN самопроверка MOEX Trading Bot v1.8.1 (моки, без сети)")
     print("=" * 64)
 
     tmp = tempfile.mkdtemp(prefix="bot_dryrun_")
@@ -236,6 +245,17 @@ async def main() -> int:
     engine = TradingEngine(cfg, state, client, analyst, notify)
     # Явный risk-on нужен для проверки полной позиции (neutral режет размер вдвое).
     engine.set_market_context({"breadth_pct": 60.0, "symbols": 80})
+
+    # Локальный план стопа/цели: пакетный Groq не тратит токены на sizing.
+    local_plan = engine._standard_trade_plan({"atr_pct": 0.30})
+    check("обычный стоп/TP рассчитываются локально по ATR и net R:R",
+          local_plan is not None and local_plan[0] > 0
+          and local_plan[1] > 2 * local_plan[0]
+          and (local_plan[1] - cfg.estimated_round_trip_cost_pct)
+              >= 2 * (local_plan[0] + cfg.estimated_round_trip_cost_pct) - 1e-9,
+          f"plan={local_plan}")
+    check("без ATR локальный план не выдумывается",
+          engine._standard_trade_plan({}) is None)
 
     # --- Тест 1: активность 50, сигнал + сентимент + LLM 'buy' -> покупка ----
     print("\n[1] Активность 50: подтверждённый reversal по OHLCV, LLM 'buy' -> ПОКУПКА")
@@ -357,16 +377,16 @@ async def main() -> int:
           indicators.summarize(closes5, 250.0).get("sma24") == s_hour.get("sma_fast"))
 
     # --- Тест 7: ai_analyst - пустой content -> ретрай с бОльшим лимитом ------
-    print("\n[7] Groq вернул пустой content (gpt-oss) -> ретрай -> ответ")
+    print("\n[7] Groq вернул пустой content -> запрос не повторяется и экономит токены")
     from ai_analyst import AnalystError  # noqa: E402
 
     class FakeCompletions:
         def __init__(self, parent: "FakeGroqClient") -> None:
             self.parent = parent
 
-        async def create(self, model, messages, temperature, max_tokens, **extra):
+        async def create(self, model, messages, temperature, max_completion_tokens, **extra):
             self.parent.calls += 1
-            self.parent.max_tokens_seen.append(max_tokens)
+            self.parent.max_tokens_seen.append(max_completion_tokens)
             self.parent.extra = extra
             if self.parent.calls <= self.parent.empty_times:
                 return SimpleNamespace(choices=[SimpleNamespace(
@@ -390,27 +410,33 @@ async def main() -> int:
 
     a_cfg = SimpleNamespace(groq_api_key="k",
                             groq_model="openai/gpt-oss-20b",
-                            http_timeout_sec=10)
+                            http_timeout_sec=10,
+                            data_dir=os.path.join(tmp, "ai_data"),
+                            groq_daily_token_budget=120000,
+                            ai_min_request_interval_sec=600,
+                            ai_batch_decision_ttl_sec=900)
     a = AIAnalyst(a_cfg)
     a._client = FakeGroqClient(empty_times=1)
-    answer = await a.answer_question("почему не покупал GAZP?", "сводка")
+    empty_failed = False
+    try:
+        await a.answer_question("почему не покупал GAZP?", "сводка")
+    except AnalystError:
+        empty_failed = True
     fake = a._client
-    check("после пустого content ответ получен", answer == "Ответ готов", answer)
-    check("было 2 попытки", fake.calls == 2, f"calls={fake.calls}")
-    check("лимит токенов вырос на ретрае",
-          len(fake.max_tokens_seen) == 2 and fake.max_tokens_seen[1]
-          > fake.max_tokens_seen[0], str(fake.max_tokens_seen))
-    check("для gpt-oss передан reasoning_effort=low",
-          fake.extra.get("reasoning_effort") == "low", str(fake.extra))
+    check("пустой content безопасно отклонён", empty_failed)
+    check("пустой ответ не запускает повторный дорогой запрос", fake.calls == 1, f"calls={fake.calls}")
+    check("для gpt-oss включён low reasoning и отключён вывод reasoning",
+          fake.extra.get("reasoning_effort") == "low"
+          and fake.extra.get("include_reasoning") is False, str(fake.extra))
+    check("используется актуальный max_completion_tokens",
+          fake.max_tokens_seen == [450], str(fake.max_tokens_seen))
 
-    # Пустой content дважды не должен подменяться reasoning; третий ответ читается. 
     a2 = AIAnalyst(a_cfg)
-    a2._client = FakeGroqClient(empty_times=2)
+    a2._client = FakeGroqClient(empty_times=1)
     sentiment = await a2.analyze_sentiment("SBER отчитался о росте прибыли")
-    check("после двух пустых content модель получила третий шанс",
-          a2._client.calls == 3, f"calls={a2._client.calls}")
     check("пустой content не трактуется как позитивный сентимент",
-          sentiment == 0.0, f"sentiment={sentiment}")
+          sentiment == 0.0 and a2._client.calls == 1,
+          f"sentiment={sentiment}, calls={a2._client.calls}")
 
     # parse_decision_json: JSON в ```-обёртке и строгие поля BUY.
     valid_buy_json = (
@@ -443,9 +469,10 @@ async def main() -> int:
 
     auditor = AIAuditor(cfg, state, analyst, send)
     verdict = await auditor.run_once(force=True)
-    check("аудитор получил вердикт 'Все ОК'", verdict == "Все ОК")
-    check("вердикт отправлен в Telegram", any("Все ОК" in s for s in sent))
-    check("вердикт сохранён в состоянии", state.last_audit_result == "Все ОК")
+    check("аудитор по умолчанию использует локальную проверку без Groq",
+          verdict is not None and verdict.startswith("Локальный аудит"))
+    check("локальный вердикт отправлен в Telegram", any("Локальный аудит" in s for s in sent))
+    check("локальный вердикт сохранён в состоянии", state.last_audit_result == verdict)
 
     # --- Тест 9: очистка логов -------------------------------------------------
     print("\n[9] Очистка: старый ротированный лог удаляется")
@@ -615,6 +642,135 @@ async def main() -> int:
     ten_msk = datetime(2026, 11, 9, 10, 5, tzinfo=sessions.MSK).timestamp()
     check("плохие часы входа также вычисляются по времени Москвы",
           "10:00" in (journal.bad_hour_reason("GAZP", now=ten_msk) or ""))
+
+    # --- Тест 17: ранжирование кандидатов без ИИ -----------------------------
+    print("\n[17] Математический селектор: ранжирование и top-3")
+    strong_summary = {
+        "price": 101.0, "sma_fast": 100.0, "sma_slow": 99.0,
+        "rsi14": 55.0, "volatility": 0.4,
+        "macd": {"histogram": 0.12, "histogram_prev": 0.08},
+        "bollinger": {"pct_b": 0.60},
+    }
+    weak_summary = {
+        "price": 95.0, "sma_fast": 100.0, "sma_slow": 102.0,
+        "rsi14": 22.0, "volatility": 2.8,
+        "macd": {"histogram": -0.3, "histogram_prev": -0.1},
+        "bollinger": {"pct_b": 0.05},
+    }
+    candidates = [
+        {"ticker": "A", "summary": strong_summary, "score": 0.5, "turnover": 2e9, "allowed_setups": ["breakout"]},
+        {"ticker": "B", "summary": weak_summary, "score": 0.8, "turnover": 1e9, "allowed_setups": ["reversal"]},
+        {"ticker": "C", "summary": strong_summary, "score": 0.4, "turnover": 9e8, "allowed_setups": ["pullback"]},
+        {"ticker": "D", "summary": strong_summary, "score": 0.3, "turnover": 8e8, "allowed_setups": ["breakout"]},
+    ]
+    for row in candidates:
+        row["rank_score"] = rank_candidate(row)
+    selected = select_top_candidates(candidates, limit=3, min_rank=48.0)
+    check("ускоряющееся падение получает штраф даже при высоком старом score",
+          candidates[1]["rank_score"] < candidates[0]["rank_score"])
+    check("ИИ shortlist допускает только техсетапы, подтверждённые движком",
+          AIAnalyst._parse_candidate_batch(
+              '{"decisions":{"SBER":{"action":"buy","confidence":0.9,"setup":"reversal","reason":"x"}}}',
+              {"SBER": {"breakout"}}
+          )["SBER"]["action"] == "hold")
+    check("математический отбор ограничен тремя кандидатами",
+          len(selected) == 3 and selected[0]["ticker"] == "A")
+    snapshot_good = rank_market_snapshot({"price": 100, "turnover": 2e9,
+                                          "day_chg_pct": 1.2, "spread_pct": 0.04})
+    snapshot_bad = rank_market_snapshot({"price": 100, "turnover": 2e9,
+                                         "day_chg_pct": -8.0, "spread_pct": 0.25})
+    check("первый проход по всему MOEX отсекает широкий спред и экстремальные движения",
+          snapshot_good > 0 and snapshot_bad == 0,
+          f"good={snapshot_good:.1f}, bad={snapshot_bad:.1f}")
+
+    # --- Тест 18: локальная фильтрация новостей -------------------------------
+    print("\n[18] Новостной фильтр работает локально, без Groq")
+    negative_score, negative_reasons = classify_headlines([
+        "Компания сообщила о судебном иске и возможных санкционных ограничениях"
+    ])
+    neutral_score, neutral_reasons = classify_headlines(["Компания раскрыла операционные результаты за месяц"])
+    check("негативное корпоративное событие даёт блокирующий score",
+          negative_score <= -0.3 and bool(negative_reasons))
+    check("нейтральная новость не создаёт искусственный bullish-score",
+          neutral_score == 0.0 and not neutral_reasons)
+    local_report = local_audit("ERROR Groq 429 tokens per day\nстоп-лосс SBER")
+    check("локальный аудит распознаёт RateLimit и не требует вызова модели",
+          "Groq TPD/rate limit" in local_report and "ошибки/исключения" in local_report)
+
+    # --- Тест 19: лимит 8 позиций и общий риск --------------------------------
+    print("\n[19] Скальп: 8 слотов, общий риск портфеля ограничен")
+    risk_state = StateStore(os.path.join(tmp, "risk_state.json"),
+                            initial_overrides={"trading_enabled": True})
+    risk_state.set_scalp_mode(True)
+    risk_client = FakeClient()
+    risk_engine = TradingEngine(cfg, risk_state, risk_client, FakeAnalyst(), notify)
+    check("лимит скальп-watchlist равен 8", risk_engine.max_tickers() == 8)
+    check("дневной лимит скальпа позволяет 40 входов", risk_engine._max_buys_today() == 40)
+    risk_state.set_position("SBER", {
+        "lots": 1, "entry_price": 100.0, "scalp_risk_pct": 1.0,
+        "scalp_managed": True,
+    })
+    # 1 lot = 10 shares, 1000 RUB notional, 1% stop = 10 RUB risk.
+    open_risk = risk_engine._open_scalp_risk_pct(100000.0)
+    check("открытый риск рассчитывается по размеру и стоп-дистанции",
+          abs(open_risk - 0.01) < 1e-8, f"open_risk={open_risk:.4f}%")
+
+    # --- Тест 20: persistent Groq daily token budget --------------------------
+    print("\n[20] Groq token budget: резерв, учёт и дневной лимит")
+    async def budget_test() -> tuple[bool, bool, dict]:
+        budget = DailyTokenBudget(os.path.join(tmp, "data", "groq_usage_test.json"), 1000)
+        ok, _ = await budget.reserve(700)
+        blocked, _ = await budget.reserve(400)
+        await budget.settle(700, 650, "test-model")
+        status = budget.status()
+        return ok, not blocked, status
+    budget_ok, budget_blocked, budget_status = await budget_test()
+    check("резерв помещается в бюджет, второй запрос сверх бюджета отклонён",
+          budget_ok and budget_blocked)
+    check("фактический usage сохраняется и освобождает разницу резерва",
+          budget_status["used_tokens"] == 650
+          and budget_status["remaining_tokens"] == 350)
+    async def interrupted_reservation_test() -> int:
+        path = os.path.join(tmp, "data", "groq_interrupted.json")
+        first = DailyTokenBudget(path, 1000)
+        await first.reserve(300)
+        restarted = DailyTokenBudget(path, 1000)
+        return restarted.status()["used_tokens"]
+    interrupted_used = await interrupted_reservation_test()
+    check("незавершённый резерв Groq не обнуляется при рестарте",
+          interrupted_used == 300, f"used={interrupted_used}")
+    batch_analyst = AIAnalyst(a_cfg)
+    batch_calls = 0
+    async def fake_batch_chat(system: str, user: str, *, max_tokens: int,
+                              temperature: float, tries: int = 2, response_format=None) -> str:
+        nonlocal batch_calls
+        batch_calls += 1
+        return ('{"decisions":{"SBER":{"action":"buy","confidence":0.8,'
+                '"setup":"breakout","reason":"пробой подтверждён"}}}')
+    batch_kwargs: list[dict] = []
+    async def capture_batch_chat(system: str, user: str, *, max_tokens: int,
+                                  temperature: float, tries: int = 2,
+                                  response_format=None) -> str:
+        batch_kwargs.append({"max_tokens": max_tokens, "response_format": response_format,
+                             "temperature": temperature, "tries": tries})
+        return await fake_batch_chat(system, user, max_tokens=max_tokens,
+                                     temperature=temperature, tries=tries,
+                                     response_format=response_format)
+    batch_analyst._chat = capture_batch_chat  # type: ignore[method-assign]
+    batch_row = {"ticker": "SBER", "price": 100.0, "rank_score": 80.0,
+                 "score": 0.5, "turnover": 1e9, "atr_pct": 0.3,
+                 "spread_pct": 0.04, "allowed_setups": ["breakout"],
+                 "summary": {"rsi14": 55, "macd": {"histogram": 0.1, "histogram_prev": 0.08}},
+                 "entry_context": {"volume_ratio": 1.7}}
+    first_decisions = await batch_analyst.analyze_candidates([batch_row], scalp_mode=True)
+    second_decisions = await batch_analyst.analyze_candidates([batch_row], scalp_mode=True)
+    check("пакетный анализ вызывает модель один раз и блокирует частые /scan",
+          batch_calls == 1 and first_decisions.get("SBER", {}).get("action") == "buy"
+          and second_decisions == {})
+    check("пакетный ответ ограничен 280 completion-токенами и JSON mode",
+          batch_kwargs and batch_kwargs[0]["max_tokens"] == 280
+          and batch_kwargs[0]["response_format"] == {"type": "json_object"},
+          str(batch_kwargs))
 
     print("\n" + "=" * 64)
     print(f"ИТОГО: пройдено {len(PASSED)}, провалено {len(FAILED)}")

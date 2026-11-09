@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from datetime import datetime
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
@@ -62,6 +63,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 import indicators
 import predictor
 import sessions
+from news_filter import classify_headlines
 
 log = logging.getLogger("engine")
 
@@ -152,6 +154,10 @@ class TradingEngine:
         # между ними - быстрая охрана позиций каждые SCALP_EXIT_POLL_SEC.
         self._last_full_cycle = 0.0
         self._market_context: Dict[str, Any] = {}
+        # Пакетный ИИ-вердикт на 2-3 математически лучших кандидата за скан.
+        # Для автопокупок прямые индивидуальные LLM-вызовы не используются.
+        self._ai_batch_candidates: Dict[str, Dict[str, Any]] = {}
+        self._ai_batch_shortlist: set[str] = set()
 
     # -------------------------------------------------------------- жизненный цикл
     def request_stop(self) -> None:
@@ -308,6 +314,32 @@ class TradingEngine:
         self._market_context = dict(context or {})
         self._market_context["received_ts"] = time.time()
 
+    def set_ai_batch_decisions(self, decisions: Dict[str, dict],
+                               candidate_rows: List[Dict[str, Any]]) -> None:
+        """Сохраняет пакетный ответ ИИ и метаданные 2-3 отобранных кандидатов."""
+        now = time.monotonic()
+        batch: Dict[str, Dict[str, Any]] = {}
+        for row in candidate_rows or []:
+            ticker = str(row.get("ticker", "")).upper()
+            if not ticker:
+                continue
+            batch[ticker] = {
+                "ts": now,
+                "price": float(row.get("price") or 0.0),
+                "rank_score": float(row.get("rank_score") or 0.0),
+                "decision": (decisions or {}).get(ticker),
+            }
+        self._ai_batch_candidates = batch
+        self._ai_batch_shortlist = set(batch)
+        log.info("Пакет ИИ обновлён: shortlist=%s; валидных вердиктов=%d",
+                 ", ".join(sorted(batch)) or "пуст", sum(
+                     1 for item in batch.values() if item.get("decision")))
+
+    def clear_ai_batch_decisions(self) -> None:
+        """Сбрасывает старый пул, например перед ручным/автоматическим сканом."""
+        self._ai_batch_candidates = {}
+        self._ai_batch_shortlist = set()
+
     def _sector(self, ticker: str) -> str:
         """Грубая корзина для ограничения коррелированных скальп-позиций."""
         groups = {
@@ -400,15 +432,14 @@ class TradingEngine:
         # 2..~32 в зависимости от агрессивности и активности, но не больше env-потолка.
         # Скальп: сделки мелкие и частые - потолок выше, но env всё равно главнее.
         if self.scalp_mode():
-            return min(self._cfg.max_buys_per_day,
-                       self._cfg.scalp_max_entries_per_day)
+            return self._cfg.scalp_max_entries_per_day
         return min(self._cfg.max_buys_per_day,
                    2 + self._state.aggressiveness() // 5 + self._activity() // 10)
 
     def _llm_ttl_sec(self) -> float:
         # Кэш вердикта трейдера: 30 мин в спокойном режиме, 10 мин в активном -
         # ИИ пересматривает рынок и открытые позиции по свежим данным.
-        # Скальп: не менее 15 мин на тикер, иначе 10 бумаг съедят квоту Groq.
+        # В актуальной схеме автоторговля использует один пакетный запрос на скан, а не отдельный вызов на тикер.
         ttl = max(600.0, _LLM_CACHE_TTL_SEC - self._activity() * 12.0)
         if self.scalp_mode():
             ttl = max(ttl, 900.0)
@@ -492,7 +523,7 @@ class TradingEngine:
         return list(self._cfg.trading_tickers)
 
     def max_tickers(self) -> int:
-        """Лимит бумаг под управлением: в скальп-режиме максимум 4."""
+        """Лимит бумаг под управлением: в скальп-режиме до 8."""
         if self.scalp_mode():
             return int(getattr(self._cfg, "scalp_max_positions", 10) or 10)
         return int(getattr(self._cfg, "max_tickers", 6) or 6)
@@ -598,7 +629,7 @@ class TradingEngine:
         обходит именно watchlist). Список полон - кандидат пропускается:
         его всегда можно купить кнопкой или /watch вручную.
 
-        Лимит за один вызов - SCAN_AUTO_BUY_PER_SCAN (по умолчанию 1):
+        Лимит за один вызов - SCAN_AUTO_BUY_PER_SCAN (по умолчанию 2):
         сканер раз в 10 минут, так что это 'иногда сам что-то покупает',
         а не скупает весь рынок.
 
@@ -647,7 +678,52 @@ class TradingEngine:
         return bought
 
     # ------------------------------------------------------------------- вход
+    def _standard_trade_plan(self, summary: Dict[str, Any]) -> Optional[Tuple[float, float]]:
+        """Рассчитывает стоп и цель обычной сделки локально по ATR и издержкам.
+
+        LLM выбирает направление/сетап, но не определяет размер риска и
+        уровни защиты. Для net R:R >= 2 требуется TP >= 2*stop + 3*cost,
+        где cost — оценка полного оборота в процентах.
+        """
+        try:
+            atr_pct = float(summary.get("atr_pct") or 0.0)
+            cost_pct = max(0.0, float(self._cfg.estimated_round_trip_cost_pct))
+            max_stop = min(
+                float(self._cfg.stop_loss_pct),
+                (float(self._cfg.take_profit_pct) - 3.0 * cost_pct) / 2.0,
+            )
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(atr_pct) or atr_pct <= 0 or max_stop < 0.60:
+            return None
+        # ATR-множитель 1.5 — базовый локальный план; минимальный стоп 0.6%,
+        # верхняя граница определяется конфигурацией и достижимым net R:R.
+        stop_pct = min(max_stop, max(0.60, 1.5 * atr_pct))
+        target_pct = min(float(self._cfg.take_profit_pct),
+                         2.0 * stop_pct + 3.0 * cost_pct)
+        if (not math.isfinite(target_pct) or target_pct <= 0
+                or (target_pct - cost_pct) < 2.0 * (stop_pct + cost_pct) - 1e-9):
+            return None
+        return round(stop_pct, 4), round(target_pct, 4)
+
     async def _evaluate_entry(self, ticker: str, price: float) -> None:
+        # Для автоматических входов LLM доступен только пакетно: не более 2-3
+        # лучших кандидатов по математическому рейтингу за один цикл сканера.
+        if getattr(self._cfg, "ai_batch_required", True):
+            if ticker not in self._ai_batch_shortlist:
+                log.debug("%s: не попал в математический shortlist ИИ - пропуск", ticker)
+                return
+            batch_item = self._ai_batch_candidates.get(ticker) or {}
+            age = time.monotonic() - float(batch_item.get("ts", 0.0) or 0.0)
+            if age > self._cfg.ai_batch_decision_ttl_sec:
+                log.info("%s: пакетный вердикт ИИ устарел (%.0f сек) - жду нового скана",
+                         ticker, age)
+                return
+            scanned_price = float(batch_item.get("price") or 0.0)
+            if scanned_price <= 0 or abs(price / scanned_price - 1.0) > 0.0035:
+                log.info("%s: цена ушла более чем на 0.35%% от пакетного решения - требуется новый скан",
+                         ticker)
+                return
         # Строгие скальп-фильтры исполняются ДО ИИ и не могут быть переопределены.
         if self.scalp_mode():
             if not sessions.is_scalp_entry_time():
@@ -810,58 +886,19 @@ class TradingEngine:
             log.info("%s: вход заблокирован: RSI %.1f без подтверждения разворота",
                      ticker, rsi_value)
             return
-        # Детерминированная проверка сетапа. ИИ не может самостоятельно
-        # объявить сетап подтверждённым, если структура/объём этого не показывают.
-        allowed_setups: List[str] = []
-        entry_features_ok = bool(entry_context and
-                                 entry_context.get("volume_ratio") is not None)
-        if entry_features_ok:
-            volume_ratio = float(entry_context["volume_ratio"])
-            sma_fast = summary.get("sma_fast")
-            sma_slow = summary.get("sma_slow")
-            previous_fast = indicators.sma(closes[:-fast_n], fast_n) if len(closes) >= 2 * fast_n else None
-            macd_ok = (hist is not None and hist_prev is not None and hist >= hist_prev)
-            trend_ok = bool(sma_fast and sma_slow and previous_fast
-                            and price > float(sma_slow)
-                            and float(sma_fast) >= float(sma_slow)
-                            and float(sma_fast) > float(previous_fast)
-                            and macd_ok)
-            if trend_ok and bool(entry_context.get("pullback_volume_fade")):
-                allowed_setups.append("pullback")
-
-            last_closed = float(entry_context.get("last_close") or 0)
-            extension_pct = ((price / last_closed - 1.0) * 100.0
-                             if last_closed > 0 else float("inf"))
-            atr_for_setup = float(summary.get("atr_pct") or 0.0)
-            if (bool(entry_context.get("close_above_prev_high"))
-                    and volume_ratio >= 1.5 and atr_for_setup > 0
-                    and 0 <= extension_pct <= 0.8 * atr_for_setup):
-                allowed_setups.append("breakout")
-
-            rsi_previous = indicators.rsi(closes[:-1], 14) if len(closes) > 15 else None
-            rsi_current = summary.get("rsi14")
-            reversal_checks = [
-                bool(entry_context.get("close_above_prev_high")),
-                bool(entry_context.get("higher_low")),
-                bool(rsi_previous is not None and rsi_current is not None
-                     and rsi_previous < 35 and rsi_current > rsi_previous),
-                volume_ratio >= 1.3,
-            ]
-            reversal_min = 3 if self.scalp_mode() else 2
-            market_breadth = (self._market_context or {}).get("breadth_pct")
-            reversal_market_ok = (not self.scalp_mode()
-                                  or (market_breadth is not None
-                                      and float(market_breadth) > 55.0))
-            if sum(reversal_checks) >= reversal_min and reversal_market_ok:
-                allowed_setups.append("reversal")
+        # Сканер и движок используют одну формулу определения сетапа,
+        # чтобы shortlist ИИ не расходился с финальной проверкой входа.
+        market_breadth = (self._market_context or {}).get("breadth_pct")
+        allowed_setups, reversal_confirmations = indicators.detect_entry_setups(
+            closes, price, summary, entry_context, fast_n,
+            scalp_mode=self.scalp_mode(), market_breadth_pct=market_breadth)
         if not allowed_setups:
             log.info("%s: нет подтверждённого OHLCV-сетапа pullback/breakout/reversal; HOLD",
                      ticker)
             return
         summary["allowed_setups"] = allowed_setups
         if entry_context:
-            summary["reversal_confirmations"] = sum(reversal_checks)
-
+            summary["reversal_confirmations"] = reversal_confirmations
         # Режим рынка: при слабой ширине рынка новые лонги запрещены.
         context = self._market_context
         if context and time.time() - float(context.get("received_ts", 0)) <= 900:
@@ -961,22 +998,35 @@ class TradingEngine:
             return
 
         if not self.scalp_mode():
-            # План сделки ИИ не остаётся декоративным полем: код проверяет
-            # R:R и лимиты конфигурации, затем сохраняет уровни в позиции.
+            # Уровни защиты рассчитывает код. Сохраняем совместимость с
+            # отдельными legacy-ответами LLM, если они содержат полный план,
+            # но пакетный анализатор намеренно не тратит токены на sizing.
             ai_stop = float(decision.get("stop_pct") or 0.0)
             ai_target = float(decision.get("tp1_pct") or 0.0)
-            if (ai_stop <= 0 or ai_target < 2.0 * ai_stop
-                    or ai_stop > self._cfg.stop_loss_pct
-                    or ai_target > self._cfg.take_profit_pct):
-                log.info("%s: план ИИ не проходит R:R/лимиты (stop=%.2f%%, TP=%.2f%%); HOLD",
-                         ticker, ai_stop, ai_target)
-                await self._notify_skip(
-                    ticker, score,
-                    f"план сделки не проходит фильтр: стоп {ai_stop:.2f}%, "
-                    f"цель {ai_target:.2f}%, требуется R:R ≥ 2 и лимиты "
-                    f"стоп ≤ {self._cfg.stop_loss_pct:.2f}% / цель "
-                    f"≤ {self._cfg.take_profit_pct:.2f}%.")
-                return
+            if ai_stop > 0 and ai_target > 0:
+                if (ai_target < 2.0 * ai_stop
+                        or ai_stop > self._cfg.stop_loss_pct
+                        or ai_target > self._cfg.take_profit_pct):
+                    log.info("%s: legacy-план LLM не проходит R:R/лимиты (stop=%.2f%%, TP=%.2f%%); HOLD",
+                             ticker, ai_stop, ai_target)
+                    await self._notify_skip(
+                        ticker, score,
+                        f"план сделки не проходит фильтр: стоп {ai_stop:.2f}%, "
+                        f"цель {ai_target:.2f}%, требуется R:R ≥ 2 и лимиты "
+                        f"стоп ≤ {self._cfg.stop_loss_pct:.2f}% / цель "
+                        f"≤ {self._cfg.take_profit_pct:.2f}%.")
+                    return
+            else:
+                local_plan = self._standard_trade_plan(summary)
+                if local_plan is None:
+                    log.info("%s: нет корректного ATR-плана для обычной сделки; HOLD", ticker)
+                    await self._notify_skip(
+                        ticker, score,
+                        "не удалось локально рассчитать стоп/цель по ATR с net R:R ≥ 2; HOLD.")
+                    return
+                decision["stop_pct"], decision["tp1_pct"] = local_plan
+                log.info("%s: локальный ATR-план: стоп %.2f%%, цель %.2f%% (net R:R≥2)",
+                         ticker, *local_plan)
 
         # Рынок без подтверждённого risk-on трактуем как neutral: размер
         # позиции уменьшается вдвое вне зависимости от пожелания LLM.
@@ -1045,6 +1095,23 @@ class TradingEngine:
             await self._buy_locked(ticker, price, sentiment, summary, score,
                                    decision, morning_ctx=morning_ctx)
 
+    def _open_scalp_risk_pct(self, equity: float) -> float:
+        """Суммарный риск открытых позиций до их стоп-уровней, в % equity."""
+        if equity <= 0:
+            return 100.0
+        risk_rub = 0.0
+        for ticker, position in self._state.positions.items():
+            lots = int(position.get("lots", 0) or 0)
+            entry = float(position.get("entry_price", 0) or 0.0)
+            if lots <= 0 or entry <= 0:
+                continue
+            lot_size = self._client.get_lot_size(ticker) or 1
+            stop_pct = float(position.get("scalp_risk_pct")
+                              or position.get("stop_loss_pct")
+                              or self._cfg.scalp_max_stop_pct)
+            risk_rub += lots * lot_size * entry * max(0.0, stop_pct) / 100.0
+        return risk_rub / equity * 100.0
+
     async def _buy_locked(self, ticker: str, price: float, sentiment: float,
                           summary: Dict[str, Optional[float]], score: float,
                           decision: dict,
@@ -1096,7 +1163,7 @@ class TradingEngine:
                     >= self._cfg.scalp_max_sector_positions:
                 return
 
-        invested_cap_pct = min(float(self._state.max_invested_pct()), 50.0) \
+        invested_cap_pct = min(float(self._state.max_invested_pct()), 70.0) \
             if self.scalp_mode() else float(self._state.max_invested_pct())
         room = total_money * invested_cap_pct / 100.0 - invested
         budget = min(cash, max(room, 0.0))
@@ -1109,7 +1176,16 @@ class TradingEngine:
             if not (0 < scalp_stop_pct <= self._cfg.scalp_max_stop_pct):
                 log.warning("%s: нет корректного ATR-стопа; покупку запрещаю", ticker)
                 return
-            risk_budget = total_money * self._cfg.scalp_risk_per_trade_pct / 100.0
+            open_risk_pct = self._open_scalp_risk_pct(total_money)
+            remaining_risk_pct = max(
+                0.0, self._cfg.scalp_max_portfolio_risk_pct - open_risk_pct)
+            trade_risk_pct = min(self._cfg.scalp_risk_per_trade_pct,
+                                 remaining_risk_pct)
+            if trade_risk_pct <= 0:
+                log.info("%s: суммарный риск скальп-портфеля %.3f%% достиг лимита %.3f%%",
+                         ticker, open_risk_pct, self._cfg.scalp_max_portfolio_risk_pct)
+                return
+            risk_budget = total_money * trade_risk_pct / 100.0
             risk_sized_notional = risk_budget / (scalp_stop_pct / 100.0)
             max_position = total_money * self._cfg.scalp_max_position_pct / 100.0
             budget = min(budget, risk_sized_notional, max_position)
@@ -1156,6 +1232,7 @@ class TradingEngine:
             pos_data.update({
                 "scalp_managed": True,
                 "scalp_risk_pct": scalp_stop_pct,
+                "scalp_risk_budget_pct": trade_risk_pct,
                 "scalp_atr_pct": float(summary.get("atr_pct") or 0.0),
                 "scalp_round_trip_cost_pct": float(summary.get("round_trip_cost_pct") or 0.0),
                 "stop_price": round(price * (1.0 - scalp_stop_pct / 100.0), 4),
@@ -1178,7 +1255,8 @@ class TradingEngine:
             stop_price = price * (1.0 - float(scalp_stop_pct) / 100.0)
             take_price = price * (1.0 + float(scalp_stop_pct) / 100.0)
             scalp_line = (
-                f"• Скальп-план: риск {self._cfg.scalp_risk_per_trade_pct:.2f}% equity; "
+                f"• Скальп-план: лимит риска {trade_risk_pct:.2f}% equity "
+                f"(открытый риск до входа {open_risk_pct:.2f}%); "
                 f"стоп {stop_price:.2f} ₽ (−{scalp_stop_pct:.2f}%, ATR×"
                 f"{self._cfg.scalp_atr_multiplier:.1f}); TP1 1R {take_price:.2f} ₽; "
                 f"после TP1 половину закрываю, стоп переношу к безубытку+издержки; "
@@ -1267,24 +1345,9 @@ class TradingEngine:
                 await self._sell(ticker, price, position, "защита прибыли", profit_pct,
                                  "; ".join(hints[:2]))
                 return
-        # ИИ может предложить ранний выход только по прибыльной позиции и
-        # не ранее 1R; он никогда не управляет стопом.
-        if (self._cfg.llm_decisions_enabled
-                and profit_pct >= max(self._cfg.llm_early_sell_min_profit_pct, stop_pct * 1.0)):
-            decision = self._llm_cache.get(ticker)
-            fresh = decision and (time.monotonic() - decision[0]) < self._llm_ttl_sec()
-            if not fresh:
-                sentiment = await self._get_sentiment(ticker)
-                brief = self._build_brief(ticker, price, summary, sentiment,
-                                          position=position, history=history)
-                verdict = await self._analyst.analyze_market(brief)
-                self._llm_cache[ticker] = (time.monotonic(), verdict)
-            else:
-                verdict = decision[1]
-            if verdict and verdict.get("action") == "sell" and \
-                    float(verdict.get("confidence", 0)) >= self._sell_confidence():
-                await self._sell(ticker, price, position, "решение ИИ", profit_pct,
-                                 str(verdict.get("reason", "")))
+        # Выходы позиции полностью детерминированы: стоп, тейк, лестница,
+        # трейлинг и локальные признаки ослабления импульса. Не тратим Groq
+        # на отдельный запрос по каждой уже открытой позиции.
 
     async def _check_scalp_exit(self, ticker: str, price: float,
                                 position: Dict[str, Any]) -> None:
@@ -1988,21 +2051,44 @@ class TradingEngine:
                                 history: Optional[List[Tuple[float, float]]] = None,
                                 morning_ctx: Optional[Dict[str, Any]] = None
                                 ) -> Optional[dict]:
-        """Вердикт трейдера-LLM с кэшем на 10-30 минут (без LLM -> None)."""
+        """Пакетный AI verdict; индивидуальный вызов оставлен только как opt-out."""
         if not self._cfg.llm_decisions_enabled:
             return None
+        if getattr(self._cfg, "ai_batch_required", True):
+            item = self._ai_batch_candidates.get(ticker)
+            if not item:
+                return None
+            age = time.monotonic() - float(item.get("ts", 0.0) or 0.0)
+            if age > self._cfg.ai_batch_decision_ttl_sec:
+                return None
+            scanned_price = float(item.get("price") or 0.0)
+            if scanned_price <= 0 or abs(price / scanned_price - 1.0) > 0.0035:
+                return None
+            verdict = item.get("decision")
+            if not isinstance(verdict, dict):
+                return None
+            if verdict.get("action") == "buy":
+                allowed = set(summary.get("allowed_setups") or [])
+                if str(verdict.get("setup", "none")).lower() not in allowed:
+                    log.info("%s: batch LLM buy отклонён - setup %r не подтверждён текущими 5m OHLCV %s",
+                             ticker, verdict.get("setup"), sorted(allowed))
+                    return None
+            log.info("%s: использую пакетный ИИ-вердикт (возраст %.0f сек, рейтинг %.1f)",
+                     ticker, age, float(item.get("rank_score", 0.0)))
+            return dict(verdict)
+
+        # Совместимость с ручным/старым режимом. По умолчанию AI_BATCH_REQUIRED=True,
+        # поэтому автоторговля не создаёт индивидуальные запросы на каждый тикер.
         brief = self._build_brief(ticker, price, summary, sentiment,
                                   history=history, morning_ctx=morning_ctx)
         cached = self._llm_cache.get(ticker)
-        # Используем кэш только при полном совпадении входных данных.
-        # Иначе старое решение по прежней цене/свечам не считается сигналом.
         if (cached and len(cached) >= 3
                 and (time.monotonic() - cached[0]) < self._llm_ttl_sec()
                 and cached[2] == brief):
             return cached[1]
         try:
             verdict = await self._analyst.analyze_market(brief, scalp_mode=self.scalp_mode())
-        except TypeError:  # совместимость со сторонними тестовыми адаптерами
+        except TypeError:
             verdict = await self._analyst.analyze_market(brief)
         self._llm_cache[ticker] = (time.monotonic(), verdict, brief)
         if verdict:
@@ -2012,28 +2098,22 @@ class TradingEngine:
 
     # --------------------------------------------------------------- сентимент
     async def _get_sentiment(self, ticker: str) -> float:
-        """Сентимент новостей с кэшем на SENTIMENT_TTL_SEC (экономия лимитов Groq)."""
+        """Детерминированный фильтр новостных рисков без отдельного Groq-вызова."""
         cached = self._sentiment_cache.get(ticker)
         if cached and (time.monotonic() - cached[0]) < self._cfg.sentiment_ttl_sec:
             return cached[1]
-
         try:
             news_items = await self._client.get_news(ticker)
         except Exception as exc:  # noqa: BLE001
-            log.warning("%s: новости недоступны (%s)", ticker, exc)
+            log.warning("%s: новости недоступны (%s); локальный фильтр нейтрален", ticker, exc)
             news_items = []
-        self._news_cache[ticker] = news_items
-
-        news_text = "\n".join(news_items)[:1500]
-        if not news_text:
-            log.info("%s: свежих новостей не найдено - нейтральный сентимент", ticker)
-            score = 0.0
+        self._news_cache[ticker] = list(news_items or [])
+        score, reasons = classify_headlines(news_items or [])
+        if reasons:
+            log.warning("%s: локальный новостной фильтр заблокировал вход: %s",
+                        ticker, ", ".join(reasons))
         else:
-            log.info("%s: новостей найдено %d, отправляю в Groq...", ticker, len(news_items))
-            score = await self._analyst.analyze_sentiment(news_text)
-            log.info("%s: сентимент %.2f", ticker, score)
-
-        # Кэш ограничен числом тикеров (<=5) - утечки памяти нет.
+            log.debug("%s: локальный новостной фильтр: блокирующих заголовков нет", ticker)
         self._sentiment_cache[ticker] = (time.monotonic(), score)
         return score
 
