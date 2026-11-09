@@ -370,9 +370,15 @@ class MarketScanner:
         except Exception as exc:  # noqa: BLE001
             log.warning("Сканер: не удалось отправить сводку автопокупки: %s", exc)
 
-    async def _deep_analyze(self, pool: List[Dict[str, Any]]
+    async def _deep_analyze(self, pool: List[Dict[str, Any]], *,
+                            breadth_pct: Optional[float] = None
                             ) -> List[Dict[str, Any]]:
-        """Свечи + индикаторы по каждой бумаге пула (СТРОГО последовательно)."""
+        """Свечи + индикаторы по каждой бумаге пула (СТРОГО последовательно).
+
+        breadth_pct — доля растущих бумаг TQBR из текущего снимка MOEX ISS.
+        При отсутствии данных остаётся None: сетапы, которым нужен breadth,
+        безопасно не подтверждаются.
+        """
         scored: List[Dict[str, Any]] = []
         for row in pool:
             if self._stop_event.is_set():

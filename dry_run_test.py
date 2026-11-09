@@ -1,5 +1,5 @@
 """
-dry_run_test.py - самопроверка всего бота v1.8.1 на МАКЕТАХ без сети и токенов.
+dry_run_test.py - самопроверка всего бота v1.8.2 на МАКЕТАХ без сети и токенов.
 
 Проверяет ключевую логику ДО выхода на реальные деньги:
   1. торговый движок: сигнал + сентимент + LLM 'buy' -> покупка;
@@ -45,6 +45,7 @@ from candidate_selector import rank_candidate, rank_market_snapshot, select_top_
 from news_filter import classify_headlines  # noqa: E402
 from trading_engine import TradingEngine  # noqa: E402
 from trade_memory import TradeMemory  # noqa: E402
+from scanner import MarketScanner  # noqa: E402
 import sessions  # noqa: E402
 
 PASSED: list[str] = []
@@ -228,7 +229,7 @@ class FakeAnalyst:
 
 async def main() -> int:
     print("=" * 64)
-    print("DRY-RUN самопроверка MOEX Trading Bot v1.8.1 (моки, без сети)")
+    print("DRY-RUN самопроверка MOEX Trading Bot v1.8.2 (моки, без сети)")
     print("=" * 64)
 
     tmp = tempfile.mkdtemp(prefix="bot_dryrun_")
@@ -771,6 +772,32 @@ async def main() -> int:
           batch_kwargs and batch_kwargs[0]["max_tokens"] == 280
           and batch_kwargs[0]["response_format"] == {"type": "json_object"},
           str(batch_kwargs))
+
+    # --- Тест 21: scanner passes market breadth into deep analysis ---------
+    print("\n[21] Сканер: breadth_pct передаётся в свечной анализ")
+    scanner_state = StateStore(os.path.join(tmp, "scanner_state.json"),
+                               initial_overrides={"trading_enabled": False})
+    scanner_client = FakeClient()
+    scanner_engine = TradingEngine(cfg, scanner_state, scanner_client,
+                                   FakeAnalyst(), notify)
+    scanner = MarketScanner(cfg, scanner_state, scanner_client, FakeAnalyst(),
+                            scanner_engine, notify, None)
+    captured_breadth: list[float | None] = []
+    original_detect_entry_setups = indicators.detect_entry_setups
+    def capture_entry_setups(*args, **kwargs):
+        captured_breadth.append(kwargs.get("market_breadth_pct"))
+        return original_detect_entry_setups(*args, **kwargs)
+    indicators.detect_entry_setups = capture_entry_setups
+    try:
+        deep_rows = await scanner._deep_analyze(
+            [{"ticker": "SBER", "price": 250.0, "turnover": 100_000_000.0,
+              "snapshot_rank": 70.0}], breadth_pct=61.5)
+    finally:
+        indicators.detect_entry_setups = original_detect_entry_setups
+    check("_deep_analyze принимает breadth_pct и завершает анализ без TypeError",
+          bool(deep_rows))
+    check("рыночная ширина 61.5% передана в функцию подтверждения сетапов",
+          captured_breadth == [61.5], str(captured_breadth))
 
     print("\n" + "=" * 64)
     print(f"ИТОГО: пройдено {len(PASSED)}, провалено {len(FAILED)}")

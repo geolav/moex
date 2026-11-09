@@ -74,7 +74,7 @@ import predictor
 
 log = logging.getLogger("telegram")
 
-VERSION = "1.8.1"
+VERSION = "1.8.2"
 
 HELP_TEXT = (
     "Команды (можно не печатать - жмите кнопки на клавиатуре ниже чата):\n"
