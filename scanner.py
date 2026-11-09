@@ -303,7 +303,8 @@ class MarketScanner:
                 len(scored), min_rank, len(rank_ok), len(setup_ok),
                 max_spread_pct, len(spread_ok), len(atr_ok))
         if self._engine_scalp() and not sessions.is_scalp_entry_time():
-            log.info("Сканер: сейчас вне окна новых скальп-входов 10:15-18:20 МСК; "
+            log.info("Сканер: сейчас вне торговых часов (входы разрешены "
+                     "10:05-18:40 и 19:07-23:40 МСК); "
                      "анализ выполнен только для отчёта")
         # Breadth добавляется в компактный payload для пакетной оценки.
         for row in ai_candidates:

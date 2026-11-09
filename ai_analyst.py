@@ -755,7 +755,12 @@ class AIAnalyst:
                 raw = await self._chat(
                     _CANDIDATE_BATCH_SYSTEM_PROMPT,
                     user,
-                    max_tokens=280,
+                    # v1.10.0: было 280 токенов - на 3 кандидата JSON физически
+                    # не влезал, Groq резал документ (finish_reason=length,
+                    # json_validate_failed "max completion tokens reached") и
+                    # бот получал 0 вердиктов - не покупал вообще. 760 хватает
+                    # на 3 компактных решения с запасом на reasoning gpt-oss.
+                    max_tokens=760,
                     temperature=0.0,
                     tries=1,
                     response_format={"type": "json_object"},
@@ -808,8 +813,9 @@ class AIAnalyst:
             setup = str(item.get("setup", "none")).lower()
             if setup not in allowed_setups:
                 setup = "none"
-            # ИИ не может одобрить buy без сетапа и достаточной уверенности.
-            if action == "buy" and (setup == "none" or confidence < 0.62
+            # ИИ не может одобрить buy без сетапа и достаточной уверенности
+            # (порог 0.60 синхронизирован с минимумом движка).
+            if action == "buy" and (setup == "none" or confidence < 0.60
                                     or setup not in confirmed_setups):
                 action = "hold"
             result[ticker] = {
