@@ -3,7 +3,8 @@ tinkoff_client.py - обёртка над официальным T-Invest API (�
 
 Что умеет:
   - режим ПЕСОЧНИЦА / РЕАЛ переключается на лету (AsyncSandboxClient/AsyncClient);
-  - get_price(ticker)      - последняя цена;
+  - get_price(ticker)      - последняя цена через unary API;
+  - start_scalp_feed(...) - поток last-price + стакан для event-driven скальпа;
   - get_sma(ticker)        - SMA по часовым свечам (для стратегии);
   - get_news(ticker)       - бесплатные RSS-новости по тикеру (в T-Invest API
                              нет новостного эндпоинта, поэтому RSS без ключей);
@@ -25,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import importlib
 import logging
 import re
 import time
@@ -178,6 +180,14 @@ class TinkoffClient:
         self._account_id: Optional[str] = None
         self._instruments: Dict[str, Dict[str, Any]] = {}   # ticker -> {figi, lot, name}
         self._ticker_by_figi: Dict[str, str] = {}
+        self._ticker_by_uid: Dict[str, str] = {}
+        # Потоковые котировки для скальпа: цена/стакан обновляются событиями,
+        # история сделок ограничена 120 точками на тикер.
+        self._scalp_quotes: Dict[str, Dict[str, Any]] = {}
+        self._scalp_feed_task: Optional[asyncio.Task] = None
+        self._scalp_feed_stop: Optional[asyncio.Event] = None
+        self._scalp_feed_tickers: set[str] = set()
+        self._scalp_feed_ready = False
         self._ohlc_cache: Dict[str, List[Dict[str, float]]] = {}
         self._spread_cache: Dict[str, Tuple[float, float]] = {}
         # Полная вселенная акций основного режима торгов TQBR (~250 бумаг):
@@ -217,6 +227,7 @@ class TinkoffClient:
 
     async def close(self) -> None:
         async with self._switch_lock:
+            await self.stop_scalp_feed()
             await self._close_api()
             if self._http is not None:
                 await self._http.close()
@@ -232,6 +243,7 @@ class TinkoffClient:
             await self._connect()
 
     async def _close_api(self) -> None:
+        await self.stop_scalp_feed()
         if self._cm is not None:
             try:
                 await self._cm.__aexit__(None, None, None)
@@ -242,7 +254,9 @@ class TinkoffClient:
         self._account_id = None
         self._instruments.clear()
         self._ticker_by_figi.clear()
+        self._ticker_by_uid.clear()
         self._universe.clear()
+        self._scalp_quotes.clear()
         self._ohlc_cache.clear()
         self._spread_cache.clear()
 
@@ -325,6 +339,7 @@ class TinkoffClient:
         for share in response.instruments:
             info = {
                 "figi": share.figi,
+                "uid": str(getattr(share, "uid", "") or getattr(share, "instrument_uid", "")),
                 "lot": int(share.lot) or 1,
                 "name": (share.name or "").strip(),
                 "class_code": share.class_code,
@@ -340,6 +355,7 @@ class TinkoffClient:
             if share.class_code == "TQBR" and share.ticker in found:
                 found[share.ticker] = {
                     "figi": share.figi,
+                    "uid": str(getattr(share, "uid", "") or getattr(share, "instrument_uid", "")),
                     "lot": int(share.lot) or 1,
                     "name": (share.name or "").strip(),
                     "class_code": share.class_code,
@@ -347,6 +363,7 @@ class TinkoffClient:
         self._universe = universe
         self._instruments = found
         self._ticker_by_figi = {info["figi"]: t for t, info in found.items()}
+        self._ticker_by_uid = {info["uid"]: t for t, info in found.items() if info.get("uid")}
         missing = wanted - set(found)
         if missing:
             log.warning("Тикеры не найдены на MOEX (проверьте написание): %s",
@@ -418,8 +435,196 @@ class TinkoffClient:
             return False
         self._instruments[ticker] = info
         self._ticker_by_figi[info["figi"]] = ticker
+        if info.get("uid"):
+            self._ticker_by_uid[str(info["uid"])] = ticker
         log.info("Тикер %s подключён к работе из вселенной TQBR", ticker)
         return True
+
+    # ---------------------------------------------------------- scalp streaming
+    @property
+    def scalp_feed_ready(self) -> bool:
+        return bool(self._scalp_feed_ready and self._scalp_feed_task
+                    and not self._scalp_feed_task.done())
+
+    async def start_scalp_feed(self, tickers: List[str]) -> bool:
+        """Запускает подписки на last-price и стакан для списка скальпа.
+
+        Поток используется только как источник быстрых данных. Если SDK или
+        нужные инструменты не готовы, возвращаем False: скальп-входы должны
+        оставаться закрытыми, а не переходить незаметно на редкий polling.
+        """
+        wanted = {str(t).strip().upper() for t in tickers if str(t).strip()}
+        for ticker in list(wanted):
+            self.ensure_instrument(ticker)
+        wanted = {t for t in wanted if t in self._instruments
+                  and (self._instruments[t].get("uid") or self._instruments[t].get("figi"))}
+        if not wanted or self._api is None:
+            return False
+        if (wanted == self._scalp_feed_tickers and self._scalp_feed_task
+                and not self._scalp_feed_task.done()):
+            # Задача может находиться в коротком backoff после обрыва канала.
+            # Не отменяем её и не создаём конкурирующие reconnect-попытки.
+            return True
+        await self.stop_scalp_feed()
+        self._scalp_feed_tickers = set(wanted)
+        self._scalp_feed_stop = asyncio.Event()
+        self._scalp_feed_task = asyncio.create_task(
+            self._scalp_feed_loop(sorted(wanted), self._scalp_feed_stop),
+            name="t-invest-scalp-market-data-stream")
+        # Даём задаче стартовать до возврата, чтобы ошибки инициализации
+        # проявились в логах, а тесты увидели отправленные подписки.
+        await asyncio.sleep(0)
+        return True
+
+    async def stop_scalp_feed(self) -> None:
+        task = self._scalp_feed_task
+        stop = self._scalp_feed_stop
+        self._scalp_feed_ready = False
+        self._scalp_feed_task = None
+        self._scalp_feed_stop = None
+        self._scalp_feed_tickers.clear()
+        if stop is not None:
+            stop.set()
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await asyncio.wait_for(task, timeout=3.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+            except Exception as exc:  # noqa: BLE001
+                log.debug("Остановка scalp stream: %s", exc)
+
+    async def _scalp_feed_loop(self, tickers: List[str], stop: asyncio.Event) -> None:
+        """Подписывает цену и стакан, переподключаясь после обрыва канала."""
+        try:
+            sdk = importlib.import_module("t_tech.invest")
+            MarketDataRequest = sdk.MarketDataRequest
+            SubscribeOrderBookRequest = sdk.SubscribeOrderBookRequest
+            SubscribeLastPriceRequest = sdk.SubscribeLastPriceRequest
+            OrderBookInstrument = sdk.OrderBookInstrument
+            LastPriceInstrument = sdk.LastPriceInstrument
+            SubscriptionAction = sdk.SubscriptionAction
+        except (ImportError, AttributeError) as exc:
+            log.error("Scalp stream недоступен: не найдены типы SDK: %s", exc)
+            return
+
+        orderbook_items = []
+        last_price_items = []
+        for ticker in tickers:
+            info = self._instruments.get(ticker) or {}
+            instrument_id = str(info.get("uid") or info.get("figi") or "")
+            if not instrument_id:
+                continue
+            orderbook_items.append(OrderBookInstrument(instrument_id=instrument_id, depth=5))
+            last_price_items.append(LastPriceInstrument(instrument_id=instrument_id))
+        if not orderbook_items or not last_price_items:
+            log.warning("Scalp stream: нет инструментов для подписки")
+            return
+
+        async def request_iterator():
+            yield MarketDataRequest(subscribe_order_book_request=SubscribeOrderBookRequest(
+                subscription_action=SubscriptionAction.SUBSCRIPTION_ACTION_SUBSCRIBE,
+                instruments=orderbook_items))
+            yield MarketDataRequest(subscribe_last_price_request=SubscribeLastPriceRequest(
+                subscription_action=SubscriptionAction.SUBSCRIPTION_ACTION_SUBSCRIBE,
+                instruments=last_price_items))
+            while not stop.is_set():
+                await asyncio.sleep(1.0)
+
+        while not stop.is_set():
+            try:
+                stream_service = getattr(self._api, "market_data_stream", None)
+                method = getattr(stream_service, "market_data_stream", None)
+                if not callable(method):
+                    log.error("Scalp stream: у SDK нет market_data_stream.market_data_stream")
+                    return
+                self._scalp_feed_ready = True
+                log.info("Scalp stream: подписываюсь на last-price и стакан для %d бумаг",
+                         len(tickers))
+                async for event in method(request_iterator()):
+                    if stop.is_set():
+                        break
+                    self._handle_scalp_stream_event(event)
+                if not stop.is_set():
+                    raise RuntimeError("T-Invest market-data stream завершился без запроса остановки")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                self._scalp_feed_ready = False
+                log.exception("Scalp stream оборвался; переподключение через 3 сек: %s", exc)
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=3.0)
+                except asyncio.TimeoutError:
+                    continue
+            finally:
+                self._scalp_feed_ready = False
+
+    @staticmethod
+    def _stream_number(value: Any) -> float:
+        try:
+            converted = quotation_to_decimal(value)
+            return float(converted)
+        except Exception:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return 0.0
+
+    def _handle_scalp_stream_event(self, event: Any) -> None:
+        """Обновляет локальный quote-cache по событию T-Invest stream."""
+        now_mono = time.monotonic()
+        last = getattr(event, "last_price", None)
+        if last is not None:
+            uid = str(getattr(last, "instrument_uid", "") or "")
+            figi = str(getattr(last, "figi", "") or "")
+            ticker = self._ticker_by_uid.get(uid) or self._ticker_by_figi.get(figi)
+            if ticker:
+                price = self._stream_number(getattr(last, "price", None))
+                if price > 0:
+                    quote = self._scalp_quotes.setdefault(ticker, {"ticks": deque(maxlen=120)})
+                    quote["price"] = price
+                    quote["price_updated_mono"] = now_mono
+                    quote["price_age_sec"] = 0.0
+                    ticks = quote.setdefault("ticks", deque(maxlen=120))
+                    if not ticks or abs(float(ticks[-1]["price"]) - price) > 1e-12:
+                        ticks.append({"ts": now_mono, "price": price})
+                    quote["price_seq"] = int(quote.get("price_seq", 0)) + 1
+
+        book = getattr(event, "orderbook", None)
+        if book is not None:
+            uid = str(getattr(book, "instrument_uid", "") or "")
+            figi = str(getattr(book, "figi", "") or "")
+            ticker = self._ticker_by_uid.get(uid) or self._ticker_by_figi.get(figi)
+            if ticker:
+                bids = list(getattr(book, "bids", []) or [])
+                asks = list(getattr(book, "asks", []) or [])
+                bid = self._stream_number(getattr(bids[0], "price", None)) if bids else 0.0
+                ask = self._stream_number(getattr(asks[0], "price", None)) if asks else 0.0
+                bid_volume = sum(max(0.0, float(getattr(x, "quantity", 0) or 0))
+                                 for x in bids[:5])
+                ask_volume = sum(max(0.0, float(getattr(x, "quantity", 0) or 0))
+                                 for x in asks[:5])
+                consistent = bool(getattr(book, "is_consistent", False))
+                quote = self._scalp_quotes.setdefault(ticker, {"ticks": deque(maxlen=120)})
+                quote.update({"bid": bid, "ask": ask, "bid_volume": bid_volume,
+                              "ask_volume": ask_volume, "book_consistent": consistent,
+                              "book_updated_mono": now_mono, "book_age_sec": 0.0})
+                mid = (bid + ask) / 2.0 if bid > 0 and ask > bid else 0.0
+                quote["spread_pct"] = ((ask - bid) / mid * 100.0 if mid > 0 else 0.0)
+
+    def get_scalp_quote(self, ticker: str) -> Optional[Dict[str, Any]]:
+        """Копия текущей потоковой цены, стакана и последних тиков."""
+        raw = self._scalp_quotes.get(str(ticker).upper())
+        if not raw:
+            return None
+        quote = dict(raw)
+        now_mono = time.monotonic()
+        price_ts = float(quote.get("price_updated_mono", 0.0) or 0.0)
+        book_ts = float(quote.get("book_updated_mono", 0.0) or 0.0)
+        quote["price_age_sec"] = max(0.0, now_mono - price_ts) if price_ts else float("inf")
+        quote["book_age_sec"] = max(0.0, now_mono - book_ts) if book_ts else float("inf")
+        quote["ticks"] = list(quote.get("ticks") or [])
+        return quote
 
     #: Открытый API МосБиржи: весь режим TQBR одним запросом, без ключей.
     MOEX_ISS_URL = ("https://iss.moex.com/iss/engines/stock/markets/shares"
@@ -525,65 +730,6 @@ class TinkoffClient:
     def get_lot_size(self, ticker: str) -> int:
         """Размер лота бумаги из кэша инструментов (1, если тикер неизвестен)."""
         return int(self._instruments.get(ticker, {}).get("lot", 1))
-
-    async def refresh_watchlist_market(self,
-                                       tickers: List[str]) -> Dict[str, Dict[str, Any]]:
-        """v1.12.0: живые цены + спреды ТОЛЬКО для watchlist одним ISS-запросом.
-
-        Микро-радар скальпа должен видеть спред каждые ~минуту, а полный
-        снимок рынка ради десяти бумаг - лишние ~200 КБ каждую минуту.
-        ISS умеет фильтр `securities=SBER,GAZP,...` - ответ крошечный.
-
-        Заполняет тот же _spread_cache, что и полный снимок, поэтому
-        get_spread_pct() движка видит свежие данные без отдельного запроса
-        на каждую бумагу. Возвращает {ticker: {price, spread_pct}}.
-        Ошибки сети НЕ глушим: радар лучше пропустит тик, чем будет
-        торговать по протухшим спредам (fail-closed внутри радара).
-        """
-        wanted = [str(t).upper() for t in (tickers or []) if t][:25]
-        if not wanted:
-            return {}
-        url = (self.MOEX_ISS_URL
-               + "?iss.meta=off&iss.only=marketdata"
-                 "&marketdata.columns=SECID,LAST,BID,OFFER"
-               + "&securities=" + ",".join(wanted))
-        if self._http is None:
-            raise TinkoffClientError("HTTP-сессия ещё не открыта (client.start())")
-        try:
-            async with self._http.get(url) as response:
-                if response.status != 200:
-                    raise TinkoffClientError(f"MOEX ISS: HTTP {response.status}")
-                payload = await response.json(content_type=None)
-        except TinkoffClientError:
-            raise
-        except (asyncio.TimeoutError, aiohttp.ClientError, OSError, ValueError) as exc:
-            raise TinkoffClientError(f"MOEX ISS недоступен: {exc}") from exc
-
-        block = payload.get("marketdata", {}) if isinstance(payload, dict) else {}
-        cols = {name: i for i, name in enumerate(block.get("columns", []) or [])}
-        out: Dict[str, Dict[str, Any]] = {}
-        for row in block.get("data", []) or []:
-            if cols.get("SECID", 0) >= len(row):
-                continue
-            secid = str(row[cols["SECID"]]).upper()
-
-            def _num(name: str) -> float:
-                if name not in cols or cols[name] >= len(row):
-                    return 0.0
-                try:
-                    return float(row[cols[name]]) if row[cols[name]] is not None else 0.0
-                except (TypeError, ValueError):
-                    return 0.0
-
-            price = _num("LAST")
-            bid, offer = _num("BID"), _num("OFFER")
-            spread_pct = ((offer - bid) / ((offer + bid) / 2.0) * 100.0
-                          if bid > 0 and offer >= bid else None)
-            if spread_pct is not None:
-                self._spread_cache[secid] = (spread_pct, time.monotonic())
-            if price > 0 or spread_pct is not None:
-                out[secid] = {"price": price, "spread_pct": spread_pct}
-        return out
 
     def instrument_name(self, ticker: str) -> str:
         """Название компании из кэша инструментов (для сообщений)."""
@@ -817,7 +963,11 @@ class TinkoffClient:
             return None
 
     def get_spread_pct(self, ticker: str, max_age_sec: float = 120.0) -> Optional[float]:
-        """Последний спред из MOEX ISS; устаревшие котировки не используются."""
+        """Спред: сначала живой T-Invest стакан, затем свежий снимок MOEX ISS."""
+        live = self.get_scalp_quote(ticker)
+        if live and live.get("book_age_sec", float("inf")) <= 5.0:
+            value = float(live.get("spread_pct") or 0.0)
+            return value if value > 0 else None
         item = self._spread_cache.get(ticker)
         if not item or time.monotonic() - item[1] > max_age_sec:
             return None

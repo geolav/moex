@@ -491,6 +491,7 @@ class AIAnalyst:
                                         getattr(config, "groq_daily_token_budget", 120000))
         self._candidate_call_lock = asyncio.Lock()
         self._last_candidate_call_monotonic = 0.0
+        self._last_scalp_candidate_call_monotonic = 0.0
 
     # --- жизненный цикл ------------------------------------------------------
     async def start(self) -> None:
@@ -512,21 +513,6 @@ class AIAnalyst:
         if self._client is not None:
             await self._client.close()
             self._client = None
-
-    def budget_status(self) -> Dict[str, int]:
-        """v1.12.0: текущий дневной бюджет Groq для решений движка.
-
-        Микро-радар скальпа перед пакетным вызовом проверяет, хватает ли
-        бюджета: если remainder < оценка вызова + резерв - ИИ пропускается
-        до конца дня, а входы работают на локальном скоре (без токенов).
-        """
-        return dict(self._budget.status())
-
-    def last_candidate_call_age(self) -> float:
-        """Секунд с последнего пакетного вызова (антиспам-интервал радара)."""
-        if not self._last_candidate_call_monotonic:
-            return float("inf")
-        return max(0.0, time.monotonic() - self._last_candidate_call_monotonic)
 
     @staticmethod
     def _estimate_tokens(system: str, user: str, max_tokens: int) -> int:
@@ -757,6 +743,7 @@ class AIAnalyst:
                 "day_change_pct": round(float(row.get("day_chg_pct") or 0.0), 2),
                 "bollinger_pct_b": round(float(bb.get("pct_b") or 0.0), 2)
                     if bb.get("pct_b") is not None else None,
+                "microstructure": row.get("microstructure") if scalp_mode else None,
             })
         user = json.dumps({
             "mode": "scalp" if scalp_mode else "intraday",
@@ -765,20 +752,30 @@ class AIAnalyst:
         }, ensure_ascii=False, separators=(",", ":"))
         async with self._candidate_call_lock:
             now = time.monotonic()
-            min_interval = int(getattr(self._cfg, "ai_min_request_interval_sec", 600))
-            elapsed = now - self._last_candidate_call_monotonic
-            if self._last_candidate_call_monotonic and elapsed < min_interval:
-                log.info("Пакетный Groq-запрос пропущен: антиспам-интервал ещё %.0f сек",
-                         min_interval - elapsed)
+            if scalp_mode:
+                min_interval = int(getattr(
+                    self._cfg, "scalp_ai_min_request_interval_sec", 240) or 240)
+                last_call = self._last_scalp_candidate_call_monotonic
+            else:
+                min_interval = int(getattr(self._cfg, "ai_min_request_interval_sec", 600))
+                last_call = self._last_candidate_call_monotonic
+            elapsed = now - last_call
+            if last_call and elapsed < min_interval:
+                log.info("Пакетный Groq-запрос %s пропущен: следующий через %.0f сек",
+                         "скальпа" if scalp_mode else "сканера", min_interval - elapsed)
                 return {}
-            self._last_candidate_call_monotonic = now
+            if scalp_mode:
+                self._last_scalp_candidate_call_monotonic = now
+            else:
+                self._last_candidate_call_monotonic = now
             try:
                 raw = await self._chat(
                     _CANDIDATE_BATCH_SYSTEM_PROMPT,
                     user,
-                    # Три JSON-вердикта не всегда помещаются в 280 токенов.
-                    # Резерв Groq учитывает этот hard cap до отправки запроса.
-                    max_tokens=760,
+                    # Скальп пакетно проверяет до трёх коротких решений;
+                    # 320 completion-токенов достаточно для компактного JSON.
+                    # Обычный сканер использует более подробный ответ: 760.
+                    max_tokens=320 if scalp_mode else 760,
                     temperature=0.0,
                     tries=1,
                     response_format={"type": "json_object"},
@@ -815,12 +812,7 @@ class AIAnalyst:
         if not isinstance(decisions, dict):
             return {}
         result: Dict[str, dict] = {}
-        # v1.12.0: добавлены имена сигналов микро-радара (impulse/squeeze):
-        # в скальпе allowed_setups кандидатов - это сигналы радара, и ИИ
-        # вправе назвать их в setup. Всё равно решение проходит проверку
-        # setup in confirmed_setups (сигналы конкретной бумаги).
-        allowed_setups = {"pullback", "breakout", "reversal",
-                          "impulse", "squeeze", "none"}
+        allowed_setups = {"pullback", "breakout", "reversal", "none"}
         for ticker, confirmed_setups in allowed_by_ticker.items():
             item = decisions.get(ticker)
             if not isinstance(item, dict):

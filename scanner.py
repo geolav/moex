@@ -215,7 +215,7 @@ class MarketScanner:
             snapshot = await self._client.get_market_snapshot()
         except Exception as exc:  # noqa: BLE001
             clear_batch = getattr(self._engine, "clear_ai_batch_decisions", None)
-            if callable(clear_batch):
+            if callable(clear_batch) and not self._engine_scalp():
                 clear_batch()
             log.warning("Сканер: рынок недоступен (%s) - пропуск", exc)
             return (f"🔎 Сканер рынка: сейчас не удалось получить данные рынка "
@@ -242,7 +242,7 @@ class MarketScanner:
         # приходило и днём - из-за бага чтения оборотов, см. docstring).
         if sum(float(row.get("turnover", 0) or 0) for row in snapshot) < 1.0:
             clear_batch = getattr(self._engine, "clear_ai_batch_decisions", None)
-            if callable(clear_batch):
+            if callable(clear_batch) and not self._engine_scalp():
                 clear_batch()
             log.info("Сканер: рынок не торгуется (обороты обнулены) - пауза")
             return ("😴 По данным Мосбиржи обороты сейчас нулевые - торгов нет, "
@@ -250,7 +250,7 @@ class MarketScanner:
                     + sessions.session_hint()), [], [], []
         if not liquid:
             clear_batch = getattr(self._engine, "clear_ai_batch_decisions", None)
-            if callable(clear_batch):
+            if callable(clear_batch) and not self._engine_scalp():
                 clear_batch()
             return ("🔎 Сканер рынка: подходящих бумаг не нашёл "
                     "(фильтр ликвидности слишком строгий или рынок спит)."), [], [], []
@@ -322,25 +322,29 @@ class MarketScanner:
         # Один batch-запрос на весь скан: максимум 2-3 кандидата.
         # Решения сохраняются в движке; он повторно проверит текущие данные,
         # OHLCV-сетап, ATR, спред, cooldown и риск до любого ордера.
-        # v1.12.0: промежуточный set_batch({}, ...) убран - он дважды писал
-        # "Пакет ИИ обновлён" в лог. Циклы движка и сканера идут строго
-        # последовательно в одном asyncio-цикле, поэтому во время await
-        # движок физически не может прочитать старый пул.
-        decisions: Dict[str, dict] = {}
-        if cfg.scan_llm and ai_candidates and self._analyst is not None:
-            batch_method = getattr(self._analyst, "analyze_candidates", None)
-            if callable(batch_method):
-                try:
-                    decisions = await batch_method(
-                        ai_candidates, scalp_mode=self._engine_scalp()) or {}
-                except Exception as exc:  # noqa: BLE001 - отказ ИИ = нет автопокупки
-                    log.warning("Сканер: пакетное решение ИИ недоступно (%s)", exc)
-                    decisions = {}
         set_batch = getattr(self._engine, "set_ai_batch_decisions", None)
-        if callable(set_batch):
-            set_batch(decisions, ai_candidates)
+        decisions: Dict[str, dict] = {}
+        if not self._engine_scalp():
+            # В обычном режиме AI batch принадлежит сканеру. В скальпе им
+            # владеет потоковая очередь движка; периодический scan не должен
+            # ни расходовать Groq, ни очищать/перезаписывать её решения.
+            if callable(set_batch):
+                set_batch({}, ai_candidates)
+            if cfg.scan_llm and ai_candidates and self._analyst is not None:
+                batch_method = getattr(self._analyst, "analyze_candidates", None)
+                if callable(batch_method):
+                    try:
+                        decisions = await batch_method(ai_candidates, scalp_mode=False) or {}
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("Сканер: пакетное решение ИИ недоступно (%s)", exc)
+                        decisions = {}
+            if callable(set_batch):
+                set_batch(decisions, ai_candidates)
+        else:
+            log.info("Скальп: периодический скан обновляет watchlist/отчёт; Groq вызывается только потоковой очередью")
         log.info("Сканер: математический рейтинг посчитал %d бумаг; ИИ получил %d кандидата(ов), ответов %d",
-                 len(scored), len(ai_candidates), len(decisions))
+                 len(scored), (len(ai_candidates) if not self._engine_scalp() else 0),
+                 len(decisions))
 
         # Скальп-режим: лучшие кандидаты автоматически занимают свободные
         # слоты под управлением движка (позиции остаются под охраной).
@@ -377,6 +381,11 @@ class MarketScanner:
         О покупке придёт обычное сообщение от движка; сюда - короткая
         сводка, если что-то куплено.
         """
+        # В скальпе заявки разрешены только после event-driven сигнала потока
+        # и свежего AI batch; автопокупка от 10-минутного scanner snapshot
+        # иначе обходит микроструктурный триггер и покупает запоздалую цену.
+        if self._engine_scalp():
+            return
         if not top or not _auto_buy_enabled(self._cfg, self._state):
             return
         method = getattr(self._engine, "auto_buy_from_scan", None)
