@@ -691,12 +691,47 @@ class TinkoffClient:
         previous10_valid = [value for value in previous10 if value > 0]
         previous10_avg = (sum(previous10_valid) / len(previous10_valid)
                           if previous10_valid else 0.0)
+        # Локальный диапазон пробоя и короткая структура отката.
+        range_bars = bars[-13:-1]
+        range_high_12 = max((float(b.get("high", 0) or 0) for b in range_bars),
+                            default=0.0)
+        recent_lows = [float(b.get("low", 0) or 0) for b in bars[-3:]]
+        recent_lows = [v for v in recent_lows if v > 0]
+        # VWAP текущей сессии: типичная цена (H+L+C)/3, взвешенная объёмом.
+        # Для вечерней сессии отдельный anchor с 19:05 МСК; иначе с 10:00.
+        try:
+            import sessions as _sessions
+            now_msk = _sessions.msk_now()
+            minute = now_msk.hour * 60 + now_msk.minute
+            if minute >= 19 * 60 + 5:
+                anchor = now_msk.replace(hour=19, minute=5, second=0, microsecond=0)
+            else:
+                anchor = now_msk.replace(hour=10, minute=0, second=0, microsecond=0)
+            anchor_ts = anchor.timestamp()
+            session_bars = [b for b in bars if float(b.get("ts", 0) or 0) >= anchor_ts]
+        except Exception:
+            session_bars = bars[-48:]
+        vwap_num = 0.0
+        vwap_den = 0.0
+        for bar in session_bars:
+            vol = float(bar.get("volume", 0) or 0)
+            hi = float(bar.get("high", 0) or 0)
+            lo = float(bar.get("low", 0) or 0)
+            cl = float(bar.get("close", 0) or 0)
+            if vol > 0 and hi >= lo > 0 and cl > 0:
+                vwap_num += ((hi + lo + cl) / 3.0) * vol
+                vwap_den += vol
+        session_vwap = vwap_num / vwap_den if vwap_den > 0 else None
         return {
             "last_close": float(current.get("close", 0) or 0),
             "last_high": float(current.get("high", 0) or 0),
             "last_low": float(current.get("low", 0) or 0),
+            "previous_close": float(previous.get("close", 0) or 0),
             "previous_high": float(previous.get("high", 0) or 0),
             "previous_low": float(previous.get("low", 0) or 0),
+            "recent_lows": recent_lows,
+            "range_high_12": range_high_12 if range_high_12 > 0 else None,
+            "session_vwap": session_vwap,
             "close_above_prev_high": float(current.get("close", 0) or 0)
                                       > float(previous.get("high", 0) or 0),
             "higher_low": float(current.get("low", 0) or 0)

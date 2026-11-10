@@ -25,6 +25,7 @@ trade_memory.py - долговременная память о завершён�
 from __future__ import annotations
 
 import json
+import math
 import logging
 import os
 import time
@@ -90,7 +91,9 @@ class TradeMemory:
                entry_ts_str: str = "", closed_ts: Optional[float] = None,
                signal_score: Optional[float] = None,
                llm_confidence: Optional[float] = None,
-               cost_rub: float = 0.0) -> Dict[str, Any]:
+               cost_rub: float = 0.0,
+               setup: str = "unknown", mode: str = "unknown",
+               entry_tf_min: int = 0) -> Dict[str, Any]:
         """
         Запоминает одну закрытую сделку. Возвращает словарь-запись.
 
@@ -136,6 +139,9 @@ class TradeMemory:
                              if signal_score is not None else None),
             "llm_confidence": (round(float(llm_confidence), 2)
                                if llm_confidence is not None else None),
+            "setup": str(setup or "unknown"),
+            "mode": str(mode or "unknown"),
+            "entry_tf_min": int(entry_tf_min or 0),
         }
         self._trades.append(record)
         if len(self._trades) > self._max:
@@ -285,6 +291,39 @@ class TradeMemory:
                          f"бумаге - будь особенно требователен к сигналу.")
         return lines[:max_lines]
 
+    def performance_metrics(self, trades: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+        """Ключевые метрики по NET P&L, без вывода о качестве на малой выборке."""
+        rows = list(self._trades if trades is None else trades)
+        pnls = [float(t.get("pnl", 0) or 0) for t in rows]
+        wins = [x for x in pnls if x > 0]
+        losses = [x for x in pnls if x < 0]
+        gross_win = sum(wins)
+        gross_loss = abs(sum(losses))
+        equity = peak = max_dd = 0.0
+        for value in pnls:
+            equity += value
+            peak = max(peak, equity)
+            max_dd = max(max_dd, peak - equity)
+        return {
+            "n": len(rows), "win_rate": len(wins) / len(rows) if rows else 0.0,
+            "gross_profit": gross_win, "gross_loss": gross_loss,
+            "profit_factor": gross_win / gross_loss if gross_loss > 0 else (float("inf") if gross_win > 0 else 0.0),
+            "expectancy": sum(pnls) / len(pnls) if pnls else 0.0,
+            "avg_win": sum(wins) / len(wins) if wins else 0.0,
+            "avg_loss": sum(losses) / len(losses) if losses else 0.0,
+            "max_drawdown_rub": max_dd,
+            "net_pnl": sum(pnls),
+        }
+
+    def grouped_metrics(self, field: str, *, min_n: int = 3) -> Dict[str, Dict[str, Any]]:
+        """Метрики по setup/mode/hour; малые группы возвращаются с n для контекста."""
+        groups: Dict[str, List[Dict[str, Any]]] = {}
+        for trade in self._trades:
+            key = str(trade.get(field) or "unknown")
+            groups.setdefault(key, []).append(trade)
+        return {key: self.performance_metrics(rows) for key, rows in groups.items()
+                if len(rows) >= min_n}
+
     # ------------------------------------------------------------ витрина
     def short_line(self) -> str:
         """Одна строка для /status."""
@@ -300,11 +339,29 @@ class TradeMemory:
         stats_all = self._all_stats()
         today = self.today_realized_pnl()
         today_n = self._today_count()
+        perf = self.performance_metrics()
+        pf = ("∞" if math.isinf(perf["profit_factor"]) else f"{perf['profit_factor']:.2f}")
+        sample_note = " (малая выборка; ориентир, не доказательство edge)" if perf["n"] < 30 else ""
         lines = [f"🧠 Память сделок (последние {stats_all['n']}):",
                  f"Сегодня реализовано: {today:+.0f} ₽ ({today_n} сделок). "
                  f"Всего в памяти: прибыльных {stats_all['wins']} из "
                  f"{stats_all['n']} ({stats_all['winrate']:.0%}), суммарный "
-                 f"итог {stats_all['total_pnl']:+.0f} ₽."]
+                 f"итог {stats_all['total_pnl']:+.0f} ₽.",
+                 f"Метрики NET: PF={pf}; матожидание {perf['expectancy']:+.2f} ₽/сделку; "
+                 f"средний плюс {perf['avg_win']:+.2f} ₽ / средний минус "
+                 f"{perf['avg_loss']:+.2f} ₽; max drawdown {perf['max_drawdown_rub']:.2f} ₽{sample_note}."]
+        setups = self.grouped_metrics("setup", min_n=3)
+        if setups:
+            lines.append("По сетапам (группы ≥3 сделок):")
+            for name, m in sorted(setups.items()):
+                pf_s = "∞" if math.isinf(m["profit_factor"]) else f"{m['profit_factor']:.2f}"
+                lines.append(f"• {name}: n={m['n']}, PF={pf_s}, expectancy={m['expectancy']:+.2f} ₽")
+        hours = self.grouped_metrics("entry_hour", min_n=3)
+        if hours:
+            lines.append("По часу входа МСК (группы ≥3 сделок):")
+            for name, m in sorted(hours.items()):
+                pf_s = "∞" if math.isinf(m["profit_factor"]) else f"{m['profit_factor']:.2f}"
+                lines.append(f"• {name}:00: n={m['n']}, PF={pf_s}, expectancy={m['expectancy']:+.2f} ₽")
         tickers = sorted({t.get("ticker", "?") for t in self._trades})
         if tickers:
             lines.append("По бумагам:")

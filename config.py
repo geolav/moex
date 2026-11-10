@@ -203,7 +203,8 @@ class BotConfig:
     chase_bounce_pct: float        # не покупать, если отскок от минимума окна уже >= X%
     morning_anchor_until: int      # до скольки часов утренний якорь на вчерашний день
     # --- Скальп-режим (v1.7.0): /scalp в Telegram -----------------------------
-    scalp_max_positions: int       # сколько скальп-позиций вести одновременно (до 8)
+    scalp_max_positions: int       # максимум одновременно открытых скальп-позиций (до 8)
+    scalp_watchlist_max: int        # сколько бумаг держать в скальп-watchlist (до 10)
     scalp_poll_sec: int            # период полных циклов с решениями (5 мин)
     scalp_exit_poll_sec: int       # период быстрой охраны позиций между циклами
     scalp_cooldown_min: int        # кулдаун повторной покупки бумаги, мин
@@ -271,8 +272,9 @@ class BotConfig:
         в движке смотрят сюда, так что рассинхрон «константа vs поле»
         исключён (v1.6.0: из-за него падал баннер при старте).
 
-        ВНИМАНИЕ (v1.7.0): это лимит ОБЫЧНОГО режима. В скальп-режиме
-        движок берёт scalp_max_positions - см. TradingEngine.max_tickers().
+        ВНИМАНИЕ: это лимит ОБЫЧНОГО режима. В скальп-режиме лимит watchlist
+        берётся из scalp_watchlist_max, а активных открытых позиций - из
+        scalp_max_positions; см. TradingEngine.max_tickers().
         """
         return MAX_TICKERS
 
@@ -366,8 +368,9 @@ def load_config() -> BotConfig:
                                     low=0.0, high=50.0),
         morning_anchor_until=_env_int("MORNING_ANCHOR_UNTIL", 13,
                                       low=10, high=17),
-        scalp_max_positions=_env_int("SCALP_MAX_POSITIONS", 10,
-                                     low=1, high=12),
+        scalp_max_positions=_env_int("SCALP_MAX_POSITIONS", 8,
+                                     low=1, high=8),
+        scalp_watchlist_max=_env_int("SCALP_WATCHLIST_MAX", 10, low=8, high=10),
         scalp_poll_sec=_env_int("SCALP_POLL_SEC", 300, low=60, high=3600),
         scalp_exit_poll_sec=_env_int("SCALP_EXIT_POLL_SEC", 60,
                                      low=30, high=1800),

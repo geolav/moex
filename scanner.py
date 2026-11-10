@@ -11,8 +11,9 @@ scanner.py - сканер рынка Мосбиржи: раз в SCAN_INTERVAL_M
   3. Локальная формула ранжирует весь ликвидный снимок по обороту (40%),
      спреду (30%), умеренности дневного движения (20%) и направлению (10%).
      Для свечного анализа выбираются только лучшие SCAN_DEEP_N бумаг.
-  4. По этому пулу локальный код анализирует свечи 15 мин за ~26 ч,
-     индикаторы и подтверждённые pullback / breakout / reversal-сетапы.
+  4. По этому пулу локальный код анализирует свечи 5 мин за ~8 ч
+     (единый таймфрейм сканера и scalp-движка), индикаторы и подтверждённые
+     pullback / breakout / reversal-сетапы.
      Отдельная техническая формула ранжирует кандидатов; падающий тренд,
      ухудшающийся MACD и перекупленность получают штрафы.
   5. В Groq уходит максимум 3 лучших бумаги, уже прошедших локальные фильтры,
@@ -21,7 +22,7 @@ scanner.py - сканер рынка Мосбиржи: раз в SCAN_INTERVAL_M
 
 СКАЛЬП-РЕЖИМ (v1.7.0): если он включён (/scalp), сканер сам обновляет список
 бумаг под управлением движка: тикеры с открытыми позициями остаются, свободные
-слоты занимают лучшие кандидаты (до 8 бумаг) - так бот торгует весь рынок,
+слоты занимают лучшие кандидаты (до 10 бумаг; открытых позиций не более 8) - так бот торгует весь рынок,
 а не только ручной список.
 
 АВТОПОКУПКА (v1.7.1, SCAN_AUTO_BUY, переключение /autobuy): после отправки
@@ -39,7 +40,7 @@ securities, где их НЕТ (они в marketdata), поэтому скане
   - такое сообщение в автоматическом режиме приходит не чаще одного раза
     в 3 часа (раньше оно повторялось каждые 10 минут и заспамивало владельца).
 
-Ручные покупки: кнопка «Купить» (= 1 лот) или /buy ТИКЕР ШТ,
+Ручные покупки: кнопка «Купить ТИКЕР (по риску)» или /buy ТИКЕР без числа считают объём по риск-бюджету; /buy ТИКЕР ШТ задаёт точное количество,
 под автоторговлю - кнопка «Торгуй» или /watch ТИКЕР.
 """
 from __future__ import annotations
@@ -60,12 +61,11 @@ Notifier = Callable[..., Awaitable[None]]
 PhotosSender = Callable[..., Awaitable[None]]
 
 #: Свечи сканера: 15 минут (0.25 ч). Рабочая средняя кандидата: SMA-16 = 4 ч.
-_SCAN_STEP_H = 0.25
-_SCAN_FAST_N = 16
-#: Сколько часов истории свечей просить по каждому кандидату (~2 торговых дня).
-_SCAN_HISTORY_H = 26.0
-#: Минимум свечей для полного набора индикаторов (как в движке: max(2*16,35)+3).
-_MIN_CANDLES = 38
+_SCAN_STEP_H = 1.0 / 12.0  # 5 минут - тот же масштаб, что у scalp engine
+_SCAN_FAST_N = 24          # SMA fast = 2 часа; slow = 4 часа
+#: Истории хватает на SMA slow, MACD, RSI и OHLCV-контекст без 15m/5m mix.
+_SCAN_HISTORY_H = 8.0
+_MIN_CANDLES = 51          # max(2*24, 35) + 3 - как в TradingEngine
 
 #: "Рынок не торгуется": не чаще одного сообщения за столько секунд
 #: (3 часа), чтобы не спамить владельца каждые 10 минут.
@@ -75,7 +75,7 @@ _CLOSED_NOTIFY_TTL_SEC = 3 * 3600
 def _report_keyboard(top: List[Dict[str, Any]]):
     """Кнопки под отчётом сканера (v1.7.0, подписи уточнены в v1.7.1):
 
-    «Купить ТИКЕР (1 лот)» - немедленная покупка одного лота своими руками;
+    «Купить ТИКЕР (по риску)» - расчёт количества лотов по риск-бюджету;
     «Торгуй ТИКЕР» - отдать бумагу боту под автоторговлю (/watch).
 
     aiogram может быть недоступен в тестах - тогда вернём None (без кнопок).
@@ -91,7 +91,7 @@ def _report_keyboard(top: List[Dict[str, Any]]):
     for row in top[:4]:
         ticker = row["ticker"]
         rows.append([
-            InlineKeyboardButton(text=f"🛒 Купить {ticker} (1 лот)",
+            InlineKeyboardButton(text=f"🛒 Купить {ticker} (по риску)",
                                  callback_data=f"buy:{ticker}"),
             InlineKeyboardButton(text=f"🤖 Торгуй {ticker}",
                                  callback_data=f"watch:{ticker}"),
@@ -291,21 +291,30 @@ class MarketScanner:
         if not ai_candidates:
             rank_ok = [r for r in scored
                        if float(r.get("rank_score", 0.0) or 0.0) >= min_rank]
-            setup_ok = [r for r in rank_ok if r.get("allowed_setups")]
-            spread_ok = [r for r in setup_ok
-                         if (r.get("spread_pct") is not None
-                             and float(r.get("spread_pct") or 0.0) <= max_spread_pct)]
-            atr_ok = [r for r in spread_ok
-                      if float(r.get("atr_pct") or 0.0) > 0]
+            setup_ok = [r for r in scored if r.get("allowed_setups")]
+            spread_ok = [r for r in scored if (r.get("spread_pct") is not None
+                         and float(r.get("spread_pct") or 0.0) <= max_spread_pct)]
+            atr_ok = [r for r in scored if float(r.get("atr_pct") or 0.0) > 0]
+            cost_ok = [r for r in scored if (not self._engine_scalp()
+                        or (r.get("planned_stop_pct") is not None
+                            and r.get("round_trip_cost_pct") is not None
+                            and float(r.get("planned_stop_pct") or 0.0)
+                                >= float(self._cfg.scalp_min_reward_cost_multiple)
+                                   * float(r.get("round_trip_cost_pct") or 0.0)))]
+            eligible = [r for r in rank_ok if r.get("allowed_setups")
+                        and (not require_spread or (r.get("spread_pct") is not None
+                             and float(r.get("spread_pct") or 0.0) <= max_spread_pct))
+                        and (not self._engine_scalp() or float(r.get("atr_pct") or 0.0) > 0)
+                        and (not self._engine_scalp() or r in cost_ok)]
             log.info(
-                "Сканер: shortlist пуст; всего=%d, rank>=%g: %d, с сетапом: %d, "
-                "спред<=%g%%: %d, ATR известен: %d; Groq не вызываю",
+                "Сканер: shortlist пуст; всего=%d, rank>=%g: %d, сетап: %d, "
+                "спред<=%g%%: %d, ATR: %d, издержки/R: %d, совместно прошло: %d; Groq не вызываю",
                 len(scored), min_rank, len(rank_ok), len(setup_ok),
-                max_spread_pct, len(spread_ok), len(atr_ok))
-        if self._engine_scalp() and not sessions.is_scalp_entry_time():
-            log.info("Сканер: сейчас вне торговых часов (входы разрешены "
-                     "10:05-18:40 и 19:07-23:40 МСК); "
-                     "анализ выполнен только для отчёта")
+                max_spread_pct, len(spread_ok), len(atr_ok), len(cost_ok), len(eligible))
+        if self._engine_scalp() and not sessions.can_open_scalp_entry(45):
+            log.info("Сканер: новые скальп-входы запрещены временем/недостаточным "
+                     "остатком сессии для 45-минутного горизонта; Groq не вызываю")
+            ai_candidates = []
         # Breadth добавляется в компактный payload для пакетной оценки.
         for row in ai_candidates:
             row["market_breadth_pct"] = breadth_pct
@@ -442,17 +451,43 @@ class MarketScanner:
             setups, reversal_confirmations = indicators.detect_entry_setups(
                 closes, price, summary, entry_context, _SCAN_FAST_N,
                 scalp_mode=self._engine_scalp(), market_breadth_pct=breadth_pct)
-            # Scalp требует ATR и известный спред: без них нельзя честно
-            # вычислить stop/ожидаемую выгоду.
-            if self._engine_scalp() and (atr_pct is None or atr_pct <= 0
-                                         or spread_pct is None):
-                setups = []
+            # Scalp требует ATR/спред и проверку издержек ДО вызова Groq.
+            # Если 1R меньше 4 круговых издержек, ИИ не должен тратить токены
+            # на заведомо слабую экономику сделки.
+            planned_stop_pct = None
+            round_trip_cost_pct = None
+            breakeven_probability = None
+            if self._engine_scalp():
+                if atr_pct is None or atr_pct <= 0 or spread_pct is None:
+                    setups = []
+                else:
+                    planned_stop_pct = min(
+                        float(self._cfg.scalp_max_stop_pct),
+                        max(float(self._cfg.scalp_min_stop_pct),
+                            float(self._cfg.scalp_atr_multiplier) * float(atr_pct)))
+                    round_trip_cost_pct = (
+                        max(0.0, float(self._cfg.scalp_round_trip_cost_pct))
+                        + max(0.0, float(spread_pct))
+                        + max(0.0, float(getattr(self._cfg, "slippage_pct", 0.0) or 0.0)))
+                    if planned_stop_pct < (float(self._cfg.scalp_min_reward_cost_multiple)
+                                           * round_trip_cost_pct):
+                        setups = []
+                    else:
+                        breakeven_probability = ((planned_stop_pct + round_trip_cost_pct)
+                                                 / (2.0 * planned_stop_pct))
+                        summary["planned_stop_pct"] = planned_stop_pct
+                        summary["round_trip_cost_pct"] = round_trip_cost_pct
+                        summary["breakeven_confidence"] = breakeven_probability
             snapshot_rank = float(row.get("snapshot_rank", 0.0) or 0.0)
             final_rank = 0.85 * rank_score + 0.15 * snapshot_rank
             scored.append({**row, "price": price, "score": score,
                            "rank_score": round(final_rank, 2),
                            "indicator_rank": rank_score, "atr_pct": atr_pct,
-                           "spread_pct": spread_pct, "entry_context": entry_context,
+                           "spread_pct": spread_pct,
+                           "planned_stop_pct": planned_stop_pct,
+                           "round_trip_cost_pct": round_trip_cost_pct,
+                           "breakeven_probability": breakeven_probability,
+                           "entry_context": entry_context,
                            "allowed_setups": setups,
                            "reversal_confirmations": reversal_confirmations,
                            "summary": summary, "history": history})

@@ -478,45 +478,112 @@ def detect_entry_setups(closes: List[float], price: float,
                         fast_n: int, *, scalp_mode: bool = False,
                         market_breadth_pct: Optional[float] = None
                         ) -> Tuple[List[str], int]:
-    """Общая детерминированная проверка pullback/breakout/reversal.
+    """Детерминированные сетапы по ЗАКРЫТЫМ OHLCV-свечам.
 
-    Одинаковая функция применяется сканером и движком: ИИ не выбирает
-    сетапы из воздуха, а лишь оценивает уже подтверждённые кодом варианты.
-    Возвращает (разрешённые сетапы, число reversal-подтверждений).
+    Pullback теперь требует реального теста EMA-зоны и бычьего подтверждения;
+    breakout проверяется относительно локального диапазона, а не одной
+    предыдущей свечи. ИИ получает только сетапы, обнаруженные этим кодом.
     """
-    if not entry_context or entry_context.get("volume_ratio") is None:
+    if not entry_context or len(closes) < max(30, fast_n * 2):
         return [], 0
     try:
-        volume_ratio = float(entry_context["volume_ratio"])
+        volume_ratio = float(entry_context.get("volume_ratio"))
         if not math.isfinite(volume_ratio) or volume_ratio < 0:
             return [], 0
     except (TypeError, ValueError):
         return [], 0
 
-    setups: List[str] = []
+    ema9_series = ema(closes, 9)
+    ema21_series = ema(closes, 21)
+    ema9 = float(ema9_series[-1]) if ema9_series else None
+    ema21 = float(ema21_series[-1]) if ema21_series else None
+    ema9_prev = float(ema9_series[-2]) if ema9_series and len(ema9_series) > 1 else None
+    ema21_prev = float(ema21_series[-2]) if ema21_series and len(ema21_series) > 1 else None
+    if ema9 is not None:
+        summary["ema9"] = ema9
+    if ema21 is not None:
+        summary["ema21"] = ema21
+
     macd_data = summary.get("macd") or {}
     hist = macd_data.get("histogram")
     hist_prev = macd_data.get("histogram_prev")
-    sma_fast_value = summary.get("sma_fast")
-    sma_slow_value = summary.get("sma_slow")
-    previous_fast = sma(closes[:-fast_n], fast_n) if fast_n > 0 and len(closes) >= 2 * fast_n else None
-    macd_ok = hist is not None and hist_prev is not None and float(hist) >= float(hist_prev)
-    trend_ok = bool(sma_fast_value and sma_slow_value and previous_fast
-                    and price > float(sma_slow_value)
-                    and float(sma_fast_value) >= float(sma_slow_value)
-                    and float(sma_fast_value) > float(previous_fast) and macd_ok)
-    if trend_ok and bool(entry_context.get("pullback_volume_fade")):
+    macd_improving = (hist is not None and hist_prev is not None
+                      and float(hist) >= float(hist_prev))
+    trend_up = bool(ema9 and ema21 and ema9 > ema21
+                    and (ema9_prev is None or ema9 >= ema9_prev)
+                    and price >= ema21 and macd_improving)
+
+    atr_pct = float(summary.get("atr_pct") or 0.0)
+    atr_abs = price * atr_pct / 100.0 if atr_pct > 0 else 0.0
+    last_close = float(entry_context.get("last_close") or closes[-1])
+    prev_close = float(entry_context.get("previous_close") or closes[-2])
+    last_low = float(entry_context.get("last_low") or last_close)
+    prev_low = float(entry_context.get("previous_low") or last_low)
+    last_high = float(entry_context.get("last_high") or last_close)
+    recent_lows = entry_context.get("recent_lows") or [last_low, prev_low]
+    try:
+        min_recent_low = min(float(v) for v in recent_lows if float(v) > 0)
+    except (TypeError, ValueError):
+        min_recent_low = min(last_low, prev_low)
+
+    vwap = entry_context.get("session_vwap")
+    # В скальпе VWAP обязателен и должен быть актуальным: неизвестный VWAP
+    # не трактуем как нейтральное подтверждение.
+    vwap_ok = ((vwap is not None and float(vwap) > 0 and price >= float(vwap))
+               if scalp_mode else
+               (vwap is None or (float(vwap) > 0 and price >= float(vwap))))
+    rsi7 = summary.get("rsi7")
+    bb = summary.get("bollinger") or {}
+    pct_b = bb.get("pct_b")
+    overbought = (rsi7 is not None and float(rsi7) > 80.0
+                  and pct_b is not None and float(pct_b) >= 0.90)
+    if overbought:
+        return [], 0
+
+    setups: List[str] = []
+    # Настоящий откат: low последних трёх свечей подошёл к EMA9/EMA21
+    # (допуск 0.35 ATR), цена закрытия вернулась над EMA9, объём отката ниже
+    # среднего. Не покупаем просто потому, что цена выше SMA.
+    ema_zone_touch = False
+    if ema9 and ema21 and atr_abs > 0:
+        ema_zone_low = min(ema9, ema21) - 0.35 * atr_abs
+        ema_zone_high = max(ema9, ema21) + 0.35 * atr_abs
+        ema_zone_touch = ema_zone_low <= min_recent_low <= ema_zone_high
+    bullish_reclaim = (last_close >= prev_close and last_close >= (ema9 or last_close)
+                       and last_low >= (ema21 * 0.995 if ema21 else 0))
+    pullback_fade = bool(entry_context.get("pullback_volume_fade"))
+    extension_pct = ((price / last_close - 1.0) * 100.0
+                     if last_close > 0 else float("inf"))
+    # Допускаем небольшой шум ниже последнего закрытия; это всё ещё pullback,
+    # но не разрешаем покупать после сильного отрыва от триггерной свечи.
+    not_extended = (atr_pct > 0 and -0.3 * atr_pct <= extension_pct <= 0.8 * atr_pct)
+    if scalp_mode:
+        pullback_ok = (trend_up and ema_zone_touch and bullish_reclaim
+                       and pullback_fade and vwap_ok and not_extended
+                       and volume_ratio >= 0.65)
+    else:
+        pullback_ok = (trend_up and ema_zone_touch and bullish_reclaim
+                       and pullback_fade)
+    if pullback_ok:
         setups.append("pullback")
 
-    last_closed = float(entry_context.get("last_close") or 0.0)
-    extension_pct = ((price / last_closed - 1.0) * 100.0
-                     if last_closed > 0 else float("inf"))
-    atr_for_setup = float(summary.get("atr_pct") or 0.0)
-    if (bool(entry_context.get("close_above_prev_high"))
-            and volume_ratio >= 1.5 and atr_for_setup > 0
-            and 0 <= extension_pct <= 0.8 * atr_for_setup):
+    # Пробой максимума предыдущих 12 закрытых свечей + импульсный объём.
+    range_high = entry_context.get("range_high_12")
+    if range_high is None:
+        range_high = entry_context.get("previous_high")
+    squeeze = summary.get("bb_squeeze") is True
+    breakout_ok = bool(
+        range_high is not None and last_close > float(range_high)
+        and volume_ratio >= (1.5 if squeeze else 1.35)
+        and atr_pct > 0 and 0 <= extension_pct <= 0.8 * atr_pct
+        and vwap_ok and (ema9 is None or ema21 is None or ema9 >= ema21)
+        and macd_improving
+    )
+    if breakout_ok:
         setups.append("breakout")
 
+    # Разворот не ловит падающий нож: нужны 3 подтверждения, а в risk-off
+    # скальп-развороты запрещены.
     rsi_previous = rsi(closes[:-1], 14) if len(closes) > 15 else None
     rsi_current = summary.get("rsi14")
     reversal_checks = [
@@ -530,6 +597,6 @@ def detect_entry_setups(closes: List[float], price: float,
     reversal_market_ok = (not scalp_mode or (market_breadth_pct is not None
                                                and float(market_breadth_pct) > 55.0))
     reversal_count = sum(reversal_checks)
-    if reversal_count >= reversal_min and reversal_market_ok:
+    if reversal_count >= reversal_min and reversal_market_ok and vwap_ok:
         setups.append("reversal")
     return setups, reversal_count

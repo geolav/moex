@@ -729,6 +729,12 @@ class AIAnalyst:
                 "chg_1h_pct": round(float(summary.get("chg_1h") or 0.0), 3),
                 "volatility_pct_h": round(float(summary.get("volatility") or 0.0), 3),
                 "atr_pct": round(float(row.get("atr_pct") or 0.0), 3),
+                "planned_stop_pct": round(float(row.get("planned_stop_pct") or 0.0), 3)
+                    if row.get("planned_stop_pct") is not None else None,
+                "round_trip_cost_pct": round(float(row.get("round_trip_cost_pct") or 0.0), 3)
+                    if row.get("round_trip_cost_pct") is not None else None,
+                "breakeven_probability": round(float(row.get("breakeven_probability") or 0.0), 3)
+                    if row.get("breakeven_probability") is not None else None,
                 "spread_pct": round(float(row.get("spread_pct") or 0.0), 3)
                     if row.get("spread_pct") is not None else None,
                 "volume_ratio": round(float((row.get("entry_context") or {}).get("volume_ratio") or 0.0), 2),
@@ -755,11 +761,8 @@ class AIAnalyst:
                 raw = await self._chat(
                     _CANDIDATE_BATCH_SYSTEM_PROMPT,
                     user,
-                    # v1.10.0: было 280 токенов - на 3 кандидата JSON физически
-                    # не влезал, Groq резал документ (finish_reason=length,
-                    # json_validate_failed "max completion tokens reached") и
-                    # бот получал 0 вердиктов - не покупал вообще. 760 хватает
-                    # на 3 компактных решения с запасом на reasoning gpt-oss.
+                    # Три JSON-вердикта не всегда помещаются в 280 токенов.
+                    # Резерв Groq учитывает этот hard cap до отправки запроса.
                     max_tokens=760,
                     temperature=0.0,
                     tries=1,
@@ -813,8 +816,7 @@ class AIAnalyst:
             setup = str(item.get("setup", "none")).lower()
             if setup not in allowed_setups:
                 setup = "none"
-            # ИИ не может одобрить buy без сетапа и достаточной уверенности
-            # (порог 0.60 синхронизирован с минимумом движка).
+            # ИИ не может одобрить buy без сетапа и достаточной уверенности.
             if action == "buy" and (setup == "none" or confidence < 0.60
                                     or setup not in confirmed_setups):
                 action = "hold"

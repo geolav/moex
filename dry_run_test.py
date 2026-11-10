@@ -1,5 +1,5 @@
 """
-dry_run_test.py - самопроверка всего бота v1.9.0 на МАКЕТАХ без сети и токенов.
+dry_run_test.py - самопроверка всего бота v1.11.0 на МАКЕТАХ без сети и токенов.
 
 Проверяет ключевую логику ДО выхода на реальные деньги:
   1. торговый движок: сигнал + сентимент + LLM 'buy' -> покупка;
@@ -15,7 +15,7 @@ dry_run_test.py - самопроверка всего бота v1.9.0 на МА�
   8. ИИ-аудитор: tail 50 строк лога -> вердикт -> сообщение админу;
   9. очистка логов (cleanup.run_cleanup);
  10. фактическое потребление ОЗУ процессом (VmRSS из /proc);
- 12. v1.9.0: полные круговые издержки (комиссия 0,05%x2 + спред + проскальзывание),
+ 12. v1.11.0: полные круговые издержки (комиссия 0,05%x2 + спред + проскальзывание),
      безубыточная вероятность сделки, умный объём для кнопки/`/buy ТИКЕР`.
 
 Запуск: python dry_run_test.py
@@ -49,6 +49,7 @@ from news_filter import classify_headlines  # noqa: E402
 from trading_engine import TradingEngine  # noqa: E402
 from trade_memory import TradeMemory  # noqa: E402
 from scanner import MarketScanner  # noqa: E402
+import scanner as scanner_module  # noqa: E402
 from tinkoff_client import TinkoffClient  # noqa: E402
 import tinkoff_client as tinkoff_module  # noqa: E402
 import sessions  # noqa: E402
@@ -95,7 +96,8 @@ def make_test_config(tmp: str) -> BotConfig:
         # None вместо числа ломал вход: None > 0 в анти-погоне и др.)
         surge_sense_from_pct=3.0, chase_guard_pct=0.0, chase_bounce_pct=0.0,
         morning_anchor_until=13,
-        scalp_max_positions=8, scalp_poll_sec=300, scalp_exit_poll_sec=60,
+        scalp_max_positions=8, scalp_watchlist_max=10,
+        scalp_poll_sec=300, scalp_exit_poll_sec=60,
         scalp_cooldown_min=20,
         scalp_harvest_tiers=((5.0, 0.15), (3.0, 0.25), (2.0, 0.4)),
         scalp_stop_loss_pct=1.0, scalp_take_profit_pct=2.0,
@@ -222,7 +224,7 @@ class FakeAnalyst:
 
     def __init__(self, verdict: dict | None = None) -> None:
         self.verdict = verdict or {"action": "buy", "confidence": 0.9,
-                                   "setup": "breakout", "stop_pct": 0.8,
+                                   "setup": "reversal", "stop_pct": 0.8,
                                    "tp1_pct": 2.0, "size_mult": 1.0,
                                    "reason": "разворот подтверждён 3 из 4 условий, объём 1.6x"}
         self.market_calls = 0
@@ -242,16 +244,8 @@ class FakeAnalyst:
 
 async def main() -> int:
     print("=" * 64)
-    print("DRY-RUN самопроверка MOEX Trading Bot v1.10.1 (моки, без сети)")
+    print("DRY-RUN самопроверка MOEX Trading Bot v1.11.0 (моки, без сети)")
     print("=" * 64)
-
-    # v1.10.1 FIX: тесты должны быть детерминированными. Фейковая история
-    # свечей рассчитана на обычный цикл; с 10:00 до ~13:00 МСК включается
-    # "утренний якорь", фильтр основной сессии срезает историю до ~35 свечей
-    # (< минимума) и половина набора падает на fail-closed. Отключаем якорь
-    # только внутри теста - производственный код не трогаем.
-    import sessions as _sessions
-    _sessions.is_morning_window = lambda **kwargs: False
 
     tmp = tempfile.mkdtemp(prefix="bot_dryrun_")
     cfg = make_test_config(tmp)
@@ -279,7 +273,7 @@ async def main() -> int:
     check("без ATR локальный план не выдумывается",
           engine._standard_trade_plan({}) is None)
 
-    # --- v1.9.0: полные круговые издержки и безубыточная вероятность --------
+    # --- v1.11.0: полные круговые издержки и безубыточная вероятность --------
     print("\n[0b] v1.9.0: издержки = комиссия 0,05%x2 + спред + проскальзывание")
     summary_probe: dict = {}
     cost = engine._effective_round_trip_cost("SBER", summary_probe)
@@ -293,7 +287,7 @@ async def main() -> int:
     check("безубыточная вероятность растёт при жирных издержках",
           engine._breakeven_confidence(0.6, 0.6, 0.4) > be)
 
-    # --- v1.9.0: умный объём для кнопки/`/buy ТИКЕР` -------------------------
+    # --- v1.11.0: умный объём для кнопки/`/buy ТИКЕР` -------------------------
     print("\n[0c] v1.9.0: smart_buy_units считает лоты по лимиту на сделку")
     units, note = await engine.smart_buy_units("SBER")
     # cash 50000, лимит 10% -> 5000 бюджет, лот 2500 -> 2 лота = 20 шт
@@ -749,7 +743,8 @@ async def main() -> int:
     risk_state.set_scalp_mode(True)
     risk_client = FakeClient()
     risk_engine = TradingEngine(cfg, risk_state, risk_client, FakeAnalyst(), notify)
-    check("лимит скальп-watchlist равен 8", risk_engine.max_tickers() == 8)
+    check("лимит скальп-watchlist равен 10 при максимуме 8 открытых позиций",
+          risk_engine.max_tickers() == 10 and cfg.scalp_max_positions == 8)
     check("дневной лимит скальпа позволяет 40 входов", risk_engine._max_buys_today() == 40)
     risk_state.set_position("SBER", {
         "lots": 1, "entry_price": 100.0, "scalp_risk_pct": 1.0,
@@ -812,8 +807,7 @@ async def main() -> int:
     check("пакетный анализ вызывает модель один раз и блокирует частые /scan",
           batch_calls == 1 and first_decisions.get("SBER", {}).get("action") == "buy"
           and second_decisions == {})
-    check("пакетный ответ ограничен 760 completion-токенами и JSON mode "
-          "(v1.10.0: 280 не вмещал JSON на 3 кандидатов)",
+    check("пакетный ответ ограничен 760 completion-токенами и JSON mode",
           batch_kwargs and batch_kwargs[0]["max_tokens"] == 760
           and batch_kwargs[0]["response_format"] == {"type": "json_object"},
           str(batch_kwargs))
@@ -899,6 +893,235 @@ async def main() -> int:
     check("при расхождении автоторговля выключена и ордер не отправлен",
           not mismatch_state.trading_enabled and not mismatch_client.buys,
           f"enabled={mismatch_state.trading_enabled}, buys={mismatch_client.buys}")
+
+    # --- Тест 24: session windows and no-overnight guard ----------------------
+    print("\n[24] Скальп: окна входов, 45 минут до закрытия, принудительный flat")
+    def msk_dt(hour: int, minute: int) -> datetime:
+        return datetime(2026, 11, 10, hour, minute, tzinfo=sessions.MSK)
+    check("основное окно открывается с 10:05 МСК",
+          sessions.is_scalp_entry_time(msk_dt(10, 5)))
+    check("вечернее окно открывается с 19:07 МСК",
+          sessions.is_scalp_entry_time(msk_dt(19, 7)))
+    check("перерыв между сессиями не допускает новых входов",
+          not sessions.is_scalp_entry_time(msk_dt(18, 55)))
+    check("вход в 18:00 допустим при 45 минутах до закрытия",
+          sessions.can_open_scalp_entry(45, msk_dt(18, 0)))
+    check("вход в 18:01 запрещён: недостаточно 45 минут",
+          not sessions.can_open_scalp_entry(45, msk_dt(18, 1)))
+    check("перед клирингом включается принудительное закрытие",
+          sessions.should_force_flatten_scalp(msk_dt(18, 40)))
+    check("flat ограничен последними минутами открытой сессии",
+          not sessions.should_force_flatten_scalp(msk_dt(18, 50))
+          and sessions.should_force_flatten_scalp(msk_dt(23, 45)))
+    check("идентификатор различает основную и вечернюю сессии",
+          sessions.scalp_session_key(msk_dt(18, 30)) == "2026-11-10:main"
+          and sessions.scalp_session_key(msk_dt(19, 15)) == "2026-11-10:evening")
+    check("в середине сессии принудительное закрытие выключено",
+          not sessions.should_force_flatten_scalp(msk_dt(14, 0)))
+
+    # --- Тест 25: migration and expiry of old positions -----------------------
+    print("\n[25] Скальп: миграция старой позиции и немедленный time-stop")
+    legacy_state = StateStore(os.path.join(tmp, "legacy_scalp_state.json"),
+                              initial_overrides={"trading_enabled": True})
+    legacy_state.set_scalp_mode(True)
+    legacy_client = FakeClient()
+    legacy_engine = TradingEngine(cfg, legacy_state, legacy_client, FakeAnalyst(), notify)
+    old_entry = time.time() - 900 * 60
+    legacy_state.set_position("SBER", {
+        "lots": 1, "initial_lots": 1, "entry_price": 100.0,
+        "entry_epoch": old_entry,
+        "entry_ts": sessions.msk_from_ts(old_entry).strftime("%Y-%m-%d %H:%M:%S"),
+        "stop_loss_pct": 3.0,
+    })
+    legacy_engine._migrate_legacy_scalp_positions()
+    migrated = legacy_state.positions.get("SBER", {})
+    check("старая позиция получает scalp_managed и стоп не шире 1%",
+          migrated.get("scalp_managed") is True
+          and migrated.get("scalp_migrated_from_legacy") is True
+          and float(migrated.get("scalp_risk_pct", 99)) <= 1.0)
+    await legacy_engine._check_scalp_exit("SBER", 100.1, migrated)
+    check("устаревшая позиция старше 45 минут закрывается при первой котировке",
+          "SBER" not in legacy_state.positions
+          and legacy_client.sells == [("SBER", 1)])
+
+    managed_legacy_state = StateStore(
+        os.path.join(tmp, "managed_legacy_state.json"),
+        initial_overrides={"trading_enabled": True})
+    managed_legacy_state.set_scalp_mode(True)
+    managed_legacy_client = FakeClient()
+    managed_legacy_engine = TradingEngine(cfg, managed_legacy_state,
+                                          managed_legacy_client, FakeAnalyst(), notify)
+    unknown_position = {"lots": 1, "entry_price": 100.0, "scalp_managed": True,
+                        "scalp_risk_pct": 3.4, "stop_price": 96.6,
+                        "scalp_atr_pct": 1.0}
+    managed_legacy_state.set_position("GAZP", unknown_position)
+    managed_legacy_engine._migrate_legacy_scalp_positions()
+    normalized_unknown = managed_legacy_state.positions["GAZP"]
+    check("scalp-позиция без времени входа мигрирует с безопасным стопом",
+          normalized_unknown.get("scalp_time_unknown") is True
+          and float(normalized_unknown.get("scalp_risk_pct", 99)) <= 1.0
+          and float(normalized_unknown.get("stop_price", 0)) >= 99.0)
+    await managed_legacy_engine._check_scalp_exit("GAZP", 100.0, normalized_unknown)
+    check("позиция с неизвестным временем закрывается на первой котировке",
+          "GAZP" not in managed_legacy_state.positions
+          and managed_legacy_client.sells == [("GAZP", 1)])
+
+    # --- Тест 26: weak-position guard -----------------------------------------
+    print("\n[26] Скальп: слабая позиция закрывается раньше полного стопа")
+    weak_state = StateStore(os.path.join(tmp, "weak_guard_state.json"),
+                            initial_overrides={"trading_enabled": True})
+    weak_state.set_scalp_mode(True)
+    weak_client = FakeClient()
+    weak_engine = TradingEngine(cfg, weak_state, weak_client, FakeAnalyst(), notify)
+    weak_pos = {"lots": 1, "initial_lots": 1, "entry_price": 100.0,
+                "entry_epoch": time.time() - 21 * 60, "max_price": 100.0,
+                "scalp_managed": True, "scalp_risk_pct": 0.8,
+                "scalp_atr_pct": 0.2, "scalp_round_trip_cost_pct": 0.1,
+                "scalp_expected_round_trip_cost_pct": 0.15,
+                "stop_price": 99.2, "tp1_done": False,
+                "llm_confidence": 0.65}
+    weak_state.set_position("SBER", weak_pos)
+    await weak_engine._check_scalp_exit("SBER", 99.6, weak_pos)
+    check("weak guard (<0.70) закрывает на -0.45R после 20 минут",
+          "SBER" not in weak_state.positions
+          and weak_client.sells == [("SBER", 1)])
+
+    # --- Тест 27: scanner and engine share the same 5m timeframe --------------
+    print("\n[27] Скальп: сканер и торговый движок используют один 5m таймфрейм")
+    check("сканер использует 5m и 51 свечу, как scalp engine",
+          abs(scanner_module._SCAN_STEP_H - (1.0 / 12.0)) < 1e-9
+          and scanner_module._SCAN_FAST_N == 24
+          and scanner_module._MIN_CANDLES == 51)
+    scalp_tf_state = StateStore(os.path.join(tmp, "scalp_tf_state.json"),
+                                initial_overrides={"aggressiveness": 30})
+    scalp_tf_state.set_scalp_mode(True)
+    scalp_tf_engine = TradingEngine(cfg, scalp_tf_state, FakeClient(), FakeAnalyst(), notify)
+    scalp_tf_info = scalp_tf_engine.activity_info()
+    check("скальп фиксирует 5m/2h независимо от activity slider",
+          scalp_tf_info["step_min"] == 5 and scalp_tf_info["sma_hours"] == 2.0
+          and scalp_tf_info["fast_n"] == 24, str(scalp_tf_info))
+
+    # --- Тест 28: trade-memory performance metrics ---------------------------
+    print("\n[28] Trade journal: PF, expectancy и группировка по сетапу")
+    metrics_memory = TradeMemory(os.path.join(tmp, "metrics_memory.json"), max_trades=100)
+    for pnl_value in [10.0, -5.0, 12.0, -7.0]:
+        metrics_memory.record(
+            ticker="SBER", entry_price=100.0, exit_price=100.0 + pnl_value,
+            lots=1, lot_size=1, reason="test", profit_pct=pnl_value,
+            entry_ts_str=sessions.msk_now().strftime("%Y-%m-%d %H:%M:%S"),
+            cost_rub=0.0, setup="breakout", mode="scalp", entry_tf_min=5)
+    perf = metrics_memory.performance_metrics()
+    check("метрики PF и expectancy рассчитываются по net P&L",
+          perf["n"] == 4 and abs(perf["profit_factor"] - 22.0/12.0) < 1e-9
+          and abs(perf["expectancy"] - 2.5) < 1e-9)
+    check("journal сохраняет setup/mode/timeframe для анализа стратегии",
+          metrics_memory.trades()[-1].get("setup") == "breakout"
+          and metrics_memory.trades()[-1].get("mode") == "scalp"
+          and metrics_memory.trades()[-1].get("entry_tf_min") == 5)
+
+    # --- Тест 29: strict scalp max age ----------------------------------------
+    print("\n[29] Скальп: жёсткий максимум удержания")
+    max_age_state = StateStore(os.path.join(tmp, "max_age_state.json"),
+                               initial_overrides={"trading_enabled": True})
+    max_age_state.set_scalp_mode(True)
+    max_age_client = FakeClient()
+    max_age_engine = TradingEngine(cfg, max_age_state, max_age_client, FakeAnalyst(), notify)
+    old_but_profitable = {"lots": 1, "initial_lots": 1, "entry_price": 100.0,
+                          "entry_epoch": time.time() - 50 * 60,
+                          "scalp_managed": True, "scalp_risk_pct": 0.8,
+                          "scalp_atr_pct": 0.2, "scalp_round_trip_cost_pct": 0.1,
+                          "scalp_expected_round_trip_cost_pct": 0.15,
+                          "stop_price": 99.2, "tp1_done": False,
+                          "llm_confidence": 0.8,
+                          "scalp_session_key": sessions.scalp_session_key() or "unknown"}
+    max_age_state.set_position("SBER", old_but_profitable)
+    await max_age_engine._check_scalp_exit("SBER", 100.3, old_but_profitable)
+    check("позиция не пересиживает 45 минут даже после +0.3R",
+          "SBER" not in max_age_state.positions
+          and max_age_client.sells == [("SBER", 1)])
+
+    # --- Тест 30: positive pullback and mandatory VWAP ------------------------
+    print("\n[30] Сетапы: pullback проходит при подтверждении и блокируется без VWAP")
+    setup_closes = [100.0 + i * 0.12 for i in range(55)]
+    setup_closes[-4:] = [106.0, 106.15, 106.05, 106.25]
+    setup_summary = indicators.summarize_generic(
+        setup_closes, setup_closes[-1], fast_n=24, step_h=1.0/12.0)
+    setup_summary["atr_pct"] = 0.35
+    setup_summary["macd"] = {"histogram": 0.08, "histogram_prev": 0.07}
+    setup_summary["rsi14"] = 58.0
+    setup_summary["rsi7"] = 62.0
+    setup_summary["bollinger"] = {"pct_b": 0.65}
+    pullback_ctx = {"volume_ratio": 0.9, "last_close": 106.25,
+                    "previous_close": 106.05, "last_low": 106.0,
+                    "previous_low": 105.95, "recent_lows": [105.9, 105.95, 106.0],
+                    "pullback_volume_fade": True, "session_vwap": 105.9,
+                    "range_high_12": 106.6}
+    pullback_setups, _ = indicators.detect_entry_setups(
+        setup_closes, 106.25, setup_summary, pullback_ctx, 24,
+        scalp_mode=True, market_breadth_pct=60.0)
+    no_vwap_ctx = dict(pullback_ctx)
+    no_vwap_ctx["session_vwap"] = None
+    no_vwap_setups, _ = indicators.detect_entry_setups(
+        setup_closes, 106.25, setup_summary, no_vwap_ctx, 24,
+        scalp_mode=True, market_breadth_pct=60.0)
+    check("подтверждённый pullback не заблокирован избыточно строгим фильтром",
+          "pullback" in pullback_setups, str(pullback_setups))
+    check("скальп не допускает сетап без актуального VWAP",
+          not no_vwap_setups, str(no_vwap_setups))
+
+    # --- Test 31: normal weak-position early cut ------------------------------
+    print("\n[31] Обычный режим: слабая позиция закрывается до полного стопа")
+    weak_normal_state = StateStore(os.path.join(tmp, "weak_normal_state.json"),
+                                   initial_overrides={"trading_enabled": True})
+    weak_normal_client = FakeClient()
+    weak_normal_engine = TradingEngine(cfg, weak_normal_state,
+                                       weak_normal_client, FakeAnalyst(), notify)
+    weak_normal_pos = {"lots": 1, "initial_lots": 1, "entry_price": 100.0,
+                       "entry_epoch": time.time() - 21 * 60,
+                       "stop_loss_pct": 3.0, "take_profit_pct": 5.0,
+                       "llm_confidence": 0.65}
+    weak_normal_state.set_position("ROSN", weak_normal_pos)
+    await weak_normal_engine._check_exit("ROSN", 98.4, weak_normal_pos)
+    check("confidence <0.70 и −0.5×стопа после 20 минут дают ранний выход",
+          "ROSN" not in weak_normal_state.positions
+          and weak_normal_client.sells == [("ROSN", 1)])
+
+    # --- Test 32: regression for harvest tier scope ---------------------------
+    print("\n[32] Регрессия сопровождения: harvest tier определён локально")
+    tier_state = StateStore(os.path.join(tmp, "tier_scope_state.json"),
+                            initial_overrides={"trading_enabled": True})
+    tier_client = FakeClient()
+    tier_engine = TradingEngine(cfg, tier_state, tier_client, FakeAnalyst(), notify)
+    tier_pos = {"lots": 1, "initial_lots": 1, "entry_price": 100.0,
+                "max_profit_pct": 4.0, "stop_loss_pct": 3.0,
+                "take_profit_pct": 10.0}
+    tier_state.set_position("SBER", tier_pos)
+    await tier_engine._check_exit("SBER", 103.0, tier_pos)
+    check("откат после пика запускает harvest-продажу без NameError tier",
+          "SBER" not in tier_state.positions
+          and tier_client.sells == [("SBER", 1)])
+
+    # --- Test 33: no carrying scalp across main/evening session --------------
+    print("\n[33] Скальп: позиция закрывается при переходе в другую сессию")
+    rollover_state = StateStore(os.path.join(tmp, "rollover_state.json"),
+                                initial_overrides={"trading_enabled": True})
+    rollover_state.set_scalp_mode(True)
+    rollover_client = FakeClient()
+    rollover_engine = TradingEngine(cfg, rollover_state, rollover_client,
+                                    FakeAnalyst(), notify)
+    rollover_pos = {"lots": 1, "initial_lots": 1, "entry_price": 100.0,
+                    "entry_epoch": time.time() - 5 * 60,
+                    "scalp_managed": True, "scalp_risk_pct": 0.8,
+                    "scalp_atr_pct": 0.2, "scalp_round_trip_cost_pct": 0.1,
+                    "scalp_expected_round_trip_cost_pct": 0.15,
+                    "stop_price": 99.2, "tp1_done": False,
+                    "llm_confidence": 0.8,
+                    "scalp_session_key": "2026-11-09:main"}
+    rollover_state.set_position("VTBR", rollover_pos)
+    await rollover_engine._check_scalp_exit("VTBR", 100.1, rollover_pos)
+    check("разница session key вызывает закрытие до переноса позиции",
+          "VTBR" not in rollover_state.positions
+          and rollover_client.sells == [("VTBR", 1)])
 
     print("\n" + "=" * 64)
     print(f"ИТОГО: пройдено {len(PASSED)}, провалено {len(FAILED)}")

@@ -73,12 +73,6 @@ Notifier = Callable[[str], Awaitable[None]]
 _LLM_CACHE_TTL_SEC = 30 * 60
 #: Как часто можно сообщать админу о пропущенной покупке (один тикер).
 _SKIP_NOTIFY_TTL_SEC = 30 * 60
-#: v1.10.0: порог "тревожной" позиции. Если при покупке ИИ был уверен
-#: меньше этого значения, позиция считается СЛАБОЙ: охрана ходит по ней
-#: вдвое чаще (30 сек вместо 60), тайм-стоп вдвое короче, а убыток
-#: режется раньше полного стопа - "не уверен - следи пристальнее и
-#: выходи вовремя", как просил владелец.
-ANXIOUS_CONFIDENCE = 0.70
 
 
 def _fmt_rub(value: float) -> str:
@@ -164,8 +158,120 @@ class TradingEngine:
         # Для автопокупок прямые индивидуальные LLM-вызовы не используются.
         self._ai_batch_candidates: Dict[str, Dict[str, Any]] = {}
         self._ai_batch_shortlist: set[str] = set()
-        # v1.10.0: одноразовый флаг "охрана ускорена" (анти-спам в логе).
-        self._fast_guard_logged = False
+        self._position_guard_last: Dict[str, float] = {}
+        self._migrate_legacy_scalp_positions()
+
+    def _migrate_legacy_scalp_positions(self) -> None:
+        """Нормализует все позиции скальп-режима, включая старые state-файлы.
+
+        Важное правило: старая swing-позиция не может сохранить широкий стоп
+        3-4% только потому, что поле stop_price уже было записано. У неизвестной
+        по времени позиции отсчёт начинается с миграции, а закрытие произойдёт
+        на первой доступной котировке после пометки time_unknown.
+        """
+        if not self.scalp_mode():
+            return
+        changed = 0
+        now_epoch = time.time()
+        for ticker, raw in list(getattr(self._state, "positions", {}).items()):
+            pos = dict(raw)
+            entry = float(pos.get("entry_price", 0) or 0.0)
+            if entry <= 0:
+                log.error("%s: позиция без entry_price; миграцию scalp-признаков пропускаю", ticker)
+                continue
+
+            try:
+                entry_epoch = float(pos.get("entry_epoch") or 0.0)
+            except (TypeError, ValueError):
+                entry_epoch = 0.0
+            time_unknown = bool(pos.get("scalp_time_unknown", False))
+            if entry_epoch <= 0:
+                try:
+                    entry_dt = datetime.strptime(
+                        str(pos.get("entry_ts", "")), "%Y-%m-%d %H:%M:%S").replace(
+                            tzinfo=sessions.MSK)
+                    entry_epoch = entry_dt.timestamp()
+                except (ValueError, TypeError):
+                    entry_epoch = now_epoch
+                    time_unknown = True
+
+            was_managed = bool(pos.get("scalp_managed"))
+            raw_risk = (pos.get("scalp_risk_pct") if was_managed
+                        else pos.get("stop_loss_pct"))
+            if raw_risk is None:
+                raw_risk = self._cfg.scalp_max_stop_pct
+            try:
+                old_risk = float(raw_risk)
+            except (TypeError, ValueError):
+                old_risk = float(self._cfg.scalp_max_stop_pct)
+            risk_pct = min(float(self._cfg.scalp_max_stop_pct),
+                           max(float(self._cfg.scalp_min_stop_pct), old_risk))
+            commission_pct = float(pos.get("scalp_round_trip_cost_pct")
+                                    or pos.get("estimated_round_trip_cost_pct")
+                                    or self._cfg.scalp_round_trip_cost_pct)
+            try:
+                atr_pct = float(pos.get("scalp_atr_pct") or
+                                risk_pct / max(0.1, self._cfg.scalp_atr_multiplier))
+            except (TypeError, ValueError):
+                atr_pct = risk_pct / max(0.1, self._cfg.scalp_atr_multiplier)
+
+            safe_stop_price = entry * (1.0 - risk_pct / 100.0)
+            try:
+                old_stop_price = float(pos.get("stop_price") or 0.0)
+            except (TypeError, ValueError):
+                old_stop_price = 0.0
+            # Для long-позиций больший stop_price = более строгий стоп.
+            # Не расширяем существующий стоп; но старый swing-стоп обязательно
+            # сужаем к scalp-риску.
+            stop_price = (safe_stop_price if not was_managed or old_stop_price <= 0
+                          else max(old_stop_price, safe_stop_price))
+            entry_session = sessions.scalp_session_key(entry_epoch)
+            if not entry_session:
+                entry_session = str(pos.get("scalp_session_key") or "") or None
+
+            needs_update = (
+                not was_managed
+                or not pos.get("entry_epoch")
+                or not pos.get("scalp_risk_pct")
+                or not pos.get("stop_price")
+                or not pos.get("scalp_session_key")
+                or bool(pos.get("scalp_time_unknown")) != time_unknown
+                or old_stop_price < stop_price
+                or pos.get("scalp_session_key") != (entry_session or "unknown")
+            )
+            if not needs_update:
+                continue
+            try:
+                migrated_confidence = float(pos.get("llm_confidence") or 0.0)
+            except (TypeError, ValueError):
+                migrated_confidence = 0.0
+            pos.update({
+                "scalp_managed": True,
+                "scalp_migrated_from_legacy": bool(
+                    pos.get("scalp_migrated_from_legacy") or not was_managed),
+                "scalp_time_unknown": time_unknown,
+                "scalp_risk_pct": risk_pct,
+                "scalp_atr_pct": max(0.01, atr_pct),
+                "scalp_round_trip_cost_pct": commission_pct,
+                "scalp_expected_round_trip_cost_pct": float(
+                    pos.get("scalp_expected_round_trip_cost_pct") or commission_pct),
+                "stop_price": round(stop_price, 4),
+                "entry_epoch": entry_epoch,
+                "entry_tf_min": 5,
+                "scalp_session_key": entry_session or "unknown",
+                "llm_confidence": migrated_confidence,
+                "setup": str(pos.get("setup") or "legacy"),
+                "tp1_done": bool(pos.get("tp1_done", False)),
+            })
+            self._state.set_position(ticker, pos)
+            changed += 1
+            age_min = max(0.0, (now_epoch - entry_epoch) / 60.0)
+            log.warning("%s: позиция нормализована для scalp management; age=%.0f мин, "
+                        "risk=%.2f%%, session=%s, time_unknown=%s", ticker, age_min,
+                        risk_pct, pos["scalp_session_key"], time_unknown)
+        if changed:
+            log.warning("Нормализация scalp-позиций: %d шт.; проверены стопы, "
+                        "время входа и идентификаторы торговой сессии", changed)
 
     # -------------------------------------------------------------- жизненный цикл
     def request_stop(self) -> None:
@@ -182,8 +288,7 @@ class TradingEngine:
         info = self.activity_info()
         scalp_txt = (f", СКАЛЬП-РЕЖИМ: полные циклы каждые "
                      f"{self._cfg.scalp_poll_sec // 60} мин, охрана позиций "
-                     f"каждые {self._cfg.scalp_exit_poll_sec // 60} мин "
-                     f"(слабые позиции - вдвое чаще), "
+                     f"каждые {self._cfg.scalp_exit_poll_sec // 60} мин, "
                      f"до {self._cfg.scalp_max_positions} бумаг"
                      if self.scalp_mode() else "")
         log.info("Торговый движок v2 запущен: тикеры %s, период %d сек, "
@@ -203,21 +308,7 @@ class TradingEngine:
                         await self.cycle()
                     else:
                         await self.exit_cycle()
-                    # v1.10.0: адаптивная охрана. Есть слабые позиции
-                    # (низкая уверенность ИИ при входе) - проверяем их
-                    # каждые 30 сек, иначе обычные SCALP_EXIT_POLL_SEC.
-                    anxious = self._anxious_positions()
-                    guard_sec = self._cfg.scalp_exit_poll_sec
-                    if anxious:
-                        guard_sec = max(15.0, self._cfg.scalp_exit_poll_sec / 2.0)
-                        if not self._fast_guard_logged:
-                            log.info("Охрана ускорена до %.0f сек: слабых позиций %d "
-                                     "(низкая уверенность ИИ при входе)",
-                                     guard_sec, anxious)
-                            self._fast_guard_logged = True
-                    else:
-                        self._fast_guard_logged = False
-                    await self._sleep(max(5.0, guard_sec))
+                    await self._sleep(30.0)
                 else:
                     await self.cycle()
                     await self._sleep(self._cfg.poll_interval_sec)
@@ -241,6 +332,7 @@ class TradingEngine:
         Один ПОЛНЫЙ проход: входы + выходы, for по тикерам СТРОГО последовательно.
         Ошибка по одному тикеру не останавливает остальные.
         """
+        self._migrate_legacy_scalp_positions()
         self._cycles_done += 1
         for ticker in self.watchlist():
             if self._stop_event.is_set():
@@ -257,7 +349,7 @@ class TradingEngine:
                                 "(инструмент недоступен для торгов). Повторю "
                                 "в следующем цикле.", ticker)
                 else:
-                    log.error("Ошибка обработки %s: %s", ticker, exc)
+                    log.exception("Ошибка обработки %s", ticker)
 
     async def exit_cycle(self) -> None:
         """Быстрая охрана позиций (скальп-режим, v1.7.0): только выходы.
@@ -265,13 +357,24 @@ class TradingEngine:
         Между полными циклами каждые SCALP_EXIT_POLL_SEC секунд проверяем
         открытые позиции: если цена перестала расти (радар разворота,
         фиксация прибыли, трейлинг) или пробила стоп - продаём сразу,
-        не дожидаясь следующего полного цикла. Слабые позиции (низкая
-        уверенность ИИ при входе) охраняются вдвое чаще - интервал
-        адаптируется в run().
+        не дожидаясь следующего полного цикла.
         """
+        self._migrate_legacy_scalp_positions()
+        now_mono = time.monotonic()
+        active_positions = set(self._state.positions.keys())
+        for stale in set(self._position_guard_last) - active_positions:
+            self._position_guard_last.pop(stale, None)
         for ticker in list(self._state.positions.keys()):
             if self._stop_event.is_set():
                 break
+            position = self._state.positions.get(ticker) or {}
+            confidence = float(position.get("llm_confidence", 0.0) or 0.0)
+            weak_position = confidence < 0.70
+            interval = 30.0 if weak_position else max(60.0, float(self._cfg.scalp_exit_poll_sec))
+            last_guard = self._position_guard_last.get(ticker, 0.0)
+            if now_mono - last_guard < interval:
+                continue
+            self._position_guard_last[ticker] = now_mono
             try:
                 await self._process_ticker(ticker, exits_only=True)
             except asyncio.CancelledError:
@@ -280,7 +383,7 @@ class TradingEngine:
                 if "30079" in str(exc) or "недоступен для торгов" in str(exc):
                     log.info("%s: рынок закрыт - охрана позиций подождёт", ticker)
                 else:
-                    log.error("Охрана позиций %s: %s", ticker, exc)
+                    log.exception("Охрана позиций %s", ticker)
 
     async def _market_closed(self, ticker: str) -> bool:
         """True - биржа точно закрыта по этой бумаге (пауза до открытия).
@@ -382,24 +485,6 @@ class TradingEngine:
         return "other:" + ticker
 
     # ------------------------------------------------------------- скальп-режим
-    def _anxious_positions(self) -> int:
-        """Сколько открытых позиций куплены с низкой уверенностью ИИ.
-
-        v1.10.0: такие позиции в "тревожном" режиме - охрана ходит по ним
-        вдвое чаще, тайм-стоп вдвое короче, убыток режется раньше полного
-        стопа (см. _check_exit/_check_scalp_exit). Ручные покупки владельца
-        считаются уверенными (ai_confidence=0.9).
-        """
-        n = 0
-        for pos in self._state.positions.values():
-            try:
-                conf = float(pos.get("ai_confidence", 1.0) or 1.0)
-            except (TypeError, ValueError):
-                conf = 1.0
-            if conf < ANXIOUS_CONFIDENCE:
-                n += 1
-        return n
-
     def scalp_mode(self) -> bool:
         """Включён ли скальп-режим (живёт в state.json, читаем каждый цикл:
         переключение /scalp действует немедленно, без рестарта).
@@ -501,11 +586,15 @@ class TradingEngine:
 
     # --------------------------------------------- активность: масштаб времени
     def _sma_hours(self) -> float:
-        """Рабочее окно средней: 24 ч при act=0 ... 1 ч при act=100."""
+        """Рабочий горизонт средней: скальп жёстко закреплён на 2 ч/5m."""
+        if self.scalp_mode():
+            return 2.0
         return max(1.0, 24.0 ** (1.0 - self._activity() / 100.0))
 
     def _candle_step_h(self, sma_hours: float) -> float:
         """Длительность рабочей свечи (в часах) под текущее окно средней."""
+        if self.scalp_mode():
+            return 1.0 / 12.0
         if sma_hours >= 10.0:
             return 1.0             # часовые свечи
         if sma_hours >= 3.0:
@@ -566,9 +655,9 @@ class TradingEngine:
         return list(self._cfg.trading_tickers)
 
     def max_tickers(self) -> int:
-        """Лимит бумаг под управлением: в скальп-режиме до 8."""
+        """Лимит тикеров наблюдения; лимит открытых позиций проверяется отдельно."""
         if self.scalp_mode():
-            return int(getattr(self._cfg, "scalp_max_positions", 10) or 10)
+            return int(getattr(self._cfg, "scalp_watchlist_max", 10) or 10)
         return int(getattr(self._cfg, "max_tickers", 6) or 6)
 
     async def add_watchlist(self, ticker: str) -> str:
@@ -818,9 +907,10 @@ class TradingEngine:
                 return
         # Строгие скальп-фильтры исполняются ДО ИИ и не могут быть переопределены.
         if self.scalp_mode():
-            if not sessions.is_scalp_entry_time():
-                log.info("%s: вход вне торговых часов (разрешены 10:05-18:40 "
-                         "и 19:07-23:40 МСК) - жду", ticker)
+            if not sessions.can_open_scalp_entry(self._cfg.scalp_time_stop_min):
+                log.info("%s: скальп-вход запрещён: вне торгового окна или "
+                         "до закрытия сессии осталось меньше %d мин", ticker,
+                         self._cfg.scalp_time_stop_min)
                 return
             if len(self._state.positions) >= self._cfg.scalp_max_positions:
                 log.info("%s: достигнут лимит скальп-позиций (%d)",
@@ -892,12 +982,7 @@ class TradingEngine:
         step_h = (1.0 / 12.0 if self.scalp_mode()
                   else self._candle_step_h(sma_h))
         fast_n = (24 if self.scalp_mode() else self._fast_n(sma_h, step_h))
-        # v1.10.1 FIX: в скальпе просили всего 4 ч истории 5-минутных свечей,
-        # а индикаторам нужно 51 - тикеры, добавленные сканером утром, часами
-        # не могли торговать (лог: "мало рабочих свечей (39 из 51)"). 26 ч =
-        # то же окно, что у сканера (_SCAN_HISTORY_H): вчерашней основной
-        # сессии хватает, индикаторы строятся сразу после старта.
-        fetch_h = (26.0 if self.scalp_mode()
+        fetch_h = (4.0 if self.scalp_mode()
                    else self._fetch_hours(fast_n, step_h))
         morning_ctx: Dict[str, Any] = {}
         morning = (not self.scalp_mode() and
@@ -941,6 +1026,8 @@ class TradingEngine:
                 "higher_low": bool(entry_context.get("higher_low")),
                 "pullback_volume_fade": bool(entry_context.get("pullback_volume_fade")),
                 "last_closed_price": entry_context.get("last_close"),
+                "session_vwap": entry_context.get("session_vwap"),
+                "range_high_12": entry_context.get("range_high_12"),
             })
         # Без ATR/спреда скальп не оцениваем: это критичные данные для стопа
         # и проверки, что цель покрывает издержки. Не подставляем выдуманные значения.
@@ -1237,7 +1324,9 @@ class TradingEngine:
             stop_pct = float(position.get("scalp_risk_pct")
                               or position.get("stop_loss_pct")
                               or self._cfg.scalp_max_stop_pct)
-            risk_rub += lots * lot_size * entry * max(0.0, stop_pct) / 100.0
+            cost_pct = float(position.get("scalp_expected_round_trip_cost_pct")
+                             or position.get("scalp_round_trip_cost_pct") or 0.0)
+            risk_rub += lots * lot_size * entry * max(0.0, stop_pct + cost_pct) / 100.0
         return risk_rub / equity * 100.0
 
     async def _buy_locked(self, ticker: str, price: float, sentiment: float,
@@ -1341,7 +1430,9 @@ class TradingEngine:
                          ticker, open_risk_pct, self._cfg.scalp_max_portfolio_risk_pct)
                 return
             risk_budget = total_money * trade_risk_pct / 100.0
-            risk_sized_notional = risk_budget / (scalp_stop_pct / 100.0)
+            expected_cost_pct = float(summary.get("round_trip_cost_pct") or 0.0)
+            # Риск-бюджет включает движение до стопа И модель трения сделки.
+            risk_sized_notional = risk_budget / ((scalp_stop_pct + expected_cost_pct) / 100.0)
             max_position = total_money * self._cfg.scalp_max_position_pct / 100.0
             budget = min(budget, risk_sized_notional, max_position)
         else:
@@ -1372,29 +1463,31 @@ class TradingEngine:
             "realized_lots": 0,
             "realized_exit_value": 0.0,
             "entry_price": round(price, 4),
-            "estimated_round_trip_cost_pct": float(
-                summary.get("round_trip_cost_pct") if self.scalp_mode()
-                else self._cfg.estimated_round_trip_cost_pct
-            ),
+            # Реализованный P&L в sandbox вычитает подтверждаемую комиссию;
+            # spread/slippage учитываются отдельно в risk/edge, не вычитаются
+            # повторно из цены исполнения.
+            "estimated_round_trip_cost_pct": float(self._cfg.scalp_round_trip_cost_pct
+                if self.scalp_mode() else self._cfg.estimated_round_trip_cost_pct),
+            "setup": str(decision.get("setup") or summary.get("selected_setup") or "unknown"),
+            "signal_score": float(score),
+            "llm_confidence": float(decision.get("confidence") or 0.0),
+            "entry_tf_min": 5 if self.scalp_mode() else int(self.activity_info()["step_min"]),
             "entry_ts": entry_ts,
             "entry_epoch": time.time(),
             "order_id": result.get("order_id", ""),
             "max_profit_pct": 0.0,
             "max_price": price,
             "sl_confirm": 0,
-            # v1.10.0: уверенность ИИ на момент входа. Позиции с низкой
-            # уверенностью (< ANXIOUS_CONFIDENCE) охраняются чаще и раньше
-            # закрываются при просадке (см. _anxious_positions).
-            "ai_confidence": round(
-                min(1.0, max(0.0, float(decision.get("confidence") or 0.9))), 3),
         }
         if self.scalp_mode() and scalp_stop_pct is not None:
             pos_data.update({
                 "scalp_managed": True,
+                "scalp_session_key": sessions.scalp_session_key() or "unknown",
                 "scalp_risk_pct": scalp_stop_pct,
                 "scalp_risk_budget_pct": trade_risk_pct,
                 "scalp_atr_pct": float(summary.get("atr_pct") or 0.0),
-                "scalp_round_trip_cost_pct": float(summary.get("round_trip_cost_pct") or 0.0),
+                "scalp_round_trip_cost_pct": float(self._cfg.scalp_round_trip_cost_pct),
+                "scalp_expected_round_trip_cost_pct": float(summary.get("round_trip_cost_pct") or 0.0),
                 "stop_price": round(price * (1.0 - scalp_stop_pct / 100.0), 4),
                 "tp1_done": False,
             })
@@ -1480,34 +1573,33 @@ class TradingEngine:
             await self._sell(ticker, price, position, "стоп-лосс", profit_pct,
                              "жёсткий стоп достигнут; ИИ не может его отложить")
             return
+        # Адаптивный weak-position guard из v1.10: слабый первоначальный
+        # вердикт (<0.70) не должен ждать полного swing-стопа. После 20 минут
+        # закрываем при просадке в половину планового стопа.
+        try:
+            confidence = float(position.get("llm_confidence", 0.0) or 0.0)
+            entry_epoch = float(position.get("entry_epoch", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            confidence, entry_epoch = 0.0, 0.0
+        if entry_epoch <= 0:
+            try:
+                entry_dt = datetime.strptime(
+                    str(position.get("entry_ts", "")), "%Y-%m-%d %H:%M:%S")
+                entry_epoch = entry_dt.replace(tzinfo=sessions.MSK).timestamp()
+            except (ValueError, TypeError):
+                entry_epoch = 0.0
+        if confidence < 0.70 and entry_epoch > 0:
+            age_min = max(0.0, (time.time() - entry_epoch) / 60.0)
+            if age_min >= 20.0 and profit_pct <= -0.5 * stop_pct:
+                await self._sell(ticker, price, position,
+                                 "ранний выход слабой позиции", profit_pct,
+                                 f"confidence={confidence:.2f}; возраст {age_min:.0f} мин; "
+                                 f"просадка достигла -0.5×стопа")
+                return
         if profit_pct >= take_pct:
             await self._sell(ticker, price, position, "тейк-профит", profit_pct,
                              "достигнута целевая прибыль")
             return
-        # v1.10.0: ранний выход СЛАБОЙ позиции (низкая уверенность ИИ при
-        # входе). Не ждём полного стопа: если за 20 минут сделка просела
-        # хотя бы на половину стопа - закрываем, пока убыток маленький.
-        try:
-            _ai_conf = float(position.get("ai_confidence", 1.0) or 1.0)
-        except (TypeError, ValueError):
-            _ai_conf = 1.0
-        if _ai_conf < ANXIOUS_CONFIDENCE and profit_pct < 0:
-            _entry_epoch = float(position.get("entry_epoch", 0) or 0)
-            _age_min = (max(0.0, (time.time() - _entry_epoch) / 60.0)
-                        if _entry_epoch > 0 else 999.0)
-            if _age_min >= 20.0 and profit_pct <= -0.5 * stop_pct:
-                await self._sell(
-                    ticker, price, position, "ранний выход слабой позиции",
-                    profit_pct,
-                    f"уверенность ИИ при входе {_ai_conf:.0%}; минус "
-                    f"{abs(profit_pct):.2f}% за {_age_min:.0f} мин - "
-                    f"сокращаю убыток до полного стопа")
-                return
-        # v1.10.1 FIX: строка вычисления тира потерялась при правке v1.10.0 -
-        # NameError "name 'tier' is not defined" убивал охрану ЛЮБОЙ позиции,
-        # не стоящей вплотную к стопу/тейку: трейлинг, лестница фиксации и
-        # защита прибыли просто не выполнялись (лог: "Охрана позиций X: name
-        # 'tier' is not defined" каждую минуту).
         tier = harvest_signal(max_profit, profit_pct, ep["tiers"])
         if tier is not None:
             drop_pp, peak_cap = tier
@@ -1545,8 +1637,10 @@ class TradingEngine:
                          min(self._cfg.scalp_stop_loss_pct, self._cfg.scalp_max_stop_pct))
         risk_pct = max(self._cfg.scalp_min_stop_pct,
                        min(risk_pct, self._cfg.scalp_max_stop_pct))
-        cost_pct = float(position.get("scalp_round_trip_cost_pct") or
-                         self._cfg.scalp_round_trip_cost_pct)
+        commission_cost_pct = float(position.get("scalp_round_trip_cost_pct") or
+                                    self._cfg.scalp_round_trip_cost_pct)
+        expected_cost_pct = float(position.get("scalp_expected_round_trip_cost_pct") or
+                                  commission_cost_pct)
         profit_pct = (price / entry - 1.0) * 100.0
         max_price = max(float(position.get("max_price", entry) or entry), price)
         tp1_done = bool(position.get("tp1_done", False))
@@ -1557,14 +1651,30 @@ class TradingEngine:
             float(position.get("max_profit_pct", 0) or 0), profit_pct),
             "scalp_managed": True, "scalp_risk_pct": risk_pct})
 
-        # v1.10.0: "тревожная" позиция. Слабой позицией считаем ту, при
-        # покупке которой ИИ был уверен меньше ANXIOUS_CONFIDENCE: тайм-стоп
-        # для неё вдвое короче, а убыток режется раньше полного стопа.
-        try:
-            ai_conf = float(position.get("ai_confidence", 1.0) or 1.0)
-        except (TypeError, ValueError):
-            ai_conf = 1.0
-        anxious = ai_conf < ANXIOUS_CONFIDENCE
+        # Жёсткий стоп имеет приоритет над сервисным закрытием сессии.
+        if price <= stop_price:
+            await self._sell(ticker, price, update, "стоп-лосс",
+                             profit_pct, "жёсткий скальп-стоп сработал немедленно")
+            return
+
+        # Не переносим скальп-позицию через разрыв между основной и вечерней
+        # сессией или через ночь. Если пропустили окно выхода перед клирингом,
+        # закрываем на первой доступной котировке следующей сессии.
+        entry_session = str(position.get("scalp_session_key") or "")
+        current_session = sessions.scalp_session_key()
+        if (entry_session and entry_session != "unknown" and current_session
+                and entry_session != current_session):
+            await self._sell(ticker, price, update, "скальп: закрытие предыдущей сессии",
+                             profit_pct, f"entry_session={entry_session}; current={current_session}")
+            return
+
+        # Проверяем принудительный выход ДО частичного TP/трейлинга, иначе
+        # ветка TP1 могла вернуть управление и оставить остаток на ночь.
+        if sessions.should_force_flatten_scalp():
+            await self._sell(ticker, price, update, "скальп: закрытие сессии",
+                             profit_pct, "принудительное закрытие перед окончанием торгов")
+            return
+
         entry_epoch = float(position.get("entry_epoch", 0) or 0)
         if entry_epoch <= 0:
             try:
@@ -1574,10 +1684,47 @@ class TradingEngine:
             except (ValueError, TypeError):
                 entry_epoch = time.time()
         age_min = max(0.0, (time.time() - entry_epoch) / 60.0)
+        confidence = float(position.get("llm_confidence", 0.0) or 0.0)
+        weak_position = confidence < 0.70
+        # У неизвестной по времени legacy-позиции безопаснее закрыть её на
+        # первой доступной цене, чем начинать новый 45-минутный таймер вслепую.
+        if bool(position.get("scalp_time_unknown")):
+            await self._sell(ticker, price, update, "скальп: время входа неизвестно",
+                             profit_pct, "не удалось достоверно восстановить возраст позиции")
+            return
+        if (bool(position.get("scalp_migrated_from_legacy"))
+                and age_min >= float(self._cfg.scalp_time_stop_min)):
+            await self._sell(ticker, price, update,
+                             "скальп: закрытие устаревшей legacy-позиции",
+                             profit_pct,
+                             f"позиция открыта до миграции; возраст {age_min:.0f} мин")
+            return
+        # Слабый вердикт получает короткий горизонт; если TP1 ещё не достигнут,
+        # закрываем через половину базового time-stop. Любая scalp-позиция
+        # без TP1 имеет жёсткий максимум удержания 45 минут — не оставляем
+        # плавающий +0.3R как повод пересидеть несколько часов.
+        if not tp1_done:
+            if weak_position and age_min >= 20.0 and profit_pct <= -0.45 * risk_pct:
+                await self._sell(ticker, price, update,
+                                 "скальп: ранний выход слабой позиции", profit_pct,
+                                 f"confidence={confidence:.2f}; просадка не лучше -0.45R")
+                return
+            time_limit = max(5.0, self._cfg.scalp_time_stop_min *
+                             (0.5 if weak_position else 1.0))
+            if age_min >= time_limit:
+                await self._sell(ticker, price, update, "скальп: жёсткий тайм-стоп",
+                                 profit_pct,
+                                 f"максимальное удержание {time_limit:.0f} мин; "
+                                 f"confidence={confidence:.2f}; TP1 не достигнут")
+                return
+        elif age_min >= float(self._cfg.scalp_time_stop_min):
+            await self._sell(ticker, price, update, "скальп: тайм-стоп остатка",
+                             profit_pct, "45 минут с момента входа; закрываю остаток после TP1")
+            return
 
         if tp1_done:
             # После первого транша защищаем капитал и остаток позиции.
-            breakeven = entry * (1.0 + cost_pct / 100.0)
+            breakeven = entry * (1.0 + expected_cost_pct / 100.0)
             atr_pct = float(position.get("scalp_atr_pct", 0) or 0)
             trailing = (max_price * (1.0 - atr_pct / 100.0)
                         if atr_pct > 0 else breakeven)
@@ -1600,16 +1747,6 @@ class TradingEngine:
                 await self._sell(ticker, price, update, "стоп-лосс", profit_pct,
                                  "жёсткий скальп-стоп сработал немедленно")
                 return
-            # Слабую позицию не держим до полного стопа: просела на 0.45R
-            # за первые 8 минут - выходим досрочно, не ждём большего.
-            if anxious and age_min >= 8.0 and profit_pct <= -0.45 * risk_pct:
-                await self._sell(ticker, price, update,
-                                 "скальп: ранний выход слабой позиции",
-                                 profit_pct,
-                                 f"уверенность ИИ при входе {ai_conf:.0%}; "
-                                 f"минус {abs(profit_pct):.2f}% за "
-                                 f"{age_min:.0f} мин - режу убыток раньше стопа")
-                return
             if profit_pct >= risk_pct:
                 if lots == 1:
                     await self._sell(ticker, price, update, "скальп: TP1 1R", profit_pct,
@@ -1618,22 +1755,12 @@ class TradingEngine:
                 partial_lots = max(1, lots // 2)
                 after_tp1 = dict(update)
                 after_tp1["tp1_done"] = True
-                after_tp1["stop_price"] = round(entry * (1.0 + cost_pct / 100.0), 4)
+                after_tp1["stop_price"] = round(entry * (1.0 + expected_cost_pct / 100.0), 4)
                 await self._sell(ticker, price, after_tp1, "скальп: TP1 1R", profit_pct,
                                  "зафиксирована половина; стоп перенесён в безубыток+издержки",
                                  lots_to_sell=partial_lots, partial=True)
                 return
 
-        # Тайм-стоп: через N минут закрываем неразогнавшуюся сделку.
-        # Слабой позиции (низкая уверенность ИИ) даём вдвое меньше времени.
-        time_stop_min = (self._cfg.scalp_time_stop_min * 0.5 if anxious
-                         else self._cfg.scalp_time_stop_min)
-        if age_min >= time_stop_min and profit_pct < risk_pct * self._cfg.scalp_min_progress_r:
-            await self._sell(ticker, price, update, "скальп: тайм-стоп", profit_pct,
-                             f"за {age_min:.0f} мин цена не прошла "
-                             f"{self._cfg.scalp_min_progress_r:.1f}R"
-                             + (" (слабая позиция: лимит времени вдвое короче)"
-                                if anxious else ""))
 
     async def _position_summary(self, ticker: str, price: float
                                 ) -> Tuple[List[Tuple[float, float]], Dict[str, Any]]:
@@ -1746,7 +1873,12 @@ class TradingEngine:
                     lots=initial_lots, lot_size=lot_size, reason=reason,
                     profit_pct=actual_profit_pct,
                     entry_ts_str=str(position.get("entry_ts", "")),
-                    cost_rub=estimated_cost_rub)
+                    cost_rub=estimated_cost_rub,
+                    setup=str(position.get("setup") or "unknown"),
+                    mode="scalp" if was_scalp else "intraday",
+                    entry_tf_min=int(position.get("entry_tf_min", 0) or 0),
+                    signal_score=position.get("signal_score"),
+                    llm_confidence=position.get("llm_confidence"))
                 streak = self._memory.loss_streak(ticker)
                 if pnl < 0 and was_scalp:
                     recent = self._memory.trades()[-2:]
@@ -1938,9 +2070,6 @@ class TradingEngine:
                 "max_profit_pct": 0.0,
                 "sl_confirm": 0,
                 "source": "manual",
-                # Ручная покупка - решение владельца, считаем её уверенной:
-                # обычная охрана без "тревожного" режима.
-                "ai_confidence": 0.9,
             })
             self._state.set_last_buy_ts(ticker, time.time())
 
