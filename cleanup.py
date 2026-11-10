@@ -16,6 +16,7 @@ cleanup.py - гарантия того, что диск 15 ГБ не переп�
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import sys
@@ -108,8 +109,6 @@ def run_cleanup(logs_dir: str, *, keep_days: int = 14,
 
 async def periodic_cleanup(config, stop_event: asyncio.Event, interval_sec: int = 86400) -> None:
     """Фоновая задача main.py: очистка раз в сутки (и сразу при старте)."""
-    import asyncio  # локальный импорт: модуль используется и как CLI-скрипт
-
     while not stop_event.is_set():
         try:
             run_cleanup(

@@ -892,7 +892,12 @@ class TradingEngine:
         step_h = (1.0 / 12.0 if self.scalp_mode()
                   else self._candle_step_h(sma_h))
         fast_n = (24 if self.scalp_mode() else self._fast_n(sma_h, step_h))
-        fetch_h = (4.0 if self.scalp_mode()
+        # v1.10.1 FIX: в скальпе просили всего 4 ч истории 5-минутных свечей,
+        # а индикаторам нужно 51 - тикеры, добавленные сканером утром, часами
+        # не могли торговать (лог: "мало рабочих свечей (39 из 51)"). 26 ч =
+        # то же окно, что у сканера (_SCAN_HISTORY_H): вчерашней основной
+        # сессии хватает, индикаторы строятся сразу после старта.
+        fetch_h = (26.0 if self.scalp_mode()
                    else self._fetch_hours(fast_n, step_h))
         morning_ctx: Dict[str, Any] = {}
         morning = (not self.scalp_mode() and
@@ -1498,6 +1503,12 @@ class TradingEngine:
                     f"{abs(profit_pct):.2f}% за {_age_min:.0f} мин - "
                     f"сокращаю убыток до полного стопа")
                 return
+        # v1.10.1 FIX: строка вычисления тира потерялась при правке v1.10.0 -
+        # NameError "name 'tier' is not defined" убивал охрану ЛЮБОЙ позиции,
+        # не стоящей вплотную к стопу/тейку: трейлинг, лестница фиксации и
+        # защита прибыли просто не выполнялись (лог: "Охрана позиций X: name
+        # 'tier' is not defined" каждую минуту).
+        tier = harvest_signal(max_profit, profit_pct, ep["tiers"])
         if tier is not None:
             drop_pp, peak_cap = tier
             giveback = max_profit - profit_pct

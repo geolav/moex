@@ -242,8 +242,16 @@ class FakeAnalyst:
 
 async def main() -> int:
     print("=" * 64)
-    print("DRY-RUN самопроверка MOEX Trading Bot v1.9.0 (моки, без сети)")
+    print("DRY-RUN самопроверка MOEX Trading Bot v1.10.1 (моки, без сети)")
     print("=" * 64)
+
+    # v1.10.1 FIX: тесты должны быть детерминированными. Фейковая история
+    # свечей рассчитана на обычный цикл; с 10:00 до ~13:00 МСК включается
+    # "утренний якорь", фильтр основной сессии срезает историю до ~35 свечей
+    # (< минимума) и половина набора падает на fail-closed. Отключаем якорь
+    # только внутри теста - производственный код не трогаем.
+    import sessions as _sessions
+    _sessions.is_morning_window = lambda **kwargs: False
 
     tmp = tempfile.mkdtemp(prefix="bot_dryrun_")
     cfg = make_test_config(tmp)
@@ -804,8 +812,9 @@ async def main() -> int:
     check("пакетный анализ вызывает модель один раз и блокирует частые /scan",
           batch_calls == 1 and first_decisions.get("SBER", {}).get("action") == "buy"
           and second_decisions == {})
-    check("пакетный ответ ограничен 280 completion-токенами и JSON mode",
-          batch_kwargs and batch_kwargs[0]["max_tokens"] == 280
+    check("пакетный ответ ограничен 760 completion-токенами и JSON mode "
+          "(v1.10.0: 280 не вмещал JSON на 3 кандидатов)",
+          batch_kwargs and batch_kwargs[0]["max_tokens"] == 760
           and batch_kwargs[0]["response_format"] == {"type": "json_object"},
           str(batch_kwargs))
 
