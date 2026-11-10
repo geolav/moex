@@ -322,9 +322,10 @@ class MarketScanner:
         # Один batch-запрос на весь скан: максимум 2-3 кандидата.
         # Решения сохраняются в движке; он повторно проверит текущие данные,
         # OHLCV-сетап, ATR, спред, cooldown и риск до любого ордера.
-        set_batch = getattr(self._engine, "set_ai_batch_decisions", None)
-        if callable(set_batch):
-            set_batch({}, ai_candidates)
+        # v1.12.0: промежуточный set_batch({}, ...) убран - он дважды писал
+        # "Пакет ИИ обновлён" в лог. Циклы движка и сканера идут строго
+        # последовательно в одном asyncio-цикле, поэтому во время await
+        # движок физически не может прочитать старый пул.
         decisions: Dict[str, dict] = {}
         if cfg.scan_llm and ai_candidates and self._analyst is not None:
             batch_method = getattr(self._analyst, "analyze_candidates", None)
@@ -335,6 +336,7 @@ class MarketScanner:
                 except Exception as exc:  # noqa: BLE001 - отказ ИИ = нет автопокупки
                     log.warning("Сканер: пакетное решение ИИ недоступно (%s)", exc)
                     decisions = {}
+        set_batch = getattr(self._engine, "set_ai_batch_decisions", None)
         if callable(set_batch):
             set_batch(decisions, ai_candidates)
         log.info("Сканер: математический рейтинг посчитал %d бумаг; ИИ получил %d кандидата(ов), ответов %d",

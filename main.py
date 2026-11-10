@@ -123,6 +123,20 @@ def _print_banner(config: BotConfig, state: StateStore) -> None:
         log.info("Скальп: полные циклы каждые %d сек, охрана позиций каждые "
                  "%d сек, кулдаун %d мин", config.scalp_poll_sec,
                  config.scalp_exit_poll_sec, config.scalp_cooldown_min)
+        # v1.12.0: микро-радар - локальный контур поиска входов + бюджет ИИ.
+        log.info("Скальп-радар: проход каждые %d сек (без ИИ) | локальные входы: "
+                 "%s (скор >= %g, до %d/день) | ИИ-подтверждение: скор >= %g, "
+                 "раз в %d сек, дедуп %d мин",
+                 config.scalp_radar_sec,
+                 "вкл" if config.scalp_local_autobuy else "выкл",
+                 config.scalp_local_autobuy_score, config.scalp_local_max_per_day,
+                 config.scalp_ai_score, config.scalp_ai_interval_sec,
+                 config.scalp_ai_dedup_min)
+        log.info("Бюджет Groq: %d токенов/день (резерв скальпа %d, оценка "
+                 "вызова ~%d); бесплатный тариф Groq: 200K TPD / 8K TPM / "
+                 "30 RPM / 1K RPD",
+                 config.groq_daily_token_budget, config.scalp_ai_reserve_tokens,
+                 config.scalp_ai_call_estimate)
     log.info("Агрессивность %d/100 | активность %d/100 "
              "(масштаб времени задаётся в Telegram: /set_activity)",
              state.aggressiveness(), state.activity())

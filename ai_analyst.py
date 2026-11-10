@@ -513,6 +513,21 @@ class AIAnalyst:
             await self._client.close()
             self._client = None
 
+    def budget_status(self) -> Dict[str, int]:
+        """v1.12.0: текущий дневной бюджет Groq для решений движка.
+
+        Микро-радар скальпа перед пакетным вызовом проверяет, хватает ли
+        бюджета: если remainder < оценка вызова + резерв - ИИ пропускается
+        до конца дня, а входы работают на локальном скоре (без токенов).
+        """
+        return dict(self._budget.status())
+
+    def last_candidate_call_age(self) -> float:
+        """Секунд с последнего пакетного вызова (антиспам-интервал радара)."""
+        if not self._last_candidate_call_monotonic:
+            return float("inf")
+        return max(0.0, time.monotonic() - self._last_candidate_call_monotonic)
+
     @staticmethod
     def _estimate_tokens(system: str, user: str, max_tokens: int) -> int:
         # Консервативная оценка для русского текста + запас на reasoning.
@@ -800,7 +815,12 @@ class AIAnalyst:
         if not isinstance(decisions, dict):
             return {}
         result: Dict[str, dict] = {}
-        allowed_setups = {"pullback", "breakout", "reversal", "none"}
+        # v1.12.0: добавлены имена сигналов микро-радара (impulse/squeeze):
+        # в скальпе allowed_setups кандидатов - это сигналы радара, и ИИ
+        # вправе назвать их в setup. Всё равно решение проходит проверку
+        # setup in confirmed_setups (сигналы конкретной бумаги).
+        allowed_setups = {"pullback", "breakout", "reversal",
+                          "impulse", "squeeze", "none"}
         for ticker, confirmed_setups in allowed_by_ticker.items():
             item = decisions.get(ticker)
             if not isinstance(item, dict):

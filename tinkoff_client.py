@@ -526,6 +526,65 @@ class TinkoffClient:
         """Размер лота бумаги из кэша инструментов (1, если тикер неизвестен)."""
         return int(self._instruments.get(ticker, {}).get("lot", 1))
 
+    async def refresh_watchlist_market(self,
+                                       tickers: List[str]) -> Dict[str, Dict[str, Any]]:
+        """v1.12.0: живые цены + спреды ТОЛЬКО для watchlist одним ISS-запросом.
+
+        Микро-радар скальпа должен видеть спред каждые ~минуту, а полный
+        снимок рынка ради десяти бумаг - лишние ~200 КБ каждую минуту.
+        ISS умеет фильтр `securities=SBER,GAZP,...` - ответ крошечный.
+
+        Заполняет тот же _spread_cache, что и полный снимок, поэтому
+        get_spread_pct() движка видит свежие данные без отдельного запроса
+        на каждую бумагу. Возвращает {ticker: {price, spread_pct}}.
+        Ошибки сети НЕ глушим: радар лучше пропустит тик, чем будет
+        торговать по протухшим спредам (fail-closed внутри радара).
+        """
+        wanted = [str(t).upper() for t in (tickers or []) if t][:25]
+        if not wanted:
+            return {}
+        url = (self.MOEX_ISS_URL
+               + "?iss.meta=off&iss.only=marketdata"
+                 "&marketdata.columns=SECID,LAST,BID,OFFER"
+               + "&securities=" + ",".join(wanted))
+        if self._http is None:
+            raise TinkoffClientError("HTTP-сессия ещё не открыта (client.start())")
+        try:
+            async with self._http.get(url) as response:
+                if response.status != 200:
+                    raise TinkoffClientError(f"MOEX ISS: HTTP {response.status}")
+                payload = await response.json(content_type=None)
+        except TinkoffClientError:
+            raise
+        except (asyncio.TimeoutError, aiohttp.ClientError, OSError, ValueError) as exc:
+            raise TinkoffClientError(f"MOEX ISS недоступен: {exc}") from exc
+
+        block = payload.get("marketdata", {}) if isinstance(payload, dict) else {}
+        cols = {name: i for i, name in enumerate(block.get("columns", []) or [])}
+        out: Dict[str, Dict[str, Any]] = {}
+        for row in block.get("data", []) or []:
+            if cols.get("SECID", 0) >= len(row):
+                continue
+            secid = str(row[cols["SECID"]]).upper()
+
+            def _num(name: str) -> float:
+                if name not in cols or cols[name] >= len(row):
+                    return 0.0
+                try:
+                    return float(row[cols[name]]) if row[cols[name]] is not None else 0.0
+                except (TypeError, ValueError):
+                    return 0.0
+
+            price = _num("LAST")
+            bid, offer = _num("BID"), _num("OFFER")
+            spread_pct = ((offer - bid) / ((offer + bid) / 2.0) * 100.0
+                          if bid > 0 and offer >= bid else None)
+            if spread_pct is not None:
+                self._spread_cache[secid] = (spread_pct, time.monotonic())
+            if price > 0 or spread_pct is not None:
+                out[secid] = {"price": price, "spread_pct": spread_pct}
+        return out
+
     def instrument_name(self, ticker: str) -> str:
         """Название компании из кэша инструментов (для сообщений)."""
         return str(self._instruments.get(ticker, {}).get("name", ""))

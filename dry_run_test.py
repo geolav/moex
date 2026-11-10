@@ -44,6 +44,7 @@ from ai_auditor import AIAuditor, local_audit, tail_lines  # noqa: E402
 from cleanup import run_cleanup  # noqa: E402
 from config import BotConfig, StateStore  # noqa: E402
 import indicators  # noqa: E402
+import scalp_detector  # noqa: E402
 from candidate_selector import rank_candidate, rank_market_snapshot, select_top_candidates  # noqa: E402
 from news_filter import classify_headlines  # noqa: E402
 from trading_engine import TradingEngine  # noqa: E402
@@ -112,6 +113,12 @@ def make_test_config(tmp: str) -> BotConfig:
         scalp_time_stop_min=45, scalp_min_progress_r=0.3,
         scalp_loss_pause_minutes=60, scalp_stop_cooldown_min=120,
         scalp_max_sector_positions=2,
+        # v1.12.0: микро-радар скальпа.
+        scalp_radar_sec=60, scalp_local_autobuy=True,
+        scalp_local_autobuy_score=85.0, scalp_local_max_per_day=20,
+        scalp_ai_score=70.0, scalp_ai_interval_sec=600,
+        scalp_ai_dedup_min=20, scalp_ai_reserve_tokens=15000,
+        scalp_ai_call_estimate=2600,
         scan_enabled=False, scan_interval_min=10, scan_min_turnover=50.0,
         scan_min_price=5.0, scan_deep_n=20, scan_report_top=6, scan_llm=False,
         scan_ai_candidates=3, scan_min_candidate_rank=48.0,
@@ -244,7 +251,7 @@ class FakeAnalyst:
 
 async def main() -> int:
     print("=" * 64)
-    print("DRY-RUN самопроверка MOEX Trading Bot v1.11.0 (моки, без сети)")
+    print("DRY-RUN самопроверка MOEX Trading Bot v1.12.0 (моки, без сети)")
     print("=" * 64)
 
     tmp = tempfile.mkdtemp(prefix="bot_dryrun_")
@@ -1122,6 +1129,249 @@ async def main() -> int:
     check("разница session key вызывает закрытие до переноса позиции",
           "VTBR" not in rollover_state.positions
           and rollover_client.sells == [("VTBR", 1)])
+
+    # =========================================================================
+    # v1.12.0: МИКРО-РАДАР СКАЛЬПА - локальные входы без ИИ + бюджет Groq.
+    # =========================================================================
+
+    # Детерминизм: тесты не зависят от времени суток (окно входа всегда открыто).
+    _real_can_open = sessions.can_open_scalp_entry
+    sessions.can_open_scalp_entry = lambda *args, **kwargs: True
+
+    # --- Test 34: radar_score - гейты и скор ---------------------------------
+    print("\n[34] Радар: гейты fail-closed и скор сильного сетапа")
+    radar_closes = [240.0 + i * 0.12 for i in range(40)] + \
+                   [244.8 + i * 0.35 for i in range(15)]
+    radar_closes[-1] = 252.0
+    radar_ctx = {
+        "last_close": 252.0, "last_high": 252.4, "last_low": 250.9,
+        "previous_close": 250.8, "previous_high": 251.0, "previous_low": 249.8,
+        "recent_lows": [250.9, 250.2, 249.8],
+        "range_high_12": 248.5, "session_vwap": 246.0,
+        "volume_ratio": 1.8, "pullback_volume_fade": False,
+        "close_above_prev_high": True, "higher_low": True,
+        "avg_volume": 1000.0, "current_volume": 1800.0,
+    }
+    radar_ok = scalp_detector.radar_score(
+        closes=radar_closes, price=252.5, entry_context=radar_ctx,
+        atr_pct=0.35, spread_pct=0.05, ema9=245.0, ema21=242.0,
+        rsi7=62.0, macd_hist=0.02, macd_hist_prev=0.01, bb_squeeze=False,
+        bollinger_pct_b=0.75, min_stop_pct=0.6, max_stop_pct=1.0,
+        atr_multiplier=1.2, max_spread_pct=0.1, round_trip_cost_pct=0.1,
+        slippage_pct=0.05, min_reward_cost_multiple=3.0,
+        market_breadth_pct=60.0)
+    check("радар подтверждает сильный импульс/пробой (ok, >=2 сигнала)",
+          bool(radar_ok.get("ok")) and radar_ok.get("signals_count", 0) >= 2,
+          scalp_detector.describe_result(radar_ok))
+    check("скор сильного сетапа >= локального порога 85",
+          float(radar_ok.get("score") or 0.0) >= 85.0,
+          f"score={radar_ok.get('score')}")
+    check("стоп радара в clamp(1.2*ATR, 0.6..1.0) = 0.6",
+          abs(float(radar_ok.get("stop_pct") or 0.0) - 0.6) < 1e-6,
+          f"stop={radar_ok.get('stop_pct')}")
+    # цена под VWAP проверяется отдельным контекстом (VWAP выше цены):
+    under_vwap_ctx = dict(radar_ctx, session_vwap=260.0)
+    under_vwap = scalp_detector.radar_score(
+        closes=radar_closes, price=252.5, entry_context=under_vwap_ctx,
+        atr_pct=0.35, spread_pct=0.05, ema9=245.0, ema21=242.0,
+        rsi7=62.0, macd_hist=0.02, macd_hist_prev=0.01, bb_squeeze=False,
+        bollinger_pct_b=0.75, min_stop_pct=0.6, max_stop_pct=1.0,
+        atr_multiplier=1.2, max_spread_pct=0.1, round_trip_cost_pct=0.1,
+        slippage_pct=0.05, min_reward_cost_multiple=3.0)
+    check("цена под session VWAP -> гейт fail-closed",
+          not under_vwap.get("ok") and "VWAP" in str(under_vwap.get("gate")),
+          str(under_vwap.get("gate")))
+    no_ctx = scalp_detector.radar_score(
+        closes=radar_closes, price=252.5, entry_context=None,
+        atr_pct=0.35, spread_pct=0.05, ema9=245.0, ema21=242.0,
+        rsi7=62.0, macd_hist=0.02, macd_hist_prev=0.01, bb_squeeze=False,
+        bollinger_pct_b=0.75, min_stop_pct=0.6, max_stop_pct=1.0,
+        atr_multiplier=1.2, max_spread_pct=0.1, round_trip_cost_pct=0.1,
+        slippage_pct=0.05, min_reward_cost_multiple=4.0)
+    check("нет OHLCV-контекста -> гейт fail-closed",
+          not no_ctx.get("ok") and "контекст" in str(no_ctx.get("gate")),
+          str(no_ctx.get("gate")))
+    fat_costs = scalp_detector.radar_score(
+        closes=radar_closes, price=252.5, entry_context=radar_ctx,
+        atr_pct=0.35, spread_pct=0.05, ema9=245.0, ema21=242.0,
+        rsi7=62.0, macd_hist=0.02, macd_hist_prev=0.01, bb_squeeze=False,
+        bollinger_pct_b=0.75, min_stop_pct=0.6, max_stop_pct=1.0,
+        atr_multiplier=1.2, max_spread_pct=0.1, round_trip_cost_pct=0.1,
+        slippage_pct=0.05, min_reward_cost_multiple=50.0)
+    check("издержки x50 не покрываются -> гейт 'ход не покрывает издержки'",
+          not fat_costs.get("ok") and "издержки" in str(fat_costs.get("gate")),
+          str(fat_costs.get("gate")))
+
+    # --- Test 35: локальный вход радара без ИИ -------------------------------
+    print("\n[35] Скальп: локальный вход по радару БЕЗ вызова Groq")
+    local_state = StateStore(os.path.join(tmp, "radar_local_state.json"),
+                             initial_overrides={"trading_enabled": True})
+    local_state.set_scalp_mode(True)
+    local_client = FakeClient()
+    local_engine = TradingEngine(cfg, local_state, local_client,
+                                 FakeAnalyst(), notify)
+    local_engine.set_market_context({"breadth_pct": 60.0, "symbols": 80})
+    hint_buy = {"ok": True, "score": 90.0, "signals": ["breakout", "impulse"],
+                "signals_count": 2, "setup": "breakout", "stop_pct": 0.6,
+                "round_trip_cost_pct": 0.2, "atr_pct": 0.35, "spread_pct": 0.05,
+                "session_vwap": 246.0, "ts": time.time()}
+    await local_engine._evaluate_entry("SBER", 250.0, radar_hint=hint_buy)
+    bought_local = "SBER" in local_state.positions
+    check("локальный вход (скор 90) покупает БЕЗ вызова analyze_market",
+          bought_local and local_engine._analyst.market_calls == 0,
+          f"position={bought_local}, llm_calls={local_engine._analyst.market_calls}")
+    check("локальная позиция помечена entry_source=radar_local",
+          bought_local
+          and local_state.positions["SBER"].get("entry_source") == "radar_local")
+    check("локальный вход учтён в дневном лимите",
+          local_engine._local_entries_today() == 1,
+          f"count={local_engine._local_entries_today()}")
+    check("локальная позиция всегда под усиленной охраной (weak)",
+          bought_local and local_engine._is_weak_position(
+              local_state.positions["SBER"]))
+    hint_weak = dict(hint_buy, score=85.0)
+    await local_engine._evaluate_entry("GAZP", 250.0, radar_hint=hint_weak)
+    check("скор 85 (уверенность 0.70) отменяется математикой безубытка",
+          "GAZP" not in local_state.positions
+          and any("математика" in n for n in notifications),
+          f"positions={list(local_state.positions)}")
+
+    # --- Test 36: ИИ-вердикт радара как пакетный ------------------------------
+    print("\n[36] Скальп: ИИ-вердикт радара работает как пакетный (без дублей Groq)")
+    ai_cfg = dataclasses.replace(cfg, ai_batch_required=True)
+    ai_state = StateStore(os.path.join(tmp, "radar_ai_state.json"),
+                          initial_overrides={"trading_enabled": True})
+    ai_state.set_scalp_mode(True)
+    ai_client = FakeClient()
+    ai_engine = TradingEngine(ai_cfg, ai_state, ai_client, FakeAnalyst(), notify)
+    ai_engine.set_market_context({"breadth_pct": 60.0, "symbols": 80})
+    ai_engine._radar_verdicts["SBER"] = {
+        "ts": time.monotonic(), "price": 250.0,
+        "decision": {"action": "buy", "confidence": 0.78, "setup": "impulse",
+                     "reason": "радар: импульс подтверждён объёмом"},
+        "row": {"rank_score": 88.0, "allowed_setups": ["impulse"],
+                "price": 250.0},
+    }
+    await ai_engine._evaluate_entry("SBER", 250.3)
+    check("вердикт ИИ из радарной очереди покупает без individual-вызова",
+          "SBER" in ai_state.positions and ai_engine._analyst.market_calls == 0,
+          f"position={'SBER' in ai_state.positions}, "
+          f"llm_calls={ai_engine._analyst.market_calls}")
+    check("позиция помечена entry_source=radar_ai",
+          "SBER" in ai_state.positions
+          and ai_state.positions["SBER"].get("entry_source") == "radar_ai")
+    # Цена ушла >0.35% от цены вердикта -> вердикт не действует.
+    ai_engine._radar_verdicts["GAZP"] = dict(ai_engine._radar_verdicts["SBER"])
+    await ai_engine._evaluate_entry("GAZP", 252.0)
+    check("цена ушла >0.35% от радарного вердикта - вход запрещён",
+          "GAZP" not in ai_state.positions)
+
+    # --- Test 37: flush очереди радара в ИИ (один пакет, дедуп) ---------------
+    print("\n[37] Скальп: очередь радара -> один пакетный вызов ИИ")
+    class FakeRadarAnalyst:
+        def __init__(self, decisions, remaining: int = 100000):
+            self.decisions = decisions
+            self.remaining = remaining
+            self.calls: list = []
+            self.budget_checks = 0
+
+        def budget_status(self):
+            self.budget_checks += 1
+            return {"used_tokens": 120000 - self.remaining,
+                    "budget_tokens": 120000, "reserved_tokens": 0}
+
+        async def analyze_candidates(self, rows, scalp_mode=False):
+            self.calls.append([r["ticker"] for r in rows])
+            return dict(self.decisions)
+
+    flush_state = StateStore(os.path.join(tmp, "radar_flush_state.json"),
+                             initial_overrides={"trading_enabled": True})
+    flush_state.set_scalp_mode(True)
+    flush_analyst = FakeRadarAnalyst(
+        {"SBER": {"action": "buy", "confidence": 0.8, "setup": "impulse",
+                  "reason": "ok"},
+         "GAZP": {"action": "hold", "confidence": 0.5, "setup": "none",
+                  "reason": "нет"}})
+    flush_engine = TradingEngine(cfg, flush_state, FakeClient(),
+                                 flush_analyst, notify)
+
+    print("\n[37b] flush: бюджет в норме")
+    row_sber = {"ticker": "SBER", "price": 250.0, "rank_score": 91.0,
+                "allowed_setups": ["impulse"], "queued_ts": time.monotonic()}
+    row_gazp = {"ticker": "GAZP", "price": 120.0, "rank_score": 74.0,
+                "allowed_setups": ["breakout"], "queued_ts": time.monotonic()}
+    flush_engine._radar_ai_queue = {"SBER": row_sber, "GAZP": row_gazp}
+    flush_engine._last_radar_ai_flush = 0.0
+    await flush_engine._scalp_radar_ai_flush()
+    check("радарный flush отправил кандидатов ОДНИМ вызовом analyze_candidates",
+          flush_analyst.calls and len(flush_analyst.calls[0]) == 2,
+          f"calls={flush_analyst.calls}")
+    check("buy-вердикт сохранён в _radar_verdicts, hold-тикер покинул очередь",
+          "SBER" in flush_engine._radar_verdicts
+          and flush_engine._radar_verdicts["SBER"]["decision"]["action"] == "buy"
+          and "GAZP" not in flush_engine._radar_ai_queue)
+    # Дедуп: та же бумага не уйдёт в ИИ раньше дедуп-интервала.
+    flush_engine._radar_ai_queue = {"LKOH": dict(row_sber, ticker="LKOH")}
+    await flush_engine._scalp_radar_ai_flush()
+    check("дедуп: повторный flush внутри интервала не тратит токены",
+          len(flush_analyst.calls) == 1
+          and flush_engine._last_radar_ai_flush > 0
+          and "LKOH" in flush_engine._radar_ai_queue,
+          f"calls={len(flush_analyst.calls)}")
+
+    print("\n[37c] flush: бюджет Groq исчерпан -> ИИ отключён, уведомление")
+    poor_analyst = FakeRadarAnalyst({}, remaining=100)
+    poor_engine = TradingEngine(cfg, StateStore(
+        os.path.join(tmp, "radar_poor_state.json"),
+        initial_overrides={"trading_enabled": True}), FakeClient(),
+        poor_analyst, notify)
+    poor_engine._radar_ai_queue = {"SBER": dict(row_sber)}
+    poor_engine._last_radar_ai_flush = 0.0
+    await poor_engine._scalp_radar_ai_flush()
+    # _spawn_notify шлёт через create_task - даём циклу выполнить задачи.
+    for _ in range(3):
+        await asyncio.sleep(0)
+    check("бюджет < оценка вызова + резерв -> ИИ радара отключён до завтра",
+          poor_engine._radar_ai_disabled_notified
+          and time.time() < poor_engine._radar_ai_disabled_until
+          and not poor_analyst.calls,
+          f"notified={poor_engine._radar_ai_disabled_notified}, "
+          f"calls={len(poor_analyst.calls)}")
+    check("об исчерпании бюджета отправлено ОДНО уведомление",
+          any("Бюджет Groq" in n for n in notifications))
+    poor_engine._radar_ai_queue = {"SBER": dict(row_sber)}
+    await poor_engine._scalp_radar_ai_flush()
+    # _spawn_notify шлёт через create_task - даём циклу выполнить задачи.
+    for _ in range(3):
+        await asyncio.sleep(0)
+    check("после отключения flush молчит (без новых вызовов и уведомлений)",
+          not poor_analyst.calls
+          and sum(1 for n in notifications if "Бюджет Groq" in n) == 1)
+
+    print("\n[38] Скальп: локальный лимит входов и weak-охрана")
+    limit_engine = TradingEngine(cfg, StateStore(
+        os.path.join(tmp, "radar_limit_state.json"),
+        initial_overrides={"trading_enabled": True}), FakeClient(),
+        FakeAnalyst(), notify)
+    limit_engine._radar_local_day = "2000-01-01"
+    limit_engine._radar_local_count = 99
+    check("счётчик локальных входов сбрасывается в новый московский день",
+          limit_engine._local_entries_today() == 0)
+    check("уверенность локального входа растёт со скором и ограничена 0.80",
+          limit_engine._local_radar_confidence(85.0) == 0.70
+          and limit_engine._local_radar_confidence(100.0) == 0.775
+          and limit_engine._local_radar_confidence(96.0) == 0.755,
+          f"85->{limit_engine._local_radar_confidence(85.0)}, "
+          f"96->{limit_engine._local_radar_confidence(96.0)}, "
+          f"100->{limit_engine._local_radar_confidence(100.0)}")
+    check("radar_local-позиция слабая даже при высокой уверенности",
+          limit_engine._is_weak_position({"llm_confidence": 0.9,
+                                          "entry_source": "radar_local"})
+          and not limit_engine._is_weak_position({"llm_confidence": 0.9,
+                                                  "entry_source": "scanner_ai"}))
+
+    # Восстановить патчи времени (остальные тесты не должны зависеть от нас).
+    sessions.can_open_scalp_entry = _real_can_open
 
     print("\n" + "=" * 64)
     print(f"ИТОГО: пройдено {len(PASSED)}, провалено {len(FAILED)}")

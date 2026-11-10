@@ -75,7 +75,7 @@ import predictor
 
 log = logging.getLogger("telegram")
 
-VERSION = "1.11.0"
+VERSION = "1.12.0"
 
 HELP_TEXT = (
     "Команды (можно не печатать - жмите кнопки на клавиатуре ниже чата):\n"
@@ -91,7 +91,7 @@ HELP_TEXT = (
     "/watchlist - бумаги под автоматической торговлей\n"
     "/watch MTSS - добавить бумагу, /unwatch MTSS - убрать\n"
     "/autobuy - автопокупка кандидатов сканера: вкл/выкл\n"
-    "/scalp - СКАЛЬП-РЕЖИМ: до 8 бумаг, риск 0.05% на сделку, общий риск 0.40%, стоп по ATR\n"
+    "/scalp - СКАЛЬП-РЕЖИМ: до 8 бумаг, риск 0.05% на сделку, общий риск 0.40%, стоп по ATR; микро-радар ищет входы без ИИ, Groq - только подтверждение\n"
     "/memory - что бот выучил из своих сделок (винрейт, уроки, плохие часы)\n"
     "/reset_memory - забыть всю память сделок (начать учиться заново)\n"
     "/toggle_trading - вкл/выкл автоматическую торговлю\n"
@@ -256,7 +256,8 @@ def create_router(ctx: AppContext) -> Router:
         balance_line = await _balance_line(ctx)
         uptime = _uptime(ctx.started_monotonic)
         scalp = ("⚡ Скальп-режим ВКЛЮЧЁН (весь рынок, до "
-                 f"{ctx.config.scalp_max_positions} бумаг)\n"
+                 f"{ctx.config.scalp_max_positions} бумаг; микро-радар без ИИ, "
+                 f"ИИ-пакет раз в {ctx.config.scalp_ai_interval_sec // 60} мин)\n"
                  if ctx.state.scalp_mode else "")
         # v1.7.1: приветствие и справка РАЗДЕЛЬНО - справка (~7 тыс. символов)
         # не влезает в лимит Telegram 4096, из-за чего /start падал целиком.
@@ -1065,6 +1066,16 @@ def create_router(ctx: AppContext) -> Router:
         # дополнительно ограничен 70% equity и 15% номинала на бумагу.
         cap_note = (f"• Лимит вложенности {min(ctx.state.max_invested_pct(), 70)}% equity; "
                     "автоматически не повышается.\n")
+        local_note = (f"• Микро-радар: локальный скоринг 5-мин свечей каждые "
+                      f"{ctx.config.scalp_radar_sec} сек БЕЗ ИИ; при скоре >= "
+                      f"{ctx.config.scalp_local_autobuy_score:.0f} вход сам "
+                      f"(до {ctx.config.scalp_local_max_per_day} за день) - "
+                      f"квота Groq не тратится;\n"
+                      f"• ИИ-подтверждение: кандидаты со скором >= "
+                      f"{ctx.config.scalp_ai_score:.0f} уходят в один пакет "
+                      f"раз в {ctx.config.scalp_ai_interval_sec // 60} мин "
+                      f"(бюджет Groq {ctx.config.groq_daily_token_budget // 1000}K "
+                      f"токенов/день, резерв {ctx.config.scalp_ai_reserve_tokens // 1000}K);\n")
         await message.answer(
             "⚡ СКАЛЬП-РЕЖИМ ВКЛЮЧЁН — строгие правила входа и выхода:\n"
             f"• максимум {ctx.config.scalp_max_positions} позиции одновременно, "
@@ -1079,8 +1090,11 @@ def create_router(ctx: AppContext) -> Router:
             "10:15–18:20 МСК; спред ≤0.10%;\n"
             f"• после стопа пауза по бумаге {ctx.config.scalp_stop_cooldown_min} мин; "
             f"после 2 убытков — пауза {ctx.config.scalp_loss_pause_minutes} мин;\n"
+            f"{local_note}"
             f"{cap_note}"
-            "При отсутствии свежего ATR/спреда или ответа Groq бот не открывает сделку. "
+            "Продажа - всегда локально (без ИИ): TP1/трейлинг/тайм-стоп, "
+            "цель всегда минимум в "
+            f"{ctx.config.scalp_min_reward_cost_multiple:.0f}x больше издержек. "
             "Выключить: /scalp off")
 
     # --------------------------------------------------------------- /autobuy

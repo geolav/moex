@@ -57,11 +57,12 @@ import asyncio
 import logging
 import math
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 import indicators
 import predictor
+import scalp_detector
 import sessions
 from news_filter import classify_headlines
 
@@ -158,6 +159,21 @@ class TradingEngine:
         # Для автопокупок прямые индивидуальные LLM-вызовы не используются.
         self._ai_batch_candidates: Dict[str, Dict[str, Any]] = {}
         self._ai_batch_shortlist: set[str] = set()
+        # v1.12.0: микро-радар скальпа (локальные входы без ИИ) и его очередь
+        # на ИИ-подтверждение. Вердикты ИИ от радара живут ОТДЕЛЬНО от
+        # сканерских: сканер вызывает set_ai_batch_decisions с полной заменой,
+        # и радарные решения он бы стирал.
+        self._radar_ai_queue: Dict[str, Dict[str, Any]] = {}
+        self._radar_verdicts: Dict[str, Dict[str, Any]] = {}
+        self._radar_cursor = 0
+        self._last_radar_pass = 0.0
+        self._last_market_refresh = 0.0
+        self._last_radar_ai_flush = 0.0
+        self._radar_ai_disabled_until = 0.0      # бюджет Groq кончился - до конца дня
+        self._radar_ai_disabled_notified = False
+        self._radar_ai_last_seen: Dict[str, float] = {}  # дедуп бумаг для ИИ
+        self._radar_local_day = ""               # счётчик локальных входов за день
+        self._radar_local_count = 0
         self._position_guard_last: Dict[str, float] = {}
         self._migrate_legacy_scalp_positions()
 
@@ -308,6 +324,15 @@ class TradingEngine:
                         await self.cycle()
                     else:
                         await self.exit_cycle()
+                    # v1.12.0: микро-радар - локальный (бесплатный) поиск
+                    # входов между полными циклами + пакет ИИ-подтверждений
+                    # по расписанию бюджета. Ошибка радара не роняет цикл.
+                    try:
+                        await self._scalp_radar_tick()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:  # noqa: BLE001
+                        log.exception("Ошибка микро-радара скальпа")
                     await self._sleep(30.0)
                 else:
                     await self.cycle()
@@ -368,8 +393,7 @@ class TradingEngine:
             if self._stop_event.is_set():
                 break
             position = self._state.positions.get(ticker) or {}
-            confidence = float(position.get("llm_confidence", 0.0) or 0.0)
-            weak_position = confidence < 0.70
+            weak_position = self._is_weak_position(position)
             interval = 30.0 if weak_position else max(60.0, float(self._cfg.scalp_exit_poll_sec))
             last_guard = self._position_guard_last.get(ticker, 0.0)
             if now_mono - last_guard < interval:
@@ -384,6 +408,324 @@ class TradingEngine:
                     log.info("%s: рынок закрыт - охрана позиций подождёт", ticker)
                 else:
                     log.exception("Охрана позиций %s", ticker)
+
+    # ------------------------------------------------------- микро-радар v1.12
+    async def _scalp_radar_tick(self) -> None:
+        """Один тик микро-радара скальпа (вызывается каждые ~30 сек из run()).
+
+        Радар - локальный (БЕСПЛАТНЫЙ) контур поиска входов: 5-минутные
+        свечи watchlist'а оценивает scalp_detector, а не Groq. Это
+        выполняет требование владельца: ИИ подтверждает только отобранные
+        ситуации (раз в SCALP_AI_INTERVAL_SEC), а очень сильные сетапы
+        (скор >= SCALP_LOCAL_AUTOBUY_SCORE) входят вообще без ИИ.
+        """
+        if not self.scalp_mode() or not self._state.trading_enabled:
+            return
+        if not sessions.can_open_scalp_entry(self._cfg.scalp_time_stop_min):
+            return
+        now_mono = time.monotonic()
+        # 1) Живые цены + спреды watchlist одним ISS-запросом (дёшево).
+        if now_mono - self._last_market_refresh >= self._cfg.scalp_radar_sec:
+            self._last_market_refresh = now_mono
+            refresher = getattr(self._client, "refresh_watchlist_market", None)
+            if callable(refresher):
+                try:
+                    await refresher(self.watchlist())
+                except Exception as exc:  # noqa: BLE001 - спреды придут позже
+                    log.info("Радар: ISS-снимок недоступен (%s)", exc)
+        # 2) Локальный скоринг ПОЛОВИНЫ watchlist (чередование halves:
+        #    каждая бумага освежается раз в ~2 мин при радаре 60 сек).
+        if now_mono - self._last_radar_pass >= self._cfg.scalp_radar_sec:
+            self._last_radar_pass = now_mono
+            await self._scalp_radar_pass()
+        # 3) Пакет ИИ-подтверждений по расписанию бюджета Groq.
+        await self._scalp_radar_ai_flush()
+
+    async def _scalp_radar_pass(self) -> None:
+        """Просматривает половину watchlist'а радаром (без ИИ, дёшево)."""
+        tickers = [t for t in self.watchlist() if t not in self._state.positions]
+        if not tickers:
+            return
+        half = max(1, (len(tickers) + 1) // 2)
+        start = self._radar_cursor % len(tickers)
+        chunk = [tickers[(start + i) % len(tickers)] for i in range(half)]
+        self._radar_cursor = (start + half) % max(1, len(tickers))
+        for ticker in chunk:
+            if self._stop_event.is_set():
+                break
+            try:
+                await self._scalp_radar_check(ticker)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - одна бумага не решает
+                log.exception("Радар: ошибка по %s", ticker)
+
+    async def _scalp_radar_check(self, ticker: str) -> None:
+        """Скор одной бумаги локальным детектором и разводка по путям входа."""
+        cfg = self._cfg
+        if ticker in self._state.positions or self._cooldown_active(ticker):
+            return
+        price = await self._client.get_price(ticker)
+        if not price or price <= 0:
+            return
+        # Те же 4 часа 5-минутных свечей, что и у полного цикла: радар
+        # обновляет _ohlc_cache, и проверка входа потом не качает данные зря.
+        history = await self._client.get_candles_history(ticker, 4.0, 1.0 / 12.0)
+        closes = [p for _, p in history]
+        if len(closes) < self._min_candles(24):
+            log.debug("Радар: %s мало свечей (%d)", ticker, len(closes))
+            return
+        context_getter = getattr(self._client, "get_entry_context", None)
+        entry_context = (context_getter(ticker, 20)
+                         if callable(context_getter) else None)
+        atr_getter = getattr(self._client, "get_atr_pct", None)
+        atr_pct = (atr_getter(ticker, 14) if callable(atr_getter) else None)
+        spread_getter = getattr(self._client, "get_spread_pct", None)
+        spread_pct = (spread_getter(ticker, 300.0)
+                      if callable(spread_getter) else None)
+        summary = indicators.summarize_generic(closes, price, 24, 1.0 / 12.0)
+        ema9_series = indicators.ema(closes, 9)
+        ema21_series = indicators.ema(closes, 21)
+        macd_data = summary.get("macd") or {}
+        bb = summary.get("bollinger") or {}
+        market_age = time.time() - float((self._market_context or {}).get(
+            "received_ts", 0) or 0)
+        breadth = (self._market_context or {}).get("breadth_pct") \
+            if market_age <= 900 else None
+        result = scalp_detector.radar_score(
+            closes=closes, price=price, entry_context=entry_context,
+            atr_pct=atr_pct, spread_pct=spread_pct,
+            ema9=(float(ema9_series[-1]) if ema9_series else None),
+            ema21=(float(ema21_series[-1]) if ema21_series else None),
+            rsi7=summary.get("rsi7"),
+            macd_hist=macd_data.get("histogram"),
+            macd_hist_prev=macd_data.get("histogram_prev"),
+            bb_squeeze=summary.get("bb_squeeze"),
+            bollinger_pct_b=bb.get("pct_b"),
+            min_stop_pct=cfg.scalp_min_stop_pct,
+            max_stop_pct=cfg.scalp_max_stop_pct,
+            atr_multiplier=cfg.scalp_atr_multiplier,
+            max_spread_pct=cfg.scalp_max_spread_pct,
+            round_trip_cost_pct=cfg.scalp_round_trip_cost_pct,
+            slippage_pct=cfg.slippage_pct,
+            min_reward_cost_multiple=cfg.scalp_min_reward_cost_multiple,
+            market_breadth_pct=(float(breadth) if breadth is not None else None))
+        if not result.get("ok"):
+            log.debug("%s: %s", ticker, scalp_detector.describe_result(result))
+            return
+        score = float(result.get("score") or 0.0)
+        # Путь 1: очень сильный сетап -> локальный вход БЕЗ ИИ (0 токенов).
+        if (cfg.scalp_local_autobuy
+                and score >= cfg.scalp_local_autobuy_score
+                and self._local_entries_today() < cfg.scalp_local_max_per_day):
+            log.info("%s: радар: ЛОКАЛЬНЫЙ вход без ИИ (%s)", ticker,
+                     scalp_detector.describe_result(result))
+            await self._evaluate_entry(ticker, price, radar_hint=result)
+            return
+        # Путь 2: кандидат в очередь на пакет ИИ-подтверждения (0 токенов
+        # сейчас, один общий вызов раз в SCALP_AI_INTERVAL_SEC).
+        if score >= cfg.scalp_ai_score:
+            prev = self._radar_ai_queue.get(ticker) or {}
+            row = {
+                "ticker": ticker, "price": price,
+                "rank_score": score, "score": score,
+                "allowed_setups": list(result.get("signals") or []),
+                "summary": summary,
+                "atr_pct": atr_pct, "spread_pct": spread_pct,
+                "entry_context": entry_context,
+                "turnover": 0.0, "day_chg_pct": 0.0,
+                "market_breadth_pct": (float(breadth)
+                                       if breadth is not None else None),
+                "radar": dict(result),
+                "queued_ts": float(prev.get("queued_ts") or time.monotonic()),
+            }
+            self._radar_ai_queue[ticker] = row
+            if not prev:
+                log.info("%s: радар: скор %.0f >= %.0f - жду ИИ-подтверждения "
+                         "(очередь: %s)", ticker, score, cfg.scalp_ai_score,
+                         ", ".join(sorted(self._radar_ai_queue)) or "-")
+
+    async def _scalp_radar_ai_flush(self) -> None:
+        """Отправляет лучших кандидатов радара в ИИ ОДНИМ пакетным запросом.
+
+        Бюджет Groq - главная скоба: перед вызовом проверяем, что остаток
+        дневного бюджета покрывает оценку вызова + резерв (аудит/справки).
+        Кончился бюджет - ИИ-подтверждения глушатся до завтра с одним
+        уведомлением админу, а локальные входы продолжают работать.
+        """
+        if not self._radar_ai_queue:
+            return
+        cfg = self._cfg
+        now_mono = time.monotonic()
+        # 0.0 = "ещё ни разу не звали" (monotonic у свежего процесса мал) -
+        # первый flush после старта разрешён сразу.
+        if (self._last_radar_ai_flush > 0
+                and now_mono - self._last_radar_ai_flush < cfg.scalp_ai_interval_sec):
+            return
+        self._last_radar_ai_flush = now_mono
+        if time.time() < self._radar_ai_disabled_until:
+            return
+        # Протухшие строки покидают очередь (данные старше TTL бесполезны).
+        ttl = max(300, int(cfg.ai_batch_decision_ttl_sec))
+        self._radar_ai_queue = {
+            t: r for t, r in self._radar_ai_queue.items()
+            if now_mono - float(r.get("queued_ts") or 0.0) <= ttl}
+        # Дедуп: одну и ту же бумагу не показываем ИИ чаще раза в N минут -
+        # ответ редко меняется быстрее, а токены конечны. Отсутствие записи
+        # = бумагу ещё НИКОГДА не показывали (не путать с 0.0 - monotonic
+        # у свежего процесса мал, и 0.0 было бы ложным "только что видел").
+        dedup_sec = max(0, int(cfg.scalp_ai_dedup_min)) * 60
+        ranked = sorted(
+            self._radar_ai_queue.items(),
+            key=lambda kv: -float(kv[1].get("rank_score") or 0.0))
+        fresh = [(t, r) for t, r in ranked
+                 if t not in self._radar_ai_last_seen
+                 or now_mono - self._radar_ai_last_seen[t] >= dedup_sec]
+        rows = [dict(r) for _, r in fresh[:3]]
+        if not rows:
+            return
+        budget_status = getattr(self._analyst, "budget_status", None)
+        if callable(budget_status):
+            try:
+                status = dict(budget_status() or {})
+            except Exception:  # noqa: BLE001
+                status = {}
+            remaining = (int(status.get("budget_tokens", 0))
+                         - int(status.get("used_tokens", 0))
+                         - int(status.get("reserved_tokens", 0)))
+            needed = int(cfg.scalp_ai_call_estimate) + int(cfg.scalp_ai_reserve_tokens)
+            if remaining < needed:
+                self._disable_radar_ai(remaining)
+                return
+        batch_method = getattr(self._analyst, "analyze_candidates", None)
+        if not callable(batch_method):
+            return
+        for ticker, _row in fresh[:3]:
+            self._radar_ai_last_seen[ticker] = now_mono
+        try:
+            decisions = await batch_method(rows, scalp_mode=True) or {}
+        except Exception as exc:  # noqa: BLE001 - очередь переживёт сбой
+            log.warning("Радар: пакет ИИ недоступен (%s) - очередь сохранена", exc)
+            return
+        if not decisions:
+            # Пусто = вызов пропущен (антиспам-интервал сканера) или ответ
+            # нечитаем: очередь остаётся на следующий тик, токены не тратились.
+            return
+        confirmed, rejected = [], []
+        for row in rows:
+            ticker = str(row.get("ticker") or "")
+            decision = decisions.get(ticker)
+            if not isinstance(decision, dict):
+                continue
+            if str(decision.get("action", "")).lower() == "buy":
+                self._radar_verdicts[ticker] = {
+                    "ts": now_mono,
+                    "price": float(row.get("price") or 0.0),
+                    "decision": dict(decision),
+                    "row": row,
+                }
+                self._radar_ai_queue.pop(ticker, None)
+                confirmed.append(f"{ticker}({float(decision.get('confidence', 0)):.0%})")
+            else:
+                self._radar_ai_queue.pop(ticker, None)
+                rejected.append(ticker)
+        if confirmed or rejected:
+            log.info("Радар: ИИ-подтверждения получены: %s; отклонено: %s; "
+                     "очередь: %d", ", ".join(confirmed) or "-",
+                     ", ".join(rejected) or "-", len(self._radar_ai_queue))
+
+    def _disable_radar_ai(self, remaining: int) -> None:
+        """Бюджет Groq исчерпан: ИИ-подтверждения до завтра, радар остаётся."""
+        if self._radar_ai_disabled_notified:
+            return
+        try:
+            tomorrow = sessions.msk_now().replace(
+                hour=9, minute=55, second=0, microsecond=0)
+            if tomorrow <= sessions.msk_now():
+                tomorrow += timedelta(days=1)
+            self._radar_ai_disabled_until = tomorrow.timestamp()
+        except Exception:  # noqa: BLE001
+            self._radar_ai_disabled_until = time.time() + 12 * 3600
+        self._radar_ai_disabled_notified = True
+        until_txt = datetime.fromtimestamp(
+            self._radar_ai_disabled_until, tz=sessions.MSK).strftime("%d.%m %H:%M")
+        log.warning("Радар: бюджет Groq исчерпан (остаток %d токенов) - "
+                    "ИИ-подтверждения на паузе до %s МСК, локальные входы "
+                    "продолжают работать", remaining, until_txt)
+        self._spawn_notify(
+            f"🧠 Бюджет Groq на сегодня почти исчерпан (остаток "
+            f"{max(0, remaining)} токенов). Пакетные ИИ-подтверждения "
+            f"скальпа остановлены до завтра, локальный радар продолжает "
+            f"искать входы без ИИ (порог скора "
+            f"{self._cfg.scalp_local_autobuy_score:.0f}).")
+
+    def _fresh_radar_verdict(self, ticker: str, price: float) -> Optional[dict]:
+        """Свежий ИИ-вердикт, полученный через радар (или None).
+
+        Условия те же, что у сканерского пакета: не старше
+        ai_batch_decision_ttl_sec и цена не ушла больше чем на 0.35%.
+        """
+        item = self._radar_verdicts.get(ticker)
+        if not item:
+            return None
+        age = time.monotonic() - float(item.get("ts", 0.0) or 0.0)
+        if age > max(60, int(self._cfg.ai_batch_decision_ttl_sec)):
+            self._radar_verdicts.pop(ticker, None)
+            return None
+        scanned = float(item.get("price") or 0.0)
+        if scanned <= 0 or price <= 0 or abs(price / scanned - 1.0) > 0.0035:
+            return None
+        return item
+
+    def _local_entries_today(self) -> int:
+        """Счётчик локальных (без ИИ) входов за текущий московский день."""
+        try:
+            day = sessions.msk_now().date().isoformat()
+        except Exception:  # noqa: BLE001
+            day = time.strftime("%Y-%m-%d")
+        if day != self._radar_local_day:
+            self._radar_local_day = day
+            self._radar_local_count = 0
+        return self._radar_local_count
+
+    def _is_weak_position(self, position: dict) -> bool:
+        """Слабая позиция = усиленная охрана (30 сек, ранний выход, ½ тайм-стопа).
+
+        v1.12.0: локальные входы радара (без ИИ) считаются слабыми ВСЕГДА,
+        независимо от формальной уверенности - детектор видел только свечи,
+        а не контекст/новости. Это консервативная плата за экономию квоты.
+        """
+        if str((position or {}).get("entry_source") or "") == "radar_local":
+            return True
+        try:
+            return float((position or {}).get("llm_confidence", 0.0) or 0.0) < 0.70
+        except (TypeError, ValueError):
+            return True
+
+    def _local_radar_confidence(self, score: float) -> float:
+        """Уверенность локального входа: 0.70..0.80 в зависимости от скора.
+
+        Не ниже 0.70, потому что безубыточная вероятность скальпа (стоп 0.6-1%,
+        издержки ~0.15-0.2%) требует уверенности 0.65-0.72 - иначе математика
+        ожидания сама отменит вход (и это правильно). Ослабленной охраны
+        локальный вход не получает в любом случае: см. _is_weak_position.
+        """
+        base = 0.70 + (float(score) - self._cfg.scalp_local_autobuy_score) * 0.005
+        return round(min(0.80, max(0.70, base)), 3)
+
+    def _spawn_notify(self, text: str) -> None:
+        """Уведомление админу без блокировки цикла (ошибки - только в лог)."""
+
+        async def _send() -> None:
+            try:
+                await self._notify(text)
+            except Exception:  # noqa: BLE001
+                log.warning("Не удалось отправить уведомление: %s", text[:80])
+
+        try:
+            asyncio.get_running_loop().create_task(_send())
+        except RuntimeError:  # нет цикла (тесты) - шлём синхронно
+            pass
 
     async def _market_closed(self, ticker: str) -> bool:
         """True - биржа точно закрыта по этой бумаге (пауза до открытия).
@@ -887,14 +1229,34 @@ class TradingEngine:
             return 1.0
         return loss / (win + loss)
 
-    async def _evaluate_entry(self, ticker: str, price: float) -> None:
+    async def _evaluate_entry(self, ticker: str, price: float, *,
+                              radar_hint: Optional[Dict[str, Any]] = None) -> None:
+        # v1.12.0: локальный путь радара (radar_hint задан) минует пакет ИИ
+        # и индивидуальный LLM-вызов - решение принимает детерминированный
+        # детектор. ВСЕ остальные проверки (сессия, лимиты, память, анти-
+        # погоня, математика безубытка) остаются обязательными.
+        local_entry = radar_hint is not None
         # Для автоматических входов LLM доступен только пакетно: не более 2-3
         # лучших кандидатов по математическому рейтингу за один цикл сканера.
-        if getattr(self._cfg, "ai_batch_required", True):
-            if ticker not in self._ai_batch_shortlist:
+        if not local_entry and getattr(self._cfg, "ai_batch_required", True):
+            batch_item = self._ai_batch_candidates.get(ticker)
+            if batch_item is None:
+                # v1.12.0: фолбэк на вердикт ИИ, полученный через радар.
+                radar_item = self._fresh_radar_verdict(ticker, price)
+                if radar_item is not None:
+                    batch_item = {
+                        "ts": float(radar_item.get("ts") or 0.0),
+                        "price": float(radar_item.get("price") or 0.0),
+                        "rank_score": float((radar_item.get("row") or {}).get(
+                            "rank_score") or 0.0),
+                        "decision": radar_item.get("decision") or {},
+                    }
+                    log.info("%s: использую ИИ-вердикт радара (возраст %.0f сек)",
+                             ticker, time.monotonic()
+                             - float(radar_item.get("ts") or 0.0))
+            if batch_item is None:
                 log.debug("%s: не попал в математический shortlist ИИ - пропуск", ticker)
                 return
-            batch_item = self._ai_batch_candidates.get(ticker) or {}
             age = time.monotonic() - float(batch_item.get("ts", 0.0) or 0.0)
             if age > self._cfg.ai_batch_decision_ttl_sec:
                 log.info("%s: пакетный вердикт ИИ устарел (%.0f сек) - жду нового скана",
@@ -1048,7 +1410,7 @@ class TradingEngine:
                 log.info("%s: спред %.3f%% выше лимита %.3f%%",
                          ticker, float(spread_pct), self._cfg.scalp_max_spread_pct)
                 return
-            if stop_pct < self._cfg.scalp_min_reward_cost_multiple * round_trip_cost:
+            if stop_pct < self._cfg.scalp_min_reward_cost_multiple * round_trip_cost - 1e-9:
                 log.info("%s: ход до TP1 %.3f%% не покрывает издержки %.3fx",
                          ticker, stop_pct, stop_pct / max(round_trip_cost, 1e-9))
                 return
@@ -1078,6 +1440,24 @@ class TradingEngine:
         allowed_setups, reversal_confirmations = indicators.detect_entry_setups(
             closes, price, summary, entry_context, fast_n,
             scalp_mode=self.scalp_mode(), market_breadth_pct=market_breadth)
+        # v1.12.0: радар подтверждает сигнал независимо от строгого сетапа.
+        # Строгий детектор требует выполнения ВСЕХ условий сразу (поэтому в
+        # логах владельца "с сетапом: 0" и ИИ не получал кандидатов вовсе);
+        # радарный скор - более гибкая оценка той же свечной картины.
+        radar_signals: List[str] = []
+        if local_entry:
+            radar_signals = [str(s) for s in (radar_hint or {}).get("signals") or []]
+        elif self.scalp_mode():
+            radar_item = self._fresh_radar_verdict(ticker, price)
+            if radar_item is not None:
+                radar_signals = [str(s) for s in
+                                 (radar_item.get("row") or {}).get(
+                                     "allowed_setups") or []]
+        if not allowed_setups and radar_signals:
+            allowed_setups = radar_signals
+            summary["radar_confirmed"] = True
+            log.info("%s: строгий сетап-детектор молчит - использую сигналы "
+                     "радара: %s", ticker, ", ".join(radar_signals))
         if not allowed_setups:
             log.info("%s: нет подтверждённого OHLCV-сетапа pullback/breakout/reversal; HOLD",
                      ticker)
@@ -1093,14 +1473,47 @@ class TradingEngine:
                 log.info("%s: risk-off по breadth %.1f%% - вход запрещён", ticker, breadth)
                 return
         score = indicators.build_score(summary)
-        log.info("%s: score %.2f (порог %.2f, агрессивность %d, активность %d, "
-                 "SMA-%.4g ч, свечи %.0f мин%s) RSI %.0f",
-                 ticker, score, needed, self._state.aggressiveness(),
-                 self._activity(), fast_n * step_h, step_h * 60,
-                 ", утренний якорь на вчера" if morning else "",
-                 summary.get("rsi14") or 0.0)
-        if score < needed:
-            return
+        if local_entry:
+            # v1.12.0: у локального входа сигнал - СКОР РАДАРА (0..100), а не
+            # legacy build_score: детектор уже учёл импульс/объём/VWAP/издержки.
+            radar_score_value = float((radar_hint or {}).get("score") or 0.0)
+            if radar_score_value < self._cfg.scalp_local_autobuy_score - 1e-6:
+                log.info("%s: скор радара %.0f ниже локального порога %.0f - пропуск",
+                         ticker, radar_score_value,
+                         self._cfg.scalp_local_autobuy_score)
+                return
+            score = max(score, radar_score_value / 100.0)
+            log.info("%s: score %.2f (радар %.0f/100; legacy-порог %.2f "
+                     "пропущен для локального входа, агрессивность %d, "
+                     "активность %d, свечи %.0f мин) RSI %.0f",
+                     ticker, score, radar_score_value, needed,
+                     self._state.aggressiveness(), self._activity(),
+                     step_h * 60, summary.get("rsi14") or 0.0)
+        elif radar_signals and self.scalp_mode():
+            # ИИ-подтверждённый кандидат радара: скор радара >= SCALP_AI_SCORE
+            # уже был на момент отправки к ИИ - legacy-порог не применяется,
+            # ожидание сделки отдельно защищает проверка безубыточности.
+            radar_item = self._fresh_radar_verdict(ticker, price)
+            radar_rank = float((radar_item or {}).get("row", {}).get(
+                "rank_score") or 0.0)
+            if radar_rank >= self._cfg.scalp_ai_score - 1e-6:
+                score = max(score, radar_rank / 100.0)
+                log.info("%s: score %.2f (радар %.0f + ИИ; legacy-порог %.2f "
+                         "пропущен, агрессивность %d, активность %d) RSI %.0f",
+                         ticker, score, radar_rank, needed,
+                         self._state.aggressiveness(), self._activity(),
+                         summary.get("rsi14") or 0.0)
+            elif score < needed:
+                return
+        else:
+            log.info("%s: score %.2f (порог %.2f, агрессивность %d, активность %d, "
+                     "SMA-%.4g ч, свечи %.0f мин%s) RSI %.0f",
+                     ticker, score, needed, self._state.aggressiveness(),
+                     self._activity(), fast_n * step_h, step_h * 60,
+                     ", утренний якорь на вчера" if morning else "",
+                     summary.get("rsi14") or 0.0)
+            if score < needed:
+                return
 
         # Шаг 1.5. Анти-погоня (v1.7.0): не покупать у локального максимума.
         # Классическая ошибка: бумага весь день росла, средняя догоняла цену,
@@ -1138,9 +1551,28 @@ class TradingEngine:
                 f"{self._sentiment_limit():+.2f}).")
             return
 
-        decision = await self._get_llm_decision(ticker, price, summary, score,
-                                                sentiment, history,
-                                                morning_ctx=morning_ctx)
+        if local_entry:
+            # v1.12.0: локальное решение радара - Groq не вызывается вообще.
+            # Уверенность намеренно скромная (0.66..0.75): без ИИ-контекста
+            # позиция получает усиленную охрану (30 сек + ранний выход).
+            radar_score_value = float((radar_hint or {}).get("score") or 0.0)
+            decision = {
+                "action": "buy",
+                "confidence": self._local_radar_confidence(radar_score_value),
+                "setup": str((radar_hint or {}).get("setup") or radar_signals[0]),
+                "stop_pct": 0.0, "tp1_pct": 0.0, "size_mult": 1.0,
+                "reason": (f"локальный радар: {', '.join(radar_signals)}; "
+                           f"скор {radar_score_value:.0f}/100; без ИИ "
+                           f"(экономия квоты Groq)"),
+                "source": "radar_local",
+            }
+            log.info("%s: локальное решение радара: buy (уверенность %.2f, "
+                     "сигналы %s)", ticker, decision["confidence"],
+                     ", ".join(radar_signals))
+        else:
+            decision = await self._get_llm_decision(ticker, price, summary, score,
+                                                    sentiment, history,
+                                                    morning_ctx=morning_ctx)
         if decision is None:
             # FAIL-CLOSED: никакой автономной покупки при недоступности Groq,
             # пустом/битом ответе или исчерпанной квоте.
@@ -1456,6 +1888,12 @@ class TradingEngine:
         lots = min(lots, executed_lots)
         shares = lots * lot_size
         cost = shares * price
+        # v1.12.0: локальный вход состоялся - учитываем дневной лимит.
+        if str(decision.get("source") or "") == "radar_local":
+            # _local_entries_today() сначала инициализирует счётчик на
+            # текущий московский день (иначе инкремент попадал в "вчерашний").
+            self._local_entries_today()
+            self._radar_local_count += 1
         entry_ts = sessions.msk_now().strftime("%Y-%m-%d %H:%M:%S")
         pos_data: Dict[str, Any] = {
             "lots": lots,
@@ -1471,6 +1909,13 @@ class TradingEngine:
             "setup": str(decision.get("setup") or summary.get("selected_setup") or "unknown"),
             "signal_score": float(score),
             "llm_confidence": float(decision.get("confidence") or 0.0),
+            # v1.12.0: источник решения - для статистики и счётчика лимита
+            # локальных входов (radar_local = без единого токена Groq).
+            "entry_source": ("radar_local"
+                             if str(decision.get("source") or "") == "radar_local"
+                             else ("radar_ai"
+                                   if self._fresh_radar_verdict(ticker, price) is not None
+                                   else "scanner_ai")),
             "entry_tf_min": 5 if self.scalp_mode() else int(self.activity_info()["step_min"]),
             "entry_ts": entry_ts,
             "entry_epoch": time.time(),
@@ -1588,7 +2033,7 @@ class TradingEngine:
                 entry_epoch = entry_dt.replace(tzinfo=sessions.MSK).timestamp()
             except (ValueError, TypeError):
                 entry_epoch = 0.0
-        if confidence < 0.70 and entry_epoch > 0:
+        if self._is_weak_position(position) and entry_epoch > 0:
             age_min = max(0.0, (time.time() - entry_epoch) / 60.0)
             if age_min >= 20.0 and profit_pct <= -0.5 * stop_pct:
                 await self._sell(ticker, price, position,
@@ -1685,7 +2130,7 @@ class TradingEngine:
                 entry_epoch = time.time()
         age_min = max(0.0, (time.time() - entry_epoch) / 60.0)
         confidence = float(position.get("llm_confidence", 0.0) or 0.0)
-        weak_position = confidence < 0.70
+        weak_position = self._is_weak_position(position)
         # У неизвестной по времени legacy-позиции безопаснее закрыть её на
         # первой доступной цене, чем начинать новый 45-минутный таймер вслепую.
         if bool(position.get("scalp_time_unknown")):
@@ -2496,6 +2941,18 @@ class TradingEngine:
             return None
         if getattr(self._cfg, "ai_batch_required", True):
             item = self._ai_batch_candidates.get(ticker)
+            if item is None:
+                # v1.12.0: вердикт ИИ, полученный через микро-радар, действует
+                # так же, как сканерский пакетный.
+                radar_item = self._fresh_radar_verdict(ticker, price)
+                if radar_item is not None:
+                    item = {
+                        "ts": float(radar_item.get("ts") or 0.0),
+                        "price": float(radar_item.get("price") or 0.0),
+                        "rank_score": float((radar_item.get("row") or {}).get(
+                            "rank_score") or 0.0),
+                        "decision": radar_item.get("decision") or {},
+                    }
             if not item:
                 return None
             age = time.monotonic() - float(item.get("ts", 0.0) or 0.0)

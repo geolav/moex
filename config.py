@@ -11,13 +11,14 @@ systemd). Никаких хардкодных токенов - только os.g
 """
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import math
 import os
 import time
 from datetime import datetime, timezone, timedelta
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Optional, Tuple
 
 # python-dotenv - опциональная зависимость: под systemd переменные приходят
@@ -230,6 +231,16 @@ class BotConfig:
     scalp_loss_pause_minutes: int
     scalp_stop_cooldown_min: int
     scalp_max_sector_positions: int
+    # --- Микро-радар скальпа (v1.12.0): локальный поиск входов без ИИ ---------
+    scalp_radar_sec: int           # период прохода радара по половине watchlist, сек
+    scalp_local_autobuy: bool      # разрешить локальные входы без ИИ при высоком скоре
+    scalp_local_autobuy_score: float  # порог скора для локального входа без ИИ (0..100)
+    scalp_local_max_per_day: int   # максимум локальных (без ИИ) входов за день
+    scalp_ai_score: float          # порог скора, с которого кандидат идёт к ИИ (0..100)
+    scalp_ai_interval_sec: int     # минимум между пакетными вызовами ИИ от радара, сек
+    scalp_ai_dedup_min: int        # не показывать ИИ ту же бумагу чаще раза в N мин
+    scalp_ai_reserve_tokens: int   # резерв бюджета Groq (аудит/справки) - ИИ-входы не тратят
+    scalp_ai_call_estimate: int    # консервативная оценка токенов одного пакетного вызова
     # --- Сканер рынка (scanner.py) -------------------------------------------
     scan_enabled: bool            # фоновый поиск кандидатов раз в N минут
     scan_interval_min: int        # период сканирования рынка, минут
@@ -314,7 +325,7 @@ def load_config() -> BotConfig:
         tickers = tickers[:MAX_TICKERS]
 
     logs_dir = os.path.join(BASE_DIR, "logs")
-    return BotConfig(
+    cfg = BotConfig(
         tinkoff_token=tinkoff_token,
         tinkoff_sandbox_token=sandbox_token,
         groq_api_key=groq_key,
@@ -411,7 +422,12 @@ def load_config() -> BotConfig:
         # v1.9.0: минимум 4.0 по правилу «издержки не съедают больше ~25-30%
         # цели» (fortraders scalp-trading-ai): при цели 1R и издержках c
         # безубыточная вероятность = (R+c)/(2R); при R>=4c она <= 62.5%.
-        scalp_min_reward_cost_multiple=_env_float("SCALP_MIN_REWARD_COST_MULTIPLE", 4.0,
+        # v1.12.0: было 4.0 - при стопе 0.6% (ATR 5-мин голубых фишек) и
+        # издержках 0.2% (спред+комиссия+проскальзывание) гейт 4x не проходил
+        # НИ ОДИН вход (в логах владельца воронка была пуста). 3x - осмысленный
+        # баланс: TP1 0.6% при издержках 0.2% даёт чистыми +0.4%, а математика
+        # безубытка (breakeven confidence) отдельно защищает ожидание сделки.
+        scalp_min_reward_cost_multiple=_env_float("SCALP_MIN_REWARD_COST_MULTIPLE", 3.0,
                                                   low=1.0, high=10.0),
         scalp_time_stop_min=_env_int("SCALP_TIME_STOP_MIN", 45, low=5, high=240),
         scalp_min_progress_r=_env_float("SCALP_MIN_PROGRESS_R", 0.3,
@@ -420,6 +436,23 @@ def load_config() -> BotConfig:
                                           low=5, high=360),
         scalp_stop_cooldown_min=_env_int("SCALP_STOP_COOLDOWN_MIN", 120,
                                          low=30, high=1440),
+        # v1.12.0: микро-радар. SCALP_AI_SCORE <= SCALP_LOCAL_AUTOBUY_SCORE
+        # проверяется ниже (валидация), чтобы радар не предлагал ИИ то,
+        # что сам уже готов купить.
+        scalp_radar_sec=_env_int("SCALP_RADAR_SEC", 60, low=30, high=300),
+        scalp_local_autobuy=_env_bool("SCALP_LOCAL_AUTOBUY", True),
+        scalp_local_autobuy_score=_env_float("SCALP_LOCAL_AUTOBUY_SCORE", 85.0,
+                                             low=50.0, high=99.0),
+        scalp_local_max_per_day=_env_int("SCALP_LOCAL_MAX_PER_DAY", 20,
+                                         low=0, high=200),
+        scalp_ai_score=_env_float("SCALP_AI_SCORE", 70.0, low=40.0, high=99.0),
+        scalp_ai_interval_sec=_env_int("SCALP_AI_INTERVAL_SEC", 600,
+                                       low=120, high=3600),
+        scalp_ai_dedup_min=_env_int("SCALP_AI_DEDUP_MIN", 20, low=5, high=240),
+        scalp_ai_reserve_tokens=_env_int("SCALP_AI_RESERVE_TOKENS", 15000,
+                                         low=0, high=100000),
+        scalp_ai_call_estimate=_env_int("SCALP_AI_CALL_ESTIMATE", 2600,
+                                        low=500, high=20000),
         scalp_max_sector_positions=_env_int("SCALP_MAX_SECTOR_POSITIONS", 2,
                                             low=1, high=4),
         scan_enabled=_env_bool("SCAN_ENABLED", True),
@@ -460,6 +493,19 @@ def load_config() -> BotConfig:
         data_dir=os.path.join(BASE_DIR, "data"),
     )
 
+    # v1.12.0: порог локального входа не может быть НИЖЕ порога отправки к
+    # ИИ - иначе радар покупал бы сам то, что ИИ ещё не подтвердил, и
+    # подтверждение теряло бы смысл. Молча тянем ИИ-порог вверх.
+    if cfg.scalp_ai_score > cfg.scalp_local_autobuy_score:
+        print(
+            f"[config] SCALP_AI_SCORE ({cfg.scalp_ai_score:g}) выше "
+            f"SCALP_LOCAL_AUTOBUY_SCORE ({cfg.scalp_local_autobuy_score:g}) - "
+            f"порог ИИ выровнен по локальному.",
+            flush=True,
+        )
+        cfg = replace(cfg, scalp_ai_score=cfg.scalp_local_autobuy_score)
+    return cfg
+
 
 # ---------------------------------------------------------------------------
 # Персистентное runtime-состояние (state.json).
@@ -499,7 +545,12 @@ class StateStore:
 
     def __init__(self, path: str, initial_overrides: Optional[Dict[str, Any]] = None):
         self._path = path
-        self._data: Dict[str, Any] = dict(self._DEFAULTS)
+        # v1.12.0: deepcopy, а не dict(): dict() копирует только верхний
+        # уровень, и вложенные словари (positions, stop_cooldowns, last_buy_ts,
+        # price_history...) ОСТАВАЛИСЬ общими для всех экземпляров StateStore
+        # в процессе: кулдаун стопа одной бумаги из теста/второго хранилища
+        # внезапно появлялся в свежем состоянии.
+        self._data: Dict[str, Any] = copy.deepcopy(self._DEFAULTS)
         self._load(initial_overrides)
 
     # --- внутреннее ---------------------------------------------------------
