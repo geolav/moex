@@ -120,23 +120,11 @@ def _print_banner(config: BotConfig, state: StateStore) -> None:
              "вкл" if config.scan_auto_buy else "выкл",
              config.scan_auto_buy_per_scan)
     if state.scalp_mode:
-        # v1.17.4: в баннере видно, что анти-погоня не блокирует скальп-триггеры
-        # и что сильные сигналы покупаются сразу, без ожидания Groq batch.
-        ft_main = ""
-        if getattr(config, "scalp_fasttrack_enabled", True):
-            ft_main = (f"; быстрый трек ям score>={config.scalp_fasttrack_min_score:.0f} "
-                       f"(потенциал >={config.scalp_fasttrack_cost_multiple:.2f}x издержек)")
-            if getattr(config, "scalp_fasttrack_impulse_enabled", True):
-                ft_main += (f" и импульсов (>={config.scalp_fasttrack_impulse_cost_multiple:.2f}x)"
-                            )
         log.info("Скальп: потоковый поиск входов; резервная охрана позиций "
-                 "каждые %d сек, Groq batch не чаще %d мин%s, кулдаун %d мин",
+                 "каждые %d сек, Groq batch не чаще %d мин, кулдаун %d мин",
                  config.scalp_exit_poll_sec,
                  max(120, config.scalp_ai_min_request_interval_sec) // 60,
-                 ft_main,
                  config.scalp_cooldown_min)
-        log.info("Скальп: анти-погоня по 2ч-свечам НЕ применяется к свежим "
-                 "микро-триггерам (у детектора своя защита от погони)")
     log.info("Агрессивность %d/100 | активность %d/100 "
              "(масштаб времени задаётся в Telegram: /set_activity)",
              state.aggressiveness(), state.activity())

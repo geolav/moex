@@ -173,6 +173,7 @@ class TradingEngine:
         self._scalp_last_local_eval: Dict[str, float] = {}
         self._scalp_local_signal_log_last: Dict[str, float] = {}
         self._scalp_dip_diag_log_last: Dict[str, float] = {}
+        self._scalp_dip_diagnostics_by_ticker: Dict[str, Dict[str, Any]] = {}
         self._last_dip_diagnostics: Dict[str, Any] = {}
         self._scalp_stream_health_log_last: float = 0.0
         self._scalp_trigger_cache: Dict[str, Dict[str, float]] = {}
@@ -183,8 +184,7 @@ class TradingEngine:
         self._scalp_last_portfolio_sync = 0.0
         self._scalp_external_missing: Dict[str, int] = {}
         self._scalp_ai_disabled_logged = False
-        # v1.17.4: не спамим в лог, когда scalp batch ждёт общего лимита Groq.
-        self._scalp_ai_defer_log_last = 0.0
+        self._scalp_ai_limit_log_last = 0.0
         # v1.13.0: троттлинг сообщений risk-off по тикерам (не чаще 1/60 сек).
         self._riskoff_log_last: Dict[str, float] = {}
         # v1.14.0: раздельные таймеры полного цикла и охраны позиций в обычном
@@ -193,6 +193,20 @@ class TradingEngine:
         self._last_entry_cycle = 0.0
         self._last_pos_guard = 0.0
         self._migrate_legacy_scalp_positions()
+        if self.scalp_mode():
+            log.info(
+                "Scalp режим: дневной потолок входов %d; fast-track ям %s "
+                "(score>=%.0f, потенциал>=%.2fx издержек); fast-track импульсов %s "
+                "(потенциал>=%.2fx, только со стаканом); price-only=%s, fallback-спред=%.3f%%",
+                int(getattr(self._cfg, "scalp_max_entries_per_day", 100)),
+                "ВКЛ" if getattr(self._cfg, "scalp_fasttrack_enabled", True) else "ВЫКЛ",
+                float(getattr(self._cfg, "scalp_fasttrack_min_score", 75.0)),
+                float(getattr(self._cfg, "scalp_fasttrack_cost_multiple", 1.10)),
+                "ВКЛ" if getattr(self._cfg, "scalp_fasttrack_impulse_enabled", True) else "ВЫКЛ",
+                float(getattr(self._cfg, "scalp_fasttrack_impulse_cost_multiple", 1.25)),
+                bool(getattr(self._cfg, "scalp_micro_price_only", True)),
+                float(getattr(self._cfg, "scalp_default_spread_pct", 0.05)),
+            )
 
     def _migrate_legacy_scalp_positions(self) -> None:
         """Нормализует все позиции скальп-режима, включая старые state-файлы.
@@ -340,19 +354,9 @@ class TradingEngine:
         входы fail-closed, а открытые позиции получают резервную REST-охрану.
         """
         info = self.activity_info()
-        # v1.17.4: в баннере видно, что анти-погоня по 2ч-свечам не действует
-        # на свежие скальп-триггеры и что сильные сигналы покупаются сразу.
-        ft_txt = ""
-        if self.scalp_mode() and bool(getattr(self._cfg, "scalp_fasttrack_enabled", True)):
-            ft_txt = (f"; быстрый трек: ямы score>={float(getattr(self._cfg, 'scalp_fasttrack_min_score', 75.0)):.0f} "
-                      f"с потенциалом >={float(getattr(self._cfg, 'scalp_fasttrack_cost_multiple', 1.10)):.2f}x издержек")
-            if bool(getattr(self._cfg, "scalp_fasttrack_impulse_enabled", True)):
-                ft_txt += (f", импульсы >={float(getattr(self._cfg, 'scalp_fasttrack_impulse_cost_multiple', 1.25)):.2f}x")
-            ft_txt += " - покупка сразу, без Groq"
         scalp_txt = (f", СКАЛЬП-РЕЖИМ: поток цены+стакана, локальная проверка "
                      f"по событиям, Groq batch не чаще 1 раза в "
-                     f"{self._cfg.scalp_ai_min_request_interval_sec // 60} мин"
-                     f"{ft_txt}, "
+                     f"{self._cfg.scalp_ai_min_request_interval_sec // 60} мин, "
                      f"до {self._cfg.scalp_max_positions} позиций"
                      if self.scalp_mode() else "")
         log.info("Торговый движок v2 запущен: тикеры %s, период %d сек, "
@@ -404,141 +408,11 @@ class TradingEngine:
     def _scalp_micro_cost_pct(self, quote: Dict[str, Any]) -> float:
         """Оценка полного трения для короткого импульса: комиссия + спред + slippage."""
         spread = max(0.0, float(quote.get("spread_pct", 0.0) or 0.0))
+        if spread <= 0 and bool(getattr(self._cfg, "scalp_micro_price_only", True)):
+            spread = max(0.0, float(getattr(self._cfg, "scalp_default_spread_pct", 0.05)))
         commission = max(0.0, float(self._cfg.scalp_round_trip_cost_pct or 0.0))
         slippage = max(0.0, float(getattr(self._cfg, "slippage_pct", 0.0) or 0.0))
         return spread + commission + slippage
-
-    @staticmethod
-    def _trigger_expected_move_pct(trigger: Optional[Dict[str, Any]]) -> float:
-        """v1.17.3: ожидаемое благоприятное движение триггера в % (0 - без прогноза).
-
-        У ямы это потенциал отскока к средней окна (rebound_to_mean_pct),
-        у импульса - прогноз на 30 секунд (projected_30s_pct). Именно эта
-        величина - честная "награда" скальпа: позиция закрывается, как только
-        брутто-рост покрывает издержки круга.
-        """
-        if not trigger:
-            return 0.0
-        best = 0.0
-        for key in ("rebound_to_mean_pct", "rebound_to_vwap_pct",
-                    "projected_30s_pct"):
-            try:
-                value = float(trigger.get(key) or 0.0)
-            except (TypeError, ValueError):
-                continue
-            if value > best:
-                best = value
-        return best
-
-    def _scalp_fasttrack_decision(self, micro: Dict[str, Any],
-                                  round_trip_cost: float,
-                                  breakeven_confidence: float) -> Optional[Dict[str, Any]]:
-        """Быстрый локальный вход для сильных ям (v1.17.3) и импульсов (v1.17.4).
-
-        Groq batch отвечает не чаще раза в 4 минуты (лимит токенов), а жизнь
-        микроямы - десятки секунд: к моменту ответа ИИ сигнал успевал
-        протухать, и покупок не было вовсе. Поэтому сильные сигналы покупаются
-        сразу, без ожидания ИИ. ИИ продолжает управлять вселенной бумаг
-        (сканер), подтверждать средние сигналы пакетами и разбирать сделки
-        аудитором. Отключается SCALP_FASTTRACK_ENABLED=false.
-
-        v1.17.4: (1) порог экономики ямы снижен с 1.25x до 1.10x издержек -
-        тот же множитель, что в общем фильтре входа; при 1.25x в быстрый трек
-        не попадали живые кандидаты из логов (PLZL 1.22x, VKCO 1.16x) и они
-        молча протухали в очереди Groq. (2) добавлен быстрый трек свежих
-        микро-импульсов с более строгой экономикой (по умолчанию >= 1.25x
-        издержек) - импульс живёт ещё меньше ямы, в очереди Groq он не
-        выживал никогда. Отключается SCALP_FASTTRACK_IMPULSE_ENABLED=false.
-        """
-        if not bool(getattr(self._cfg, "scalp_fasttrack_enabled", True)):
-            return None
-        kind = str(micro.get("kind") or "")
-        is_dip = bool(micro.get("micro_dip")) or kind == "dip_reversal"
-        is_impulse = not is_dip and (
-            kind == "micro_impulse" or "projected_30s_pct" in micro)
-        cost = max(0.0, float(round_trip_cost or 0.0))
-        if cost <= 0:
-            return None
-        if is_dip:
-            try:
-                bottom_score = float(micro.get("bottom_score") or 0.0)
-            except (TypeError, ValueError):
-                bottom_score = 0.0
-            min_score = max(0.0, float(getattr(
-                self._cfg, "scalp_fasttrack_min_score", 75.0) or 75.0))
-            if bottom_score < min_score:
-                return None
-            expected = self._trigger_expected_move_pct(micro)
-            mult = max(1.0, float(getattr(
-                self._cfg, "scalp_fasttrack_cost_multiple", 1.10) or 1.10))
-            if expected < mult * cost:
-                return None
-            # Уверенность не выдумывается: она обязана перекрывать
-            # безубыточную вероятность сделки (та же планка, что для ИИ).
-            base = 0.72 + 0.10 * min(1.0, max(0.0, bottom_score - min_score) / 20.0)
-            confidence = max(base, float(breakeven_confidence or 0.0) + 0.06)
-            confidence = min(0.92, confidence)
-            return {
-                "action": "buy",
-                "confidence": round(confidence, 3),
-                "setup": kind or "dip_reversal",
-                "reason": (f"сильная яма: score {bottom_score:.0f}/100, потенциал "
-                           f"{expected:.2f}% = {expected / cost:.2f}x издержек "
-                           f"{cost:.2f}%"),
-            }
-        if is_impulse:
-            if not bool(getattr(self._cfg, "scalp_fasttrack_impulse_enabled", True)):
-                return None
-            try:
-                expected = float(micro.get("projected_30s_pct") or 0.0)
-            except (TypeError, ValueError):
-                expected = 0.0
-            mult = max(1.0, float(getattr(
-                self._cfg, "scalp_fasttrack_impulse_cost_multiple", 1.25) or 1.25))
-            if expected < mult * cost:
-                return None
-            # Быстрый вход по импульсу только с поддержкой стакана: без
-            # стакана (price_only) покупка "на uprising" - это ровно та
-            # погоня, против которой есть анти-погоня; такой кандидат
-            # идёт в очередь Groq.
-            book_mode = str(micro.get("book_mode") or "none")
-            try:
-                imbalance = float(micro.get("bid_ask_imbalance") or 0.0)
-            except (TypeError, ValueError):
-                imbalance = 0.0
-            if book_mode not in ("stream", "rest") or imbalance < 1.05:
-                return None
-            confidence = max(0.68, float(breakeven_confidence or 0.0) + 0.06)
-            confidence = min(0.88, confidence)
-            return {
-                "action": "buy",
-                "confidence": round(confidence, 3),
-                "setup": kind or "micro_impulse",
-                "reason": (f"свежий микро-импульс: прогноз +{expected:.2f}% = "
-                           f"{expected / cost:.2f}x издержек {cost:.2f}%, "
-                           f"стакан за покупку"),
-            }
-        return None
-
-    def _price_only_kwargs(self) -> Dict[str, Any]:
-        """Общие kwargs деградации без стакана (v1.17.2) для всех детекторов.
-
-        Стакан в этой конфигурации может молчать (book_age=inf): детекторы
-        получают разрешение на price-only анализ и консервативную оценку
-        спреда, чтобы локальные ямы обнаруживались по структуре цены.
-        Значения читаются None-защищённо: dry-run конфиг заполняет новые
-        поля BotConfig значением None по умолчанию.
-        """
-        price_only = getattr(self._cfg, "scalp_micro_price_only_fallback", True)
-        spread_fb = getattr(self._cfg, "scalp_default_spread_pct", 0.05)
-        rest_age = getattr(self._cfg, "scalp_rest_book_max_age_sec", 45)
-        return {
-            "allow_price_only": True if price_only is None else bool(price_only),
-            "spread_fallback_pct": max(0.0, float(
-                0.05 if spread_fb is None else spread_fb)),
-            "rest_book_max_age_sec": max(10.0, float(
-                45 if rest_age is None else rest_age)),
-        }
 
     def _micro_trigger(self, quote: Optional[Dict[str, Any]]) -> Optional[Dict[str, float]]:
         """Единая точка вызова локального микро-детектора со порогами из конфига.
@@ -563,10 +437,16 @@ class TradingEngine:
             min_up_ratio=float(cfg_up_ratio) if cfg_up_ratio else 0.55,
             min_imbalance=float(cfg_imbalance) if cfg_imbalance else 1.10,
             max_ret45_pct=float(cfg_max_ret45) if cfg_max_ret45 else 0.45,
-            **self._price_only_kwargs(),
+            allow_price_only=bool(getattr(self._cfg, "scalp_micro_price_only", True)),
+            default_spread_pct=float(getattr(self._cfg, "scalp_default_spread_pct", 0.05)),
         )
         if signal is not None:
             signal["kind"] = "micro_impulse"
+            signal["book_source"] = str(
+                quote.get("book_source") or
+                ("stream" if float(quote.get("book_age_sec", float("inf"))) <= 5.0
+                 else "price_only")
+            )
         return signal
 
     def _dip_trigger(self, quote: Optional[Dict[str, Any]]) -> Optional[Dict[str, float]]:
@@ -589,7 +469,6 @@ class TradingEngine:
         # локально, не вызывает Groq и не ослабляет ограничения по спреду,
         # свежести данных или доступному потенциалу относительно издержек.
         signals = []
-        price_only_kwargs = self._price_only_kwargs()
         legacy = detect_dip_reversal_trigger(
             quote,
             max_spread_pct=float(self._cfg.scalp_max_spread_pct),
@@ -599,7 +478,6 @@ class TradingEngine:
             dip_stabilize_sec=float(max(5, int(getattr(
                 self._cfg, "scalp_dip_stabilize_sec", 20)))),
             dip_min_imbalance=float(getattr(self._cfg, "scalp_dip_min_imbalance", 1.15)),
-            **price_only_kwargs,
         )
         if legacy is not None:
             legacy["kind"] = "dip_reversal"
@@ -613,12 +491,18 @@ class TradingEngine:
                 getattr(self._cfg, "scalp_micro_dip_min_drop_pct", None) or 0.02),
             min_score=float(
                 getattr(self._cfg, "scalp_micro_dip_min_score", None) or 48.0),
+            allow_price_only=bool(getattr(self._cfg, "scalp_micro_price_only", True)),
+            default_spread_pct=float(getattr(self._cfg, "scalp_default_spread_pct", 0.05)),
             diagnostics=diagnostics,
-            **price_only_kwargs,
         )
         self._last_dip_diagnostics = diagnostics
         if micro is not None:
             micro["kind"] = "dip_reversal"
+            micro["book_source"] = str(
+                quote.get("book_source") or
+                ("stream" if float(quote.get("book_age_sec", float("inf"))) <= 5.0
+                 else "price_only")
+            )
             signals.append(micro)
         return max(signals, key=lambda item: float(item.get("bottom_score", 0.0))) if signals else None
 
@@ -684,6 +568,16 @@ class TradingEngine:
 
         ready = bool(getattr(self._client, "scalp_feed_ready", False))
         getter = getattr(self._client, "get_scalp_quote", None)
+        if ready:
+            refresh_books = getattr(self._client, "refresh_stale_books", None)
+            if callable(refresh_books):
+                try:
+                    await refresh_books(tickers, refresh_sec=30.0,
+                                        max_age_sec=5.0, max_requests=6, depth=5)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - optional fallback
+                    log.debug("Scalp REST book fallback недоступен: %s", exc)
         if not ready or not callable(getter):
             if now - self._scalp_stream_health_log_last >= 60.0:
                 self._scalp_stream_health_log_last = now
@@ -699,20 +593,6 @@ class TradingEngine:
                 await self.exit_cycle()
             return
 
-        # v1.17.2: если стримовый стакан молчит (сервер отклонил подписку или
-        # стакан просто не шлёт), освежаем bid/ask по REST GetOrderBook -
-        # детекторы получают спред и дисбаланс вместо book_age=inf.
-        book_refresher = getattr(self._client, "refresh_stale_books", None)
-        if callable(book_refresher):
-            try:
-                refreshed = await book_refresher(tickers)
-                if refreshed:
-                    log.debug("Scalp stream: REST-стакан обновлён для %d бумаг", refreshed)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001 - фолбэк не обязан работать
-                log.debug("REST-обновление стакана не удалось: %s", exc)
-
         for ticker in tickers:
             if self._stop_event.is_set():
                 break
@@ -720,26 +600,12 @@ class TradingEngine:
                 quote = getter(ticker)
                 if not quote:
                     continue
-                # v1.17.2: если у котировки нет спреда (стакан молчит),
-                # подставляем фолбэк: REST-стакан -> ISS-снимок ->
-                # консервативная оценка из конфига. Без этого детекторы
-                # браковали сигнал с "спред 0.0000% вне лимита".
-                if not float(quote.get("spread_pct") or 0.0):
-                    fallback_spread = None
-                    spread_getter = getattr(self._client, "get_spread_pct", None)
-                    if callable(spread_getter):
-                        try:
-                            fallback_spread = spread_getter(ticker)
-                        except Exception:  # noqa: BLE001
-                            fallback_spread = None
-                    if not fallback_spread:
-                        default_spread = getattr(
-                            self._cfg, "scalp_default_spread_pct", 0.05)
-                        fallback_spread = max(0.0, float(
-                            0.05 if default_spread is None else default_spread))
-                    quote["spread_pct"] = float(fallback_spread)
-                    quote["spread_source"] = "fallback"
                 price = float(quote.get("price") or 0.0)
+                if (float(quote.get("spread_pct") or 0.0) <= 0
+                        and bool(getattr(self._cfg, "scalp_micro_price_only", True))):
+                    quote["spread_pct"] = float(getattr(
+                        self._cfg, "scalp_default_spread_pct", 0.05))
+                    quote["spread_source"] = "fallback"
                 price_age = float(quote.get("price_age_sec", float("inf")))
                 seq = int(quote.get("price_seq", 0) or 0)
                 if price <= 0:
@@ -778,6 +644,8 @@ class TradingEngine:
                     # Раньше отрицательный результат детектора был полностью
                     # невидим в логах. Теперь раз в минуту на тикер показываем,
                     # что проверялось и почему локальная яма не подтвердилась.
+                    self._scalp_dip_diagnostics_by_ticker[ticker] = dict(
+                        self._last_dip_diagnostics or {})
                     last_diag_log = self._scalp_dip_diag_log_last.get(ticker, 0.0)
                     if now - last_diag_log >= 60.0:
                         self._scalp_dip_diag_log_last[ticker] = now
@@ -785,41 +653,31 @@ class TradingEngine:
                         tick_count = diag.get("ticks", len(quote.get("ticks") or []))
                         windows = diag.get("windows_checked", "нет")
                         reason = diag.get("reason", "минимум/отскок/поток не подтвердили паттерн")
-                        book_mode = str(quote.get("book_source") or "none")
-                        if diag.get("book_mode"):
-                            book_mode = str(diag["book_mode"])
                         log.info(
                             "Микродно %s: локальный анализ выполнен; тиков=%s, "
-                            "окна=%s сек, спред=%.4f%% (%s), цена свежая %.2f сек, "
-                            "стакан свежий %.2f сек (%s); сигнал не подтверждён: %s",
+                            "окна=%s сек, спред=%.4f%%, цена свежая %.2f сек, "
+                            "стакан свежий %.2f сек; сигнал не подтверждён: %s",
                             ticker, tick_count, windows,
                             float(quote.get("spread_pct") or 0.0),
-                            str(quote.get("spread_source") or "стакан"),
                             float(quote.get("price_age_sec") or 0.0),
-                            float(quote.get("book_age_sec") or 0.0), book_mode,
-                            reason)
+                            float(quote.get("book_age_sec") or 0.0), reason)
                     continue
                 self._scalp_trigger_cache[ticker] = signal
                 last_signal_log = self._scalp_local_signal_log_last.get(ticker, 0.0)
                 if now - last_signal_log >= 45.0:
                     self._scalp_local_signal_log_last[ticker] = now
                     if signal.get("micro_dip"):
-                        # v1.17.3: честная формулировка. Здесь сигнал только
-                        # распознан; фильтры входа (ATR/спред/издержки/брэдс/
-                        # анти-погоня/новости) прогоняет _process_ticker, и
-                        # только после них кандидат попадает в очередь Groq.
                         log.info(
                             "Микрояма %s: масштаб %.0fс, глубина %.4f%%, отскок %.4f%%, "
                             "потенциал %.4f%%, стакан %.2fx, score %.1f/100; "
-                            "сигнал распознан, прогоняю фильтры входа",
+                            "сигнал распознан, запускаю локальные фильтры входа",
                             ticker, signal.get("dip_scale_sec", 0.0),
                             signal.get("dip_drop_pct", 0.0), signal.get("off_low_pct", 0.0),
                             signal.get("rebound_to_mean_pct", 0.0),
                             signal.get("bid_ask_imbalance", 0.0),
                             signal.get("bottom_score", 0.0))
                     else:
-                        log.info("Микроструктурный сигнал %s: %s; сигнал распознан, "
-                                 "прогоняю фильтры входа",
+                        log.info("Микроструктурный сигнал %s: %s; запускаю локальные фильтры входа",
                                  ticker, signal.get("kind", "micro_impulse"))
                 # _process_ticker запишет эту цену в историю один раз.
                 await self._process_ticker(ticker, current_price=price)
@@ -830,57 +688,46 @@ class TradingEngine:
 
         # Контроль здоровья stream: ready=True само по себе не значит, что
         # по тикерам реально приходят свежие цены и стаканы. Один INFO/минуту.
-        # v1.17.2: цена и стакан считаются раздельно - при молчащем стакане
-        # видно, что цена живая и поиск идёт в price-only/REST-режиме.
         if now - self._scalp_stream_health_log_last >= 60.0:
-            fresh_price = []
-            fresh_book = []
-            stale_price = []
-            for symbol in tickers:
-                try:
-                    q = getter(symbol)
-                    if not q:
-                        stale_price.append(symbol)
-                        continue
-                    if float(q.get("price_age_sec", float("inf"))) <= 3.0:
-                        fresh_price.append(symbol)
-                    else:
-                        stale_price.append(symbol)
-                    if float(q.get("book_age_sec", float("inf"))) <= 5.0:
-                        fresh_book.append(symbol)
-                except Exception:
-                    stale_price.append(symbol)
-            # Буферы показываем по всем бумагам с тиками (а не только "свежим",
-            # как раньше - при молчащем стакане список всегда был "нет").
-            buffer_sizes = []
-            with_ticks = []
-            for symbol in tickers:
-                try:
-                    q = getter(symbol) or {}
-                    size = len(q.get("ticks") or [])
-                    if size:
-                        with_ticks.append((size, symbol))
-                except Exception:
-                    pass
-            for size, symbol in sorted(with_ticks, reverse=True)[:6]:
-                buffer_sizes.append(f"{symbol}:{size}")
+            fresh_prices = []
+            stream_books = []
             rest_books = []
+            stale_prices = []
+            buffer_sizes = []
             for symbol in tickers:
                 try:
                     q = getter(symbol) or {}
-                    if str(q.get("book_source") or "") == "rest":
+                    price_age_now = float(q.get("price_age_sec", float("inf")))
+                    book_age_now = float(q.get("book_age_sec", float("inf")))
+                    source_now = str(q.get("book_source") or "")
+                    if price_age_now <= 3.0:
+                        fresh_prices.append(symbol)
+                        ticks_now = len(q.get("ticks") or [])
+                        if ticks_now:
+                            buffer_sizes.append(f"{symbol}:{ticks_now}")
+                    else:
+                        stale_prices.append(symbol)
+                    if source_now == "stream" and book_age_now <= 5.0:
+                        stream_books.append(symbol)
+                    elif source_now == "rest" and book_age_now <= 45.0:
                         rest_books.append(symbol)
                 except Exception:
-                    pass
+                    stale_prices.append(symbol)
+            reason_items = []
+            for symbol in tickers:
+                diag = self._scalp_dip_diagnostics_by_ticker.get(symbol) or {}
+                reason = str(diag.get("reason") or "")
+                if reason and symbol not in stale_prices:
+                    reason_items.append(f"{symbol}: {reason}")
             log.info(
-                "Scalp stream ЗДОРОВ: цена свежая %d/%d; стакан (стрим) %d/%d%s; "
-                "буферы тиков [%s]; без свежей цены [%s]. "
-                "Локальный поиск микродон работает по свежим тикам; "
-                "Groq не вызывается на каждом тике.",
-                len(fresh_price), len(tickers), len(fresh_book), len(tickers),
-                ("; стакан по REST: " + ", ".join(rest_books[:8])) if rest_books else "",
-                ", ".join(buffer_sizes) or "нет",
-                ", ".join(stale_price[:12]) or "нет")
+                "Scalp stream ЗДОРОВ: цена свежая %d/%d; стакан (стрим) %d/%d; "
+                "стакан по REST: %s; буферы тиков [%s]; без свежей цены [%s]; "
+                "последние причины без сигнала [%s]. Groq не вызывается на каждом тике.",
+                len(fresh_prices), len(tickers), len(stream_books), len(tickers),
+                ", ".join(rest_books[:12]) or "нет",
+                ", ".join(buffer_sizes[:12]) or "нет",
+                ", ".join(stale_prices[:12]) or "нет",
+                "; ".join(reason_items[:5]) or "анализ ещё не запускался")
             self._scalp_stream_health_log_last = now
 
         await self._flush_scalp_ai_queue()
@@ -1045,34 +892,36 @@ class TradingEngine:
             self._cfg, "scalp_ai_min_request_interval_sec", 240) or 240))
         now = time.monotonic()
         if self._scalp_last_ai_batch_attempt and now - self._scalp_last_ai_batch_attempt < interval:
+            wait_left = interval - (now - self._scalp_last_ai_batch_attempt)
+            if now - self._scalp_ai_limit_log_last >= 600.0:
+                log.info("Scalp AI batch: очередь ждёт локальный интервал Groq ещё %.0f сек; "
+                         "%d кандидат(ов) остаются под проверкой свежести",
+                         wait_left, len(self._scalp_ai_queue))
+                self._scalp_ai_limit_log_last = now
             return
         wait_getter = getattr(self._analyst, "candidate_call_wait_seconds", None)
         if callable(wait_getter):
             try:
                 wait_sec = float(wait_getter(scalp_mode=True) or 0.0)
+                if wait_sec > 0.0:
+                    if now - self._scalp_ai_limit_log_last >= 600.0:
+                        log.info("Scalp AI batch: очередь ждёт общего лимита Groq ещё примерно "
+                                 "%.0f сек; сильные fast-track сигналы могут входить без ИИ",
+                                 wait_sec)
+                        self._scalp_ai_limit_log_last = now
+                    return  # Сканер/другой пакетный запрос уже использовал общий лимит.
             except Exception:
-                wait_sec = 0.0
-            if wait_sec > 0.0:
-                # Сканер/другой пакетный запрос уже использовал общий лимит.
-                # v1.17.4: раз в 10 минут объясняем в логе, почему очередь
-                # ждёт, - раньше это было полной тишиной.
-                if now - self._scalp_ai_defer_log_last >= 600.0:
-                    self._scalp_ai_defer_log_last = now
-                    log.info(
-                        "Scalp AI batch: очередь (%d кандидат(ов)) ждёт общего "
-                        "лимита запросов Groq ещё %.0f сек; сильные ямы/импульсы "
-                        "в это время не ждут - заходят по быстрому треку",
-                        len(self._scalp_ai_queue), wait_sec)
-                return
+                pass
         # Перед отправкой отбрасываем устаревшие записи: за время ожидания
         # Groq рынок мог измениться, и анализировать уже нечего.
         getter = getattr(self._client, "get_scalp_quote", None)
-        queue_len_before = len(self._scalp_ai_queue)
         fresh_rows: List[Dict[str, Any]] = []
+        expired_rows: List[str] = []
         for ticker, row in list(self._scalp_ai_queue.items()):
             quote = getter(ticker) if callable(getter) else None
             if not quote:
                 self._scalp_ai_queue.pop(ticker, None)
+                expired_rows.append(ticker)
                 continue
             signal = self._trigger_by_kind(
                 quote, str(row.get("trigger_kind") or "micro_impulse"))
@@ -1081,24 +930,21 @@ class TradingEngine:
             if (signal is None or price <= 0 or old_price <= 0
                     or abs(price / old_price - 1.0) > 0.0015):
                 self._scalp_ai_queue.pop(ticker, None)
+                expired_rows.append(ticker)
                 continue
             row["price"] = price
             row["microstructure"] = signal
             self._scalp_trigger_cache[ticker] = signal
             fresh_rows.append(row)
+        if expired_rows:
+            log.info("Scalp AI batch: %d кандидат(ов) сняты до отправки - "
+                     "триггер протух, цена ушла или котировка отсутствует: %s",
+                     len(expired_rows), ", ".join(expired_rows[:10]))
         rows = sorted(
             fresh_rows,
             key=lambda row: float(row.get("rank_score", 0.0) or 0.0),
             reverse=True,
         )[:3]
-        # v1.17.4: устаревшие кандидаты раньше выбрасывались молча - в логе
-        # не было ни строчки о том, почему очередь "исчезла" без покупок.
-        stale_dropped = (queue_len_before - len(fresh_rows)
-                         + max(0, len(fresh_rows) - len(rows)))
-        if stale_dropped:
-            log.info("Scalp AI batch: %d кандидат(ов) выброшены до отправки - "
-                     "сигнал устарел (импульс отыгрался, цена ушла более чем "
-                     "на 0.15%% или триггер погас)", stale_dropped)
         for row in rows:
             self._scalp_ai_queue.pop(str(row.get("ticker", "")).upper(), None)
         if not rows:
@@ -1732,6 +1578,72 @@ class TradingEngine:
         summary["round_trip_cost_pct"] = round(cost, 4)
         return cost
 
+    def _scalp_fasttrack_decision(self, trigger: Dict[str, Any],
+                                  round_trip_cost_pct: float,
+                                  stop_pct: float) -> Optional[Dict[str, Any]]:
+        """Локальный fast-track для редких сильных сигналов без ожидания Groq.
+
+        Это не прогноз гарантированной вероятности, а консервативный score-based
+        proxy. Он ограничен диапазоном 0.68..0.88 и обязан перекрыть p* + 5 п.п.
+        Импульсы дополнительно требуют реальный stream/REST-стакан.
+        """
+        if not bool(getattr(self._cfg, "scalp_fasttrack_enabled", True)):
+            return None
+        kind = str(trigger.get("kind") or "micro_impulse")
+        cost = max(0.0, float(round_trip_cost_pct))
+        if cost <= 0 or stop_pct <= 0:
+            return None
+        if kind == "dip_reversal":
+            score = float(trigger.get("bottom_score") or 0.0)
+            potential = float(trigger.get("rebound_to_vwap_pct")
+                              or trigger.get("rebound_to_mean_pct") or 0.0)
+            multiple = float(getattr(self._cfg, "scalp_fasttrack_cost_multiple", 1.10))
+            if score < float(getattr(self._cfg, "scalp_fasttrack_min_score", 75.0)):
+                return None
+            if potential < cost * multiple:
+                return None
+            confidence = min(0.88, max(0.68, 0.68 + 0.20 * (score / 100.0)))
+            reason = (f"сильная локальная яма score={score:.1f}, потенциал "
+                      f"{potential:.3f}% = {potential / cost:.2f}x издержек")
+        elif kind == "micro_impulse":
+            if not bool(getattr(self._cfg, "scalp_fasttrack_impulse_enabled", True)):
+                return None
+            if float(trigger.get("price_only") or 0.0) > 0.5:
+                return None
+            source = str(trigger.get("book_source") or "stream").lower()
+            if source not in {"stream", "rest"}:
+                return None
+            imbalance = float(trigger.get("bid_ask_imbalance") or 0.0)
+            if imbalance < 1.05:
+                return None
+            potential = float(trigger.get("projected_30s_pct") or 0.0)
+            multiple = float(getattr(
+                self._cfg, "scalp_fasttrack_impulse_cost_multiple", 1.25))
+            if potential < cost * multiple:
+                return None
+            ratio = potential / cost
+            confidence = min(0.88, max(0.68, 0.68 + 0.20 * min(1.0, max(0.0, (ratio - 1.0) / 2.0))))
+            reason = (f"локальный импульс, прогноз {potential:.3f}% = "
+                      f"{ratio:.2f}x издержек, bid/ask={imbalance:.2f}")
+        else:
+            return None
+
+        be_conf = self._breakeven_confidence(stop_pct, stop_pct, cost)
+        required_conf = be_conf + 0.05
+        if be_conf >= 1.0 or confidence < required_conf:
+            log.info("Fast-track %s: сигнал найден, но локальная оценка %.0f%% "
+                     "ниже требуемых %.0f%% (p*=%.0f%%); жду Groq/следующий сигнал",
+                     kind, confidence * 100.0, required_conf * 100.0,
+                     be_conf * 100.0)
+            return None
+        return {
+            "action": "buy",
+            "confidence": round(confidence, 3),
+            "reason": "fast-track: " + reason,
+            "setup": kind,
+            "size_mult": 0.5,
+        }
+
     def _breakeven_confidence(self, stop_pct: float, tp_pct: float,
                               cost_pct: float) -> float:
         """Минимальная вероятность, при которой сделка имеет нулевое матожидание.
@@ -1750,9 +1662,10 @@ class TradingEngine:
         return loss / (win + loss)
 
     async def _evaluate_entry(self, ticker: str, price: float) -> None:
-        if self.scalp_mode() and not bool(
-                getattr(self._cfg, "llm_decisions_enabled", False)):
-            log.debug("%s: scalp entry пропущен: решения ИИ отключены", ticker)
+        if (self.scalp_mode()
+                and not bool(getattr(self._cfg, "llm_decisions_enabled", False))
+                and not bool(getattr(self._cfg, "scalp_fasttrack_enabled", True))):
+            log.debug("%s: scalp entry пропущен: LLM и быстрый трек отключены", ticker)
             return
         # Для автоматических входов LLM доступен только пакетно: не более 2-3
         # лучших кандидатов по математическому рейтингу за один цикл сканера.
@@ -1913,28 +1826,17 @@ class TradingEngine:
             })
         # Без ATR/спреда скальп не оцениваем: это критичные данные для стопа
         # и проверки, что цель покрывает издержки. Не подставляем выдуманные значения.
-        # v1.17.2: спред больше не жёсткий блок - если ни стримовый, ни REST-стакан,
-        # ни ISS-снимок не дали спред, берём консервативную оценку
-        # SCALP_DEFAULT_SPREAD_PCT (та же, что использовал детектор при
-        # генерации сигнала), иначе каждый сигнал гас на "нет свежего спреда".
         if self.scalp_mode():
             atr_getter = getattr(self._client, "get_atr_pct", None)
             spread_getter = getattr(self._client, "get_spread_pct", None)
             atr_pct = atr_getter(ticker, 14) if callable(atr_getter) else None
             spread_pct = spread_getter(ticker) if callable(spread_getter) else None
-            if spread_pct is None or float(spread_pct) <= 0:
-                default_spread = getattr(
-                    self._cfg, "scalp_default_spread_pct", 0.05)
-                spread_pct = max(0.0, float(
-                    0.05 if default_spread is None else default_spread))
-                if not float(spread_pct):
-                    log.info("%s: скальп-вход пропущен: спред неизвестен, а "
-                             "SCALP_DEFAULT_SPREAD_PCT = 0", ticker)
-                    return
-                log.info("%s: спред недоступен - использую консервативную "
-                         "оценку %.3f%%", ticker, float(spread_pct))
-            if atr_pct is None or atr_pct <= 0:
-                log.info("%s: скальп-вход пропущен: нет свежего ATR(14)", ticker)
+            if spread_pct is None and bool(getattr(self._cfg, "scalp_micro_price_only", True)):
+                spread_pct = float(getattr(self._cfg, "scalp_default_spread_pct", 0.05))
+                log.info("%s: спред недоступен - использую консервативный fallback %.3f%%",
+                         ticker, spread_pct)
+            if atr_pct is None or atr_pct <= 0 or spread_pct is None:
+                log.info("%s: скальп-вход пропущен: нет ATR(14) или оценки спреда", ticker)
                 return
             stop_pct = min(self._cfg.scalp_max_stop_pct,
                            max(self._cfg.scalp_min_stop_pct,
@@ -1945,31 +1847,20 @@ class TradingEngine:
                 log.info("%s: спред %.3f%% выше лимита %.3f%%",
                          ticker, float(spread_pct), self._cfg.scalp_max_spread_pct)
                 return
-            # v1.17.3: экономику входа считаем от ОЖИДАЕМОГО движения триггера
-            # (потенциал отскока ямы / прогноз импульса), а не от стопа. Раньше
-            # "наградой" в этой проверке была плановая стоп-дистанция: при
-            # SCALP_MIN_REWARD_COST_MULTIPLE=4.0 и стопе 0.6% порог требовал
-            # ход >= 0.667% и был невыполним - фильтр гасил ВСЕ кандидаты
-            # (в логах: "ход до TP1 0.600% не покрывает издержки 3.4-3.8x").
-            expected_move = self._trigger_expected_move_pct(trigger)
-            reward_multiple = max(1.0, float(getattr(
-                self._cfg, "scalp_min_reward_cost_multiple", 1.10) or 1.10))
-            if expected_move > 0:
-                needed_move = reward_multiple * round_trip_cost
-                if expected_move < needed_move:
-                    log.info("%s: потенциал %.3f%% = %.2fx издержек %.3f%% "
-                             "(нужно >= %.2fx) - вход отменён",
-                             ticker, expected_move,
-                             expected_move / max(round_trip_cost, 1e-9),
-                             round_trip_cost, reward_multiple)
-                    return
-            elif stop_pct < reward_multiple * round_trip_cost:
-                # Триггер без прогноза (не должен случаться в скальпе):
-                # консервативный fallback на старую проверку по стопу.
-                log.info("%s: ход до цели %.3f%% = %.2fx издержек %.3f%% "
+            trigger_reward_pct = 0.0
+            if trigger is not None:
+                trigger_reward_pct = float(
+                    trigger.get("rebound_to_vwap_pct")
+                    or trigger.get("rebound_to_mean_pct")
+                    or trigger.get("projected_30s_pct") or 0.0)
+            reward_basis = trigger_reward_pct if trigger_reward_pct > 0 else stop_pct
+            reward_multiple = float(getattr(
+                self._cfg, "scalp_min_reward_cost_multiple", 1.10) or 1.10)
+            if reward_basis < reward_multiple * round_trip_cost:
+                log.info("%s: потенциал %.4f%% = %.2fx полных издержек %.4f%% "
                          "(нужно >= %.2fx) - вход отменён",
-                         ticker, stop_pct,
-                         stop_pct / max(round_trip_cost, 1e-9),
+                         ticker, reward_basis,
+                         reward_basis / max(round_trip_cost, 1e-9),
                          round_trip_cost, reward_multiple)
                 return
             summary["atr_pct"] = float(atr_pct)
@@ -2062,22 +1953,8 @@ class TradingEngine:
         # первый же откат к средней считался "сигналом" - и покупка выходила
         # на хае (кейс LKOH). Теперь вход запрещён, если цена уже вплотную
         # к максимуму локального окна или отскок от минимума уже отыгран.
-        # v1.17.4: в скальпе у свежего микротриггера СВОЯ анти-погоня на
-        # масштабе секунд, и она строже 2-часовой: детектор ямы бракует
-        # "отскок больше 70% просадки" (покупка задним числом) и "цена
-        # продолжает обновлять минимум", детектор импульса - "улетевшие"
-        # движения (ret45/ret15). А 2-часовое окно 5-минутных свечей гасило
-        # ровно те входы, ради которых создан скальп: яма у минимума окна
-        # почти всегда стоит в верхней половине 2ч-диапазона, поэтому каждый
-        # кандидат гиб со "жду более глубокий откат" (в логах: "цена всего
-        # на 0.00% ниже максимума последних ~24 свечей" - и покупок нет).
-        # 2ч-анти-погоня остаётся для свечных сетапов без микротриггера
-        # и для обычного (не скальп) режима.
-        if self.scalp_mode() and trigger is not None:
-            chase = None
-        else:
-            chase = self._chase_guard(closes, price)
-        if chase:
+        chase = self._chase_guard(closes, price)
+        if chase and not (self.scalp_mode() and trigger is not None):
             log.info("%s: анти-погоня - %s. Жду более глубокий откат", ticker, chase)
             self._state.append_decision({
                 "ts": time.strftime("%d.%m %H:%M"), "ticker": ticker,
@@ -2117,31 +1994,27 @@ class TradingEngine:
                 and batch_price > 0
                 and abs(price / batch_price - 1.0) <= 0.0015
             )
-            decision: Optional[Dict[str, Any]] = None
+            fasttracked = False
             if not has_fresh_verdict:
                 micro = dict(self._scalp_trigger_cache.get(ticker) or {})
                 be_stop = float(summary.get("planned_stop_pct") or 0.0)
                 be_cost = float(summary.get("round_trip_cost_pct") or 0.0)
                 be_conf = self._breakeven_confidence(be_stop, be_stop, be_cost)
                 summary["breakeven_confidence"] = round(be_conf, 3)
-                # Рейтинг нужен только для выбора трёх лучших из очереди.
-                # v1.14.0: у ямы нет projected_30s_pct - берём её потенциал
-                # отскока к VWAP окна; у импульса - прогноз на 30 сек.
-                trigger_kind = str(micro.get("kind") or "micro_impulse")
-                # v1.17.3: быстрый трек сильных ям - вход без ожидания Groq.
-                fasttrack = self._scalp_fasttrack_decision(micro, be_cost, be_conf)
-                if fasttrack is not None:
-                    self._scalp_ai_queue.pop(ticker, None)
-                    decision = fasttrack
-                    log.info("%s: БЫСТРЫЙ ТРЕК ямы: %s - вхожу без ожидания "
-                             "Groq batch", ticker, decision.get("reason"))
+                fasttrack_decision = self._scalp_fasttrack_decision(
+                    micro, be_cost, be_stop)
+                if fasttrack_decision is not None:
+                    decision = fasttrack_decision
+                    fasttracked = True
+                    log.info("%s: FAST-TRACK BUY без Groq: %s; уверенность-эвристика %.0f%%, "
+                             "размер позиции ограничен x0.5",
+                             ticker, decision["reason"], decision["confidence"] * 100.0)
                 else:
+                    trigger_kind = str(micro.get("kind") or "micro_impulse")
                     projected = float(micro.get("projected_30s_pct")
                                       or micro.get("rebound_to_vwap_pct") or 0.0)
                     rank_score = 50.0 + max(-1.0, min(1.0, score)) * 20.0
                     rank_score += min(10.0, max(0.0, projected) * 100.0)
-                    # Качество именно локального дна влияет на приоритет в batch:
-                    # сильные свежие микроямы не теряются среди обычных импульсов.
                     rank_score += min(15.0, max(0.0, float(
                         micro.get("bottom_score", 0.0) or 0.0)) * 0.15)
                     self._scalp_ai_queue[ticker] = {
@@ -2166,7 +2039,7 @@ class TradingEngine:
                     log.info("%s: локальные фильтры пройдены (%s); кандидат добавлен в очередь Groq batch",
                              ticker, trigger_kind)
                     return
-            if decision is None:
+            if not fasttracked:
                 decision = await self._get_llm_decision(ticker, price, summary, score,
                                                         sentiment, history,
                                                         morning_ctx=morning_ctx)
@@ -2480,12 +2353,8 @@ class TradingEngine:
         budget *= size_mult
         lots = int(budget // lot_cost) if lot_cost > 0 else 0
         if lots < 1:
-            # v1.17.4: подсказка в логе - частая причина "сигнал был, а покупки
-            # нет" при маленьком балансе/риск-лимите.
-            log.info("%s: размер позиции по риск-лимиту меньше 1 лота "
-                     "(лимит %.2f ₽, лот %.2f ₽). Если такие отказы повторяются "
-                     "часто - поднимите SCALP_RISK_PER_TRADE_PCT в .env",
-                     ticker, budget, lot_cost)
+            log.info("%s: размер позиции по риск-лимиту меньше 1 лота (лимит %.2f ₽)",
+                     ticker, budget)
             return
 
         result = await self._client.buy(ticker, lots, price=price)

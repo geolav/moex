@@ -77,7 +77,7 @@ class StreamTypesTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(captured[1].subscribe_last_price_request)
             book_request = captured[0].subscribe_order_book_request
             self.assertEqual(book_request.instruments[0].instrument_id, "uid-test")
-            self.assertEqual(book_request.instruments[0].depth, 5)
+            self.assertEqual(book_request.instruments[0].depth, 1)
 
             quote = client.get_scalp_quote("TEST")
             self.assertIsNotNone(quote)

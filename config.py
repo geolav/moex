@@ -227,14 +227,6 @@ class BotConfig:
     scalp_max_spread_pct: float
     scalp_round_trip_cost_pct: float
     scalp_min_reward_cost_multiple: float
-    # v1.17.3: быстрый трек сильных ям - вход без ожидания Groq batch.
-    # v1.17.4: + быстрый трек свежих микро-импульсов (жизнь импульса ещё
-    # короче ямы, очередь Groq с интервалом 4 мин он не переживает).
-    scalp_fasttrack_enabled: bool
-    scalp_fasttrack_min_score: float
-    scalp_fasttrack_cost_multiple: float
-    scalp_fasttrack_impulse_enabled: bool
-    scalp_fasttrack_impulse_cost_multiple: float
     scalp_time_stop_min: int
     scalp_min_progress_r: float
     scalp_loss_pause_minutes: int
@@ -262,14 +254,14 @@ class BotConfig:
     scalp_dip_min_imbalance: float # bid/ask дисбаланс у дна ямы
     scalp_micro_dip_min_drop_pct: float # минимальная локальная просадка для многомасштабного детектора
     scalp_micro_dip_min_score: float # минимальный score микродна 0..100
-    # --- Деградация без стакана (v1.17.2) -------------------------------------
-    # У владельца last_price по стриму приходит, а стакан - нет: раньше из-за
-    # этого браковались ВСЕ локальные ямы ("стакан устарел"). Теперь стакан
-    # освежается по REST, а без него детектор работает по цене.
-    scalp_book_rest_refresh_sec: int  # как часто освежать стакан по REST, если стрим молчит
-    scalp_rest_book_max_age_sec: int  # сколько секунд REST-стакан считается пригодным
-    scalp_micro_price_only_fallback: bool  # микродно без стакана: решение по структуре цены
-    scalp_default_spread_pct: float   # консервативный спред, если ни стрима, ни REST, ни ISS
+    # v1.17.5-rebuild: быстрый вход сильных микро-сигналов без ожидания Groq.
+    scalp_fasttrack_enabled: bool
+    scalp_fasttrack_min_score: float
+    scalp_fasttrack_cost_multiple: float
+    scalp_fasttrack_impulse_enabled: bool
+    scalp_fasttrack_impulse_cost_multiple: float
+    scalp_micro_price_only: bool
+    scalp_default_spread_pct: float
     # --- Правила «недоверия после убытков» (v1.14.0) --------------------------
     # Пауза после 3 убытков подряд и повышенный порог после 2: по решению
     # владельца правило по умолчанию ВЫКЛЮЧЕНО (мешало скальпу повторно
@@ -436,8 +428,8 @@ def load_config() -> BotConfig:
                                            low=0.1, high=100.0),
         scalp_surge_from_pct=_env_float("SCALP_SURGE_FROM_PCT", 1.5,
                                         low=0.3, high=100.0),
-        scalp_max_entries_per_day=_env_int("SCALP_MAX_ENTRIES_PER_DAY", 40,
-                                           low=1, high=60),
+        scalp_max_entries_per_day=_env_int("SCALP_MAX_ENTRIES_PER_DAY", 100,
+                                           low=1, high=100),
         scalp_risk_per_trade_pct=_env_float("SCALP_RISK_PER_TRADE_PCT", 0.05,
                                             low=0.05, high=0.3),
         scalp_max_portfolio_risk_pct=_env_float(
@@ -456,28 +448,11 @@ def load_config() -> BotConfig:
                                         low=0.01, high=0.1),
         scalp_round_trip_cost_pct=_env_float("SCALP_ROUND_TRIP_COST_PCT", 0.1,
                                              low=0.0, high=1.0),
-        # v1.17.3: множитель применяется к ОЖИДАЕМОМУ движению триггера
-        # (потенциал отскока ямы / прогноз импульса) против полного круга
-        # издержек. Раньше сравнивался плановый стоп (0.6%) с 4x издержек -
-        # порог требовал ход >=0.667% и был невыполним, отменяя все
-        # скальп-входы. 1.10 = запас 10% поверх безубыточности.
+        # v1.17.5-rebuild: для микротриггера сравниваем ожидаемый отскок/
+        # импульс с полными круговыми издержками, а не стоп (который является
+        # мерой риска, а не наградой). Значение 1.10 означает запас 10%.
         scalp_min_reward_cost_multiple=_env_float("SCALP_MIN_REWARD_COST_MULTIPLE", 1.10,
                                                   low=1.0, high=10.0),
-        # v1.17.3: быстрый трек очень сильных ям (score >= 75): вход сразу,
-        # без ожидания Groq batch, который отвечает раз в 4 минуты и не
-        # успевал за микроямами. v1.17.4: порог экономики ямы 1.25x -> 1.10x
-        # издержек (тот же множитель, что в общем фильтре входа; при 1.25x
-        # живые кандидаты вроде PLZL 1.22x и VKCO 1.16x молча протухали в
-        # очереди Groq) и добавлен быстрый трек импульсов (строже: >= 1.25x).
-        scalp_fasttrack_enabled=_env_bool("SCALP_FASTTRACK_ENABLED", True),
-        scalp_fasttrack_min_score=_env_float("SCALP_FASTTRACK_MIN_SCORE", 75.0,
-                                             low=0.0, high=100.0),
-        scalp_fasttrack_cost_multiple=_env_float("SCALP_FASTTRACK_COST_MULTIPLE", 1.10,
-                                                 low=1.0, high=10.0),
-        scalp_fasttrack_impulse_enabled=_env_bool(
-            "SCALP_FASTTRACK_IMPULSE_ENABLED", True),
-        scalp_fasttrack_impulse_cost_multiple=_env_float(
-            "SCALP_FASTTRACK_IMPULSE_COST_MULTIPLE", 1.25, low=1.0, high=10.0),
         scalp_time_stop_min=_env_int("SCALP_TIME_STOP_MIN", 30, low=5, high=240),
         scalp_min_progress_r=_env_float("SCALP_MIN_PROGRESS_R", 0.3,
                                         low=0.0, high=2.0),
@@ -528,18 +503,17 @@ def load_config() -> BotConfig:
             "SCALP_MICRO_DIP_MIN_DROP_PCT", 0.02, low=0.005, high=0.20),
         scalp_micro_dip_min_score=_env_float(
             "SCALP_MICRO_DIP_MIN_SCORE", 48.0, low=30.0, high=90.0),
-        # v1.17.2: деградация без стакана. REST-обновление стакана раз в 30 сек
-        # ограничено 6 вызовами за проход; price-only разрешён по умолчанию,
-        # потому что в конфигурации владельца стакан по стриму не приходит
-        # вовсе, и жёсткая проверка браковала все микродна подряд.
-        scalp_book_rest_refresh_sec=_env_int(
-            "SCALP_BOOK_REST_REFRESH_SEC", 30, low=5, high=300),
-        scalp_rest_book_max_age_sec=_env_int(
-            "SCALP_REST_BOOK_MAX_AGE_SEC", 45, low=10, high=300),
-        scalp_micro_price_only_fallback=_env_bool(
-            "SCALP_MICRO_PRICE_ONLY", True),
-        scalp_default_spread_pct=_env_float(
-            "SCALP_DEFAULT_SPREAD_PCT", 0.05, low=0.0, high=0.5),
+        scalp_fasttrack_enabled=_env_bool("SCALP_FASTTRACK_ENABLED", True),
+        scalp_fasttrack_min_score=_env_float("SCALP_FASTTRACK_MIN_SCORE", 75.0,
+                                             low=50.0, high=100.0),
+        scalp_fasttrack_cost_multiple=_env_float("SCALP_FASTTRACK_COST_MULTIPLE", 1.10,
+                                                 low=1.0, high=3.0),
+        scalp_fasttrack_impulse_enabled=_env_bool("SCALP_FASTTRACK_IMPULSE_ENABLED", True),
+        scalp_fasttrack_impulse_cost_multiple=_env_float(
+            "SCALP_FASTTRACK_IMPULSE_COST_MULTIPLE", 1.25, low=1.0, high=5.0),
+        scalp_micro_price_only=_env_bool("SCALP_MICRO_PRICE_ONLY", True),
+        scalp_default_spread_pct=_env_float("SCALP_DEFAULT_SPREAD_PCT", 0.05,
+                                            low=0.01, high=0.10),
         # v1.14.0: правило «после убытков бумаге не доверяем» по умолчанию
         # выключено (просьба владельца; в скальпе оно не работало в любом
         # случае). MEMORY_LOSS_STREAK_GUARD=true возвращает прежнее поведение.

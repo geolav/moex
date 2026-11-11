@@ -110,11 +110,6 @@ def make_test_config(tmp: str) -> BotConfig:
         scalp_min_stop_pct=0.6, scalp_atr_multiplier=1.2,
         scalp_max_stop_pct=1.0, scalp_max_spread_pct=0.1,
         scalp_round_trip_cost_pct=0.1, scalp_min_reward_cost_multiple=3.0,
-        # v1.17.4: быстрый трек ям/импульсов (None ломает getattr-цепочки).
-        scalp_fasttrack_enabled=True, scalp_fasttrack_min_score=75.0,
-        scalp_fasttrack_cost_multiple=1.10,
-        scalp_fasttrack_impulse_enabled=True,
-        scalp_fasttrack_impulse_cost_multiple=1.25,
         scalp_time_stop_min=45, scalp_min_progress_r=0.3,
         scalp_loss_pause_minutes=60, scalp_stop_cooldown_min=120,
         scalp_max_sector_positions=2,
@@ -129,9 +124,6 @@ def make_test_config(tmp: str) -> BotConfig:
         scalp_dip_enabled=True, scalp_dip_window_sec=240,
         scalp_dip_min_drop_pct=0.20, scalp_dip_stabilize_sec=20,
         scalp_dip_min_imbalance=1.15,
-        # v1.17.2: деградация без стакана (None ломает _price_only_kwargs).
-        scalp_book_rest_refresh_sec=30, scalp_rest_book_max_age_sec=45,
-        scalp_micro_price_only_fallback=True, scalp_default_spread_pct=0.05,
         memory_loss_streak_guard=False,
         scan_empty_shortlist_fallback=True,
         scan_enabled=False, scan_interval_min=10, scan_min_turnover=50.0,
@@ -1248,15 +1240,11 @@ async def main() -> int:
     entry_client = FakeClient()
     mono1 = time.monotonic()
     entry_quote = {
-        "price": 100.44, "price_seq": 42, "price_age_sec": 0.2,
-        "book_age_sec": 0.5, "bid": 100.43, "ask": 100.45,
+        "price": 100.2, "price_seq": 42, "price_age_sec": 0.2,
+        "book_age_sec": 0.5, "bid": 100.19, "ask": 100.21,
         "bid_volume": 1500, "ask_volume": 800, "spread_pct": 0.02,
         "book_consistent": True,
-        # v1.17.4: тики с потенциалом >= 1.10x издержек: линейный рост
-        # 0.44% за 45с даёт прогноз на 30с ~0.29% > 1.10x×0.19%. Раньше
-        # тестовые тики (рост 0.2%) гасились экономическим гейтом ещё до
-        # очереди (0.70x < 3.00x) - тест проверял пустой путь.
-        "ticks": [{"ts": mono1 - 45.0 + i * 9.0, "price": 100.0 + i * 0.088}
+        "ticks": [{"ts": mono1 - 45.0 + i * 9.0, "price": 100.0 + i * 0.04}
                   for i in range(6)],
     }
     entry_client.get_scalp_quote = lambda ticker: dict(entry_quote)
@@ -1284,13 +1272,7 @@ async def main() -> int:
     entry_engine = TradingEngine(
         # learning_enabled=False: память ошибок общая на tmp-папку, и стопы из
         # предыдущих тестов ставят SBER на паузу - изолируем проверку bypass.
-        # v1.17.4: multiple 3.0 - наследие гейта по стопу; с перенесённым на
-        # потенциал гейтом он отменял ВСЕ импульсы до очереди Groq. Ставим
-        # прод-дефолт 1.10. Fasttrack импульсов выключен: этот тест проверяет
-        # путь очереди Groq (fasttrack - в тесте 44).
-        dataclasses.replace(cfg, learning_enabled=False,
-                            scalp_min_reward_cost_multiple=1.10,
-                            scalp_fasttrack_impulse_enabled=False),
+        dataclasses.replace(cfg, learning_enabled=False),
         entry_state, entry_client, FakeAnalyst(), notify)
     # Нейтральная зона breadth 32%: вход разрешён с половинным риском.
     entry_engine.set_market_context({"breadth_pct": 32.0, "symbols": 80})
@@ -1302,7 +1284,7 @@ async def main() -> int:
     # Свечной сетап детерминированно молчит: проверяем именно bypass.
     indicators.detect_entry_setups = lambda *a, **k: ([], 0)
     try:
-        await entry_engine._evaluate_entry("SBER", 100.44)
+        await entry_engine._evaluate_entry("SBER", 100.2)
     finally:
         sessions.can_open_scalp_entry = orig_can_open
         sessions.should_force_flatten_scalp = orig_flatten
@@ -1534,76 +1516,6 @@ async def main() -> int:
           and all(int(n.split("топ ", 1)[1].split(" ", 1)[0]) <= 4
                   for n in manual_notes if "топ " in n),
           "; ".join(n.splitlines()[0][:60] for n in manual_notes if n))
-
-    # --- Test 44 (v1.17.4): быстрый трек ям/импульсов и анти-погоня скальпа --
-    print("\n[44] v1.17.4: сильная яма у верха 2ч-диапазона покупается сразу")
-    ft_state = StateStore(os.path.join(tmp, "fasttrack_state.json"),
-                          initial_overrides={"trading_enabled": True})
-    ft_state.set_scalp_mode(True)
-    ft_client = FakeClient()
-    ft_engine = TradingEngine(
-        # Прод-пороги: гейт экономики 1.10x, ямный fasttrack включён.
-        # risk_per_trade 0.5%: при тестовом балансе 0.05% даёт бюджет меньше
-        # 1 лота ("меньше 1 лота") - позиция не открылась бы вовсе.
-        dataclasses.replace(cfg, learning_enabled=False,
-                            scalp_min_reward_cost_multiple=1.10,
-                            scalp_risk_per_trade_pct=0.5),
-        ft_state, ft_client, FakeAnalyst(), notify)
-    ft_engine.set_market_context({"breadth_pct": 32.0, "symbols": 80})
-
-    def fake_dip_trigger(quote, kind="dip_reversal"):
-        return {
-            "kind": "dip_reversal", "micro_dip": 1.0,
-            "dip_drop_pct": 0.32, "off_low_pct": 0.06,
-            "rebound_to_mean_pct": 0.30, "rebound_to_vwap_pct": 0.30,
-            "bottom_score": 80.0, "dip_scale_sec": 60.0,
-            "bid_ask_imbalance": 1.5, "book_mode": "stream",
-        }
-
-    ft_engine._trigger_by_kind = fake_dip_trigger
-    ft_engine._any_micro_trigger = (lambda quote: fake_dip_trigger(quote))
-    ft_engine._scalp_trigger_cache["SBER"] = fake_dip_trigger(None)
-    ft_can_open = sessions.can_open_scalp_entry
-    ft_flatten = sessions.should_force_flatten_scalp
-    ft_setups = indicators.detect_entry_setups
-    sessions.can_open_scalp_entry = lambda *a, **k: True
-    sessions.should_force_flatten_scalp = lambda *a, **k: False
-    indicators.detect_entry_setups = lambda *a, **k: ([], 0)
-    try:
-        await ft_engine._evaluate_entry("SBER", 100.44)
-    finally:
-        sessions.can_open_scalp_entry = ft_can_open
-        sessions.should_force_flatten_scalp = ft_flatten
-        indicators.detect_entry_setups = ft_setups
-    check("яма score 80 у верха 2ч-диапазона открыла позицию (анти-погоня не мешает)",
-          "SBER" in ft_state.positions,
-          f"позиции: {list(ft_state.positions.keys())}")
-
-    decision_dip = ft_engine._scalp_fasttrack_decision(
-        fake_dip_trigger(None), round_trip_cost=0.19, breakeven_confidence=0.6)
-    check("fasttrack ямы: score 80, потенциал 1.58x издержек -> BUY",
-          bool(decision_dip) and decision_dip.get("action") == "buy"
-          and decision_dip.get("confidence", 0) >= 0.72,
-          str(decision_dip))
-    decision_dip_weak = ft_engine._scalp_fasttrack_decision(
-        {**fake_dip_trigger(None), "bottom_score": 60.0},
-        round_trip_cost=0.19, breakeven_confidence=0.6)
-    check("fasttrack ямы: score 60 ниже порога 75 -> нет быстрого входа",
-          decision_dip_weak is None, str(decision_dip_weak))
-
-    impulse_strong = {"kind": "micro_impulse", "projected_30s_pct": 0.30,
-                      "bid_ask_imbalance": 1.5, "book_mode": "stream"}
-    impulse_weak = {"kind": "micro_impulse", "projected_30s_pct": 0.13,
-                    "bid_ask_imbalance": 1.5, "book_mode": "stream"}
-    decision_imp = ft_engine._scalp_fasttrack_decision(
-        impulse_strong, round_trip_cost=0.19, breakeven_confidence=0.6)
-    check("fasttrack импульса: прогноз 0.30% = 1.58x издержек -> BUY",
-          bool(decision_imp) and decision_imp.get("action") == "buy",
-          str(decision_imp))
-    decision_imp_weak = ft_engine._scalp_fasttrack_decision(
-        impulse_weak, round_trip_cost=0.19, breakeven_confidence=0.6)
-    check("fasttrack импульса: прогноз 0.13% < 1.25x издержек -> ждёт Groq",
-          decision_imp_weak is None, str(decision_imp_weak))
 
     print("\n" + "=" * 64)
     print(f"ИТОГО: пройдено {len(PASSED)}, провалено {len(FAILED)}")

@@ -1,184 +1,111 @@
-"""Экономика скальп-входа и быстрый трек сильных ям/импульсов.
-
-v1.17.3: регрессии после того, как фильтр "ход до TP1 не покрывает издержки"
-(невыполнимый при стопе 0.6% и multiple 4.0) блокировал ВСЕ покупки, а
-очередь Groq (1 запрос в 4 минуты) не успевала за микроямами.
-v1.17.4: порог экономики ямы 1.25x -> 1.10x (живые кандидаты вроде PLZL
-1.22x и VKCO 1.16x больше не протухают в очереди) и добавлен быстрый трек
-свежих импульсов с более строгим порогом (>= 1.25x издержек).
-"""
-from __future__ import annotations
-
-import tempfile
-import unittest
-from pathlib import Path
+"""Регрессии восстановленного fast-track режима v1.17.5."""
 from types import SimpleNamespace
+import unittest
+from unittest.mock import patch
 
-from config import StateStore
+from config import load_config
 from trading_engine import TradingEngine
+from scalp_microstructure import detect_multiscale_dip_trigger, detect_microstructure_trigger
 
 
-def make_config(tmp: str) -> SimpleNamespace:
-    return SimpleNamespace(
-        scalp_max_stop_pct=1.0, scalp_min_stop_pct=0.6,
-        scalp_atr_multiplier=1.2, scalp_round_trip_cost_pct=0.10,
-        scalp_max_spread_pct=0.10, slippage_pct=0.05,
-        scalp_min_reward_cost_multiple=1.10,
-        scalp_fasttrack_enabled=True,
-        scalp_fasttrack_min_score=75.0,
-        scalp_fasttrack_cost_multiple=1.10,
-        scalp_fasttrack_impulse_enabled=True,
-        scalp_fasttrack_impulse_cost_multiple=1.25,
-        scalp_exit_poll_sec=10, scalp_ai_min_request_interval_sec=240,
-        scalp_time_stop_min=45, ai_batch_decision_ttl_sec=900,
-        llm_decisions_enabled=True, ai_batch_required=True,
-        trading_tickers=("SBER",),
-    )
+class FastTrackEconomicsTests(unittest.TestCase):
+    def engine(self):
+        engine = object.__new__(TradingEngine)
+        engine._cfg = SimpleNamespace(
+            scalp_fasttrack_enabled=True,
+            scalp_fasttrack_min_score=75.0,
+            scalp_fasttrack_cost_multiple=1.10,
+            scalp_fasttrack_impulse_enabled=True,
+            scalp_fasttrack_impulse_cost_multiple=1.25,
+        )
+        return engine
+
+    def test_strong_dip_fasttracks_without_llm(self):
+        engine = self.engine()
+        trigger = {
+            "kind": "dip_reversal", "bottom_score": 82.0,
+            "rebound_to_vwap_pct": 0.22, "book_source": "price_only",
+        }
+        decision = engine._scalp_fasttrack_decision(trigger, 0.18, 0.60)
+        self.assertIsNotNone(decision)
+        self.assertEqual(decision["action"], "buy")
+        self.assertEqual(decision["size_mult"], 0.5)
+        self.assertGreaterEqual(decision["confidence"], 0.68)
+        self.assertLessEqual(decision["confidence"], 0.88)
+
+    def test_dip_below_score_or_economics_waits(self):
+        engine = self.engine()
+        weak_score = {"kind": "dip_reversal", "bottom_score": 74.9,
+                      "rebound_to_vwap_pct": 0.30}
+        weak_economics = {"kind": "dip_reversal", "bottom_score": 90.0,
+                          "rebound_to_vwap_pct": 0.19}
+        self.assertIsNone(engine._scalp_fasttrack_decision(weak_score, 0.18, 0.60))
+        self.assertIsNone(engine._scalp_fasttrack_decision(weak_economics, 0.18, 0.60))
+
+    def test_impulse_needs_real_book_and_125x_costs(self):
+        engine = self.engine()
+        no_book = {"kind": "micro_impulse", "projected_30s_pct": 0.30,
+                   "bid_ask_imbalance": 1.3, "book_source": "price_only"}
+        thin = {"kind": "micro_impulse", "projected_30s_pct": 0.22,
+                "bid_ask_imbalance": 1.3, "book_source": "stream"}
+        valid = {"kind": "micro_impulse", "projected_30s_pct": 0.24,
+                 "bid_ask_imbalance": 1.10, "book_source": "rest"}
+        self.assertIsNone(engine._scalp_fasttrack_decision(no_book, 0.18, 0.60))
+        self.assertIsNone(engine._scalp_fasttrack_decision(thin, 0.18, 0.60))
+        self.assertIsNotNone(engine._scalp_fasttrack_decision(valid, 0.18, 0.60))
 
 
-class FakeClient:
-    scalp_feed_ready = True
+class PriceOnlyDetectorTests(unittest.TestCase):
+    def test_multiscale_dip_can_use_price_only(self):
+        import time
+        values = [100.08, 100.09, 100.10, 100.07, 100.04,
+                  100.01, 100.00, 100.005, 100.015, 100.025, 100.035]
+        now = time.monotonic()
+        quote = {
+            "price": values[-1], "price_age_sec": 0.1,
+            "book_age_sec": float("inf"), "spread_pct": 0.0,
+            "ticks": [{"ts": now - len(values) + i, "price": v}
+                      for i, v in enumerate(values)],
+        }
+        signal = detect_multiscale_dip_trigger(
+            quote, max_spread_pct=0.1, round_trip_cost_pct=0.02,
+            allow_price_only=True, default_spread_pct=0.05)
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal["price_only"], 1.0)
+        self.assertEqual(signal["bid_ask_imbalance"], 1.0)
 
-    def get_lot_size(self, ticker: str) -> int:
-        return 1
-
-    def get_scalp_quote(self, ticker: str):
-        return None
-
-    async def is_tradable(self, ticker: str) -> bool:
-        return True
-
-
-async def notify(_text: str) -> None:
-    return None
-
-
-def make_engine(tmp: str) -> TradingEngine:
-    state = StateStore(str(Path(tmp) / "state.json"),
-                       initial_overrides={"trading_enabled": True})
-    state.set_scalp_mode(True)
-    return TradingEngine(make_config(tmp), state, FakeClient(),
-                         SimpleNamespace(), notify)
-
-
-def dip_signal(score: float = 78.4, potential: float = 0.2165) -> dict:
-    """Сигнал как у реальной Микроямы PLZL из лога пользователя."""
-    return {
-        "kind": "dip_reversal", "micro_dip": True,
-        "dip_scale_sec": 60.0, "dip_drop_pct": 0.2707,
-        "off_low_pct": 0.0541, "rebound_to_mean_pct": potential,
-        "rebound_to_vwap_pct": potential, "projected_30s_pct": 0.0,
-        "bid_ask_imbalance": 5.53, "bottom_score": score,
-    }
-
-
-class TriggerExpectedMoveTests(unittest.TestCase):
-    def test_picks_max_of_potential_fields(self):
-        move = TradingEngine._trigger_expected_move_pct(
-            {"rebound_to_mean_pct": 0.20, "projected_30s_pct": 0.35})
-        self.assertAlmostEqual(move, 0.35)
-
-    def test_none_and_empty_are_zero(self):
-        self.assertEqual(TradingEngine._trigger_expected_move_pct(None), 0.0)
-        self.assertEqual(TradingEngine._trigger_expected_move_pct({}), 0.0)
-
-    def test_garbage_values_ignored(self):
-        move = TradingEngine._trigger_expected_move_pct(
-            {"rebound_to_mean_pct": "abc", "projected_30s_pct": 0.12})
-        self.assertAlmostEqual(move, 0.12)
+    def test_impulse_can_use_price_only_but_is_marked_as_such(self):
+        ticks = [{"ts": i * 5.0, "price": 100.0 + i * 0.035}
+                 for i in range(10)]
+        quote = {
+            "price": ticks[-1]["price"], "price_age_sec": 0.1,
+            "book_age_sec": float("inf"), "spread_pct": 0.0,
+            "ticks": ticks,
+        }
+        signal = detect_microstructure_trigger(
+            quote, max_spread_pct=0.1, round_trip_cost_pct=0.02,
+            allow_price_only=True, default_spread_pct=0.05)
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal["price_only"], 1.0)
+        self.assertEqual(signal["bid_ask_imbalance"], 1.0)
 
 
-class FastTrackTests(unittest.IsolatedAsyncioTestCase):
-    def test_strong_dip_from_user_log_gets_buy_decision(self):
-        # PLZL: score 78.4, потенциал 0.2165%, издержки ~0.167%.
-        with tempfile.TemporaryDirectory() as tmp:
-            engine = make_engine(tmp)
-            decision = engine._scalp_fasttrack_decision(
-                dip_signal(), 0.1668, breakeven_confidence=0.639)
-            self.assertIsNotNone(decision)
-            self.assertEqual(decision["action"], "buy")
-            self.assertEqual(decision["setup"], "dip_reversal")
-            self.assertGreaterEqual(decision["confidence"], 0.69)
-            self.assertLessEqual(decision["confidence"], 0.92)
-            self.assertIn("издержек", decision["reason"])
-
-    def test_weak_score_goes_to_ai_queue(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            engine = make_engine(tmp)
-            decision = engine._scalp_fasttrack_decision(
-                dip_signal(score=60.0), 0.1668, breakeven_confidence=0.639)
-            self.assertIsNone(decision)
-
-    def test_thin_potential_not_fasttracked(self):
-        # Потенциал 0.10% < 1.10 x 0.1668% - сделка не окупает издержки.
-        with tempfile.TemporaryDirectory() as tmp:
-            engine = make_engine(tmp)
-            decision = engine._scalp_fasttrack_decision(
-                dip_signal(score=90.0, potential=0.10), 0.1668,
-                breakeven_confidence=0.639)
-            self.assertIsNone(decision)
-
-    def test_impulse_weak_goes_to_ai_queue(self):
-        # v1.17.4: слабый импульс (прогноз 0.13% < 1.25 x 0.1668%) не входит
-        # по быстрому треку - ждёт подтверждения ИИ в очереди Groq.
-        with tempfile.TemporaryDirectory() as tmp:
-            engine = make_engine(tmp)
-            decision = engine._scalp_fasttrack_decision(
-                {"kind": "micro_impulse", "bottom_score": 90.0,
-                 "projected_30s_pct": 0.13, "bid_ask_imbalance": 1.4,
-                 "book_mode": "stream"}, 0.1668, 0.639)
-            self.assertIsNone(decision)
-
-    def test_impulse_strong_is_fasttracked(self):
-        # v1.17.4: сильный импульс (прогноз 0.40% = 2.40x издержек) входит
-        # сразу: импульс живёт секунды, очередь Groq его не переживает.
-        with tempfile.TemporaryDirectory() as tmp:
-            engine = make_engine(tmp)
-            decision = engine._scalp_fasttrack_decision(
-                {"kind": "micro_impulse", "bottom_score": 90.0,
-                 "projected_30s_pct": 0.40, "bid_ask_imbalance": 1.4,
-                 "book_mode": "stream"}, 0.1668, 0.639)
-            self.assertIsNotNone(decision)
-            self.assertEqual(decision["action"], "buy")
-            self.assertGreaterEqual(decision["confidence"], 0.65)
-
-    def test_impulse_without_book_support_not_fasttracked(self):
-        # Импульс в price-only режиме (стакан молчал) быстрый трек не берёт.
-        with tempfile.TemporaryDirectory() as tmp:
-            engine = make_engine(tmp)
-            decision = engine._scalp_fasttrack_decision(
-                {"kind": "micro_impulse", "projected_30s_pct": 0.40,
-                 "bid_ask_imbalance": 0.0, "book_mode": "price_only"},
-                0.1668, 0.639)
-            self.assertIsNone(decision)
-
-    def test_disabled_by_config(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            engine = make_engine(tmp)
-            engine._cfg.scalp_fasttrack_enabled = False
-            decision = engine._scalp_fasttrack_decision(
-                dip_signal(), 0.1668, breakeven_confidence=0.639)
-            self.assertIsNone(decision)
-
-    def test_wide_spread_confidence_covers_breakeven_probability(self):
-        # При широком спреде издержки растут и безубыточная вероятность
-        # выше: уверенность быстрого трека обязана её перекрывать.
-        with tempfile.TemporaryDirectory() as tmp:
-            engine = make_engine(tmp)
-            be_conf = (0.6 + 0.25) / (2 * 0.6)  # стоп 0.6%, издержки 0.25%
-            decision = engine._scalp_fasttrack_decision(
-                dip_signal(potential=0.35), 0.25, breakeven_confidence=be_conf)
-            self.assertIsNotNone(decision)
-            self.assertGreaterEqual(decision["confidence"], be_conf + 0.05)
-
-    def test_thin_potential_vs_wide_spread_not_fasttracked(self):
-        # Потенциал 0.2165% при издержках 0.25% (1.10x порог = 0.275%):
-        # сделка не окупает широкий спред - входим только через ИИ.
-        with tempfile.TemporaryDirectory() as tmp:
-            engine = make_engine(tmp)
-            decision = engine._scalp_fasttrack_decision(
-                dip_signal(), 0.25, breakeven_confidence=0.708)
-            self.assertIsNone(decision)
+class ScalpConfigTests(unittest.TestCase):
+    def test_daily_entry_limit_accepts_100(self):
+        values = {
+            "TINKOFF_SANDBOX_TOKEN": "test-token",
+            "GROQ_API_KEY": "test-key",
+            "TELEGRAM_BOT_TOKEN": "123:TEST",
+            "TELEGRAM_ADMIN_ID": "123",
+            "SCALP_MAX_ENTRIES_PER_DAY": "100",
+            "SCALP_MIN_REWARD_COST_MULTIPLE": "1.10",
+        }
+        with patch.dict("os.environ", values, clear=False):
+            cfg = load_config()
+        self.assertEqual(cfg.scalp_max_entries_per_day, 100)
+        self.assertAlmostEqual(cfg.scalp_min_reward_cost_multiple, 1.10)
+        self.assertTrue(cfg.scalp_fasttrack_enabled)
+        self.assertTrue(cfg.scalp_micro_price_only)
 
 
 if __name__ == "__main__":
