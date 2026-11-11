@@ -27,11 +27,62 @@ v1.14.0: добавлен второй детектор - разворот по�
 Средняя цена окна не называется VWAP: у потока нет объёма для каждого тика.
 Свежесть цены/стакана, согласованность стакана и лимит спреда - те же
 fail-closed проверки, что и у импульсного детектора.
+
+v1.17.2: у владельца last_price по стриму приходит, а стакан - нет
+(book_age=inf), из-за чего жёсткая проверка стакана браковала ВСЕ
+локальные ямы подряд (в логе: "сигнал не подтверждён: стакан устарел").
+Теперь стакан - улика, а не шлагбаум:
+  - если стримовый/REST-стакан свежий - работают все проверки стакана
+    (дисбаланс, спред по стакану, согласованность);
+  - если стакана нет, но разрешён price-only фолбэк
+    (SCALP_MICRO_PRICE_ONLY), детектор работает по цене: структура
+    падения/разворота, uptick-поток и потенциальный отскок проверяются
+    как раньше, дисбаланс считается нейтральным (book_score = 0),
+    спред берётся из фолбэка (REST-стакан, ISS или консервативная
+    оценка SCALP_DEFAULT_SPREAD_PCT);
+  - свежесть САМОЙ ЦЕНЫ осталась жёсткой (fail-closed): нет свежих
+    тиков - сигнала по-прежнему нет.
 """
 from __future__ import annotations
 
 from typing import Any, Dict, Optional
 import math
+
+
+def _book_mode(
+    quote: Dict[str, Any],
+    *,
+    max_book_age_sec: float,
+    rest_book_max_age_sec: float,
+    max_spread_pct: float,
+) -> str:
+    """Классификация стакана: "stream" / "rest" / "none".
+
+    "stream" - стакан прямо из подписки, лимит свежести max_book_age_sec;
+    "rest"   - стакан восстановлен по REST GetOrderBook, лимит мягче
+               (rest_book_max_age_sec), потому что обновляется реже;
+    "none"   - стакана нет или он некорректен (bid/ask/объёмы/спред).
+    """
+    source = str(quote.get("book_source") or "stream")
+    book_age = float(quote.get("book_age_sec", math.inf))
+    limit = (float(rest_book_max_age_sec) if source == "rest"
+             else float(max_book_age_sec))
+    limit = max(limit, float(max_book_age_sec))
+    try:
+        bid = float(quote.get("bid") or 0.0)
+        ask = float(quote.get("ask") or 0.0)
+        bid_size = float(quote.get("bid_volume") or 0.0)
+        ask_size = float(quote.get("ask_volume") or 0.0)
+        spread_pct = float(quote.get("spread_pct") or 0.0)
+    except (TypeError, ValueError):
+        return "none"
+    if book_age > limit:
+        return "none"
+    if (bid <= 0 or ask <= bid or bid_size <= 0 or ask_size <= 0
+            or not bool(quote.get("book_consistent", True))
+            or spread_pct <= 0 or spread_pct > max_spread_pct):
+        return "none"
+    return "rest" if source == "rest" else "stream"
 
 
 def detect_microstructure_trigger(
@@ -51,6 +102,9 @@ def detect_microstructure_trigger(
     min_ret45_pct: float = 0.010,
     max_ret15_pct: float = 0.30,
     projected_cost_multiple: float = 0.60,
+    allow_price_only: bool = False,
+    spread_fallback_pct: float = 0.0,
+    rest_book_max_age_sec: float = 45.0,
 ) -> Optional[Dict[str, float]]:
     """Возвращает короткий сигнал вверх либо None (fail-closed).
 
@@ -63,7 +117,6 @@ def detect_microstructure_trigger(
     try:
         price = float(quote.get("price") or 0.0)
         price_age = float(quote.get("price_age_sec", math.inf))
-        book_age = float(quote.get("book_age_sec", math.inf))
         bid = float(quote.get("bid") or 0.0)
         ask = float(quote.get("ask") or 0.0)
         bid_size = float(quote.get("bid_volume") or 0.0)
@@ -73,11 +126,31 @@ def detect_microstructure_trigger(
     except (TypeError, ValueError):
         return None
 
-    if (price <= 0 or bid <= 0 or ask <= bid or bid_size <= 0 or ask_size <= 0
-            or price_age > max_price_age_sec or book_age > max_book_age_sec
-            or not quote.get("book_consistent", True)
-            or spread_pct <= 0 or spread_pct > max_spread_pct):
+    if price <= 0 or price_age > max_price_age_sec:
         return None
+    if spread_pct <= 0:
+        spread_pct = float(spread_fallback_pct or 0.0)
+    if spread_pct <= 0 or spread_pct > max_spread_pct:
+        return None
+    book_mode = _book_mode(
+        quote,
+        max_book_age_sec=max_book_age_sec,
+        rest_book_max_age_sec=rest_book_max_age_sec,
+        max_spread_pct=max_spread_pct,
+    )
+    if book_mode == "none":
+        if not allow_price_only:
+            return None
+        # v1.17.2: стакана нет - работаем по цене, дисбаланс нейтрален.
+        bid = ask = bid_size = ask_size = 0.0
+        imbalance = 1.0
+        book_mode = "price_only"
+    else:
+        if bid <= 0 or ask <= bid or bid_size <= 0 or ask_size <= 0:
+            return None
+        if not quote.get("book_consistent", True):
+            return None
+        imbalance = bid_size / ask_size if ask_size > 0 else 0.0
 
     latest_ts = max((float(item.get("ts", 0) or 0) for item in ticks
                      if isinstance(item, dict)), default=0.0)
@@ -118,7 +191,6 @@ def detect_microstructure_trigger(
         return None
     slope = sum((x - x_mean) * (y - y_mean) for x, y in zip(xs, ys)) / denom
     projected_30_pct = (slope * 30.0 / price) * 100.0
-    imbalance = bid_size / ask_size
 
     # Не покупаем после уже состоявшегося резкого рывка: он часто означает
     # погоню за ценой, особенно при широком спреде. Дальнейшую защиту от
@@ -130,7 +202,7 @@ def detect_microstructure_trigger(
     if slope <= 0 or projected_30_pct <= max(0.02, round_trip_cost_pct
                                              * projected_cost_multiple):
         return None
-    if imbalance < min_imbalance:
+    if book_mode in ("stream", "rest") and imbalance < min_imbalance:
         return None
 
     return {
@@ -141,7 +213,8 @@ def detect_microstructure_trigger(
         "projected_30s_pct": round(projected_30_pct, 5),
         "spread_pct": round(spread_pct, 5),
         "price_age_sec": round(price_age, 3),
-        "book_age_sec": round(book_age, 3),
+        "book_age_sec": round(float(quote.get("book_age_sec", math.inf)), 3),
+        "book_mode": book_mode,
     }
 
 
@@ -159,6 +232,9 @@ def detect_dip_reversal_trigger(
     rebound_cost_multiple: float = 0.70,
     max_price_age_sec: float = 3.0,
     max_book_age_sec: float = 5.0,
+    allow_price_only: bool = False,
+    spread_fallback_pct: float = 0.0,
+    rest_book_max_age_sec: float = 45.0,
 ) -> Optional[Dict[str, float]]:
     """Сигнал «локальная яма»: свежий провал остановился, продают меньше,
     покупают больше - ждём отскок вверх (v1.14.0).
@@ -176,7 +252,6 @@ def detect_dip_reversal_trigger(
     try:
         price = float(quote.get("price") or 0.0)
         price_age = float(quote.get("price_age_sec", math.inf))
-        book_age = float(quote.get("book_age_sec", math.inf))
         bid = float(quote.get("bid") or 0.0)
         ask = float(quote.get("ask") or 0.0)
         bid_size = float(quote.get("bid_volume") or 0.0)
@@ -186,11 +261,31 @@ def detect_dip_reversal_trigger(
     except (TypeError, ValueError):
         return None
 
-    if (price <= 0 or bid <= 0 or ask <= bid or bid_size <= 0 or ask_size <= 0
-            or price_age > max_price_age_sec or book_age > max_book_age_sec
-            or not quote.get("book_consistent", True)
-            or spread_pct <= 0 or spread_pct > max_spread_pct):
+    if price <= 0 or price_age > max_price_age_sec:
         return None
+    if spread_pct <= 0:
+        spread_pct = float(spread_fallback_pct or 0.0)
+    if spread_pct <= 0 or spread_pct > max_spread_pct:
+        return None
+    book_mode = _book_mode(
+        quote,
+        max_book_age_sec=max_book_age_sec,
+        rest_book_max_age_sec=rest_book_max_age_sec,
+        max_spread_pct=max_spread_pct,
+    )
+    if book_mode == "none":
+        if not allow_price_only:
+            return None
+        # v1.17.2: стакана нет - работаем по цене, дисбаланс нейтрален.
+        bid = ask = bid_size = ask_size = 0.0
+        imbalance = 1.0
+        book_mode = "price_only"
+    else:
+        if bid <= 0 or ask <= bid or bid_size <= 0 or ask_size <= 0:
+            return None
+        if not quote.get("book_consistent", True):
+            return None
+        imbalance = bid_size / ask_size if ask_size > 0 else 0.0
 
     latest_ts = max((float(item.get("ts", 0) or 0) for item in ticks
                      if isinstance(item, dict)), default=0.0)
@@ -254,9 +349,9 @@ def detect_dip_reversal_trigger(
     if rebounded_pct > 0.5 * drop_pct:
         return None
 
-    # Покупатели у дна: bid перевешивает ask в стакане.
-    imbalance = bid_size / ask_size
-    if imbalance < dip_min_imbalance:
+    # Покупатели у дна: bid перевешивает ask в стакане. В price-only режиме
+    # стакан недоступен - проверка нейтрализуется (решение по структуре цены).
+    if book_mode in ("stream", "rest") and imbalance < dip_min_imbalance:
         return None
 
     # Прогнозируемый отскок к среднему уровню последних цен. Это обычное
@@ -273,7 +368,8 @@ def detect_dip_reversal_trigger(
     depth_score = min(25.0, 25.0 * drop_pct / max(2.0 * dip_min_drop_pct, 1e-9))
     stability_score = 25.0 if higher_low_confirmed else 0.0
     tail_score = min(20.0, max(0.0, ret_tail) / 0.08 * 20.0) * min(1.0, tail_up_ratio / 0.75)
-    book_score = min(15.0, max(0.0, (imbalance - 1.0) / 0.5) * 15.0)
+    book_score = (0.0 if book_mode == "none"
+                  else min(15.0, max(0.0, (imbalance - 1.0) / 0.5) * 15.0))
     potential_score = min(15.0, max(0.0, rebound_potential_pct) / max(2.0 * min_rebound, 0.05) * 15.0)
     bottom_score = max(0.0, min(100.0, depth_score + stability_score + tail_score
                                  + book_score + potential_score))
@@ -292,7 +388,8 @@ def detect_dip_reversal_trigger(
         "min_rebound_pct": round(min_rebound, 5),
         "spread_pct": round(spread_pct, 5),
         "price_age_sec": round(price_age, 3),
-        "book_age_sec": round(book_age, 3),
+        "book_age_sec": round(float(quote.get("book_age_sec", math.inf)), 3),
+        "book_mode": book_mode,
     }
 
 
@@ -307,6 +404,9 @@ def detect_multiscale_dip_trigger(
     max_price_age_sec: float = 3.0,
     max_book_age_sec: float = 5.0,
     diagnostics: Optional[Dict[str, Any]] = None,
+    allow_price_only: bool = False,
+    spread_fallback_pct: float = 0.0,
+    rest_book_max_age_sec: float = 45.0,
 ) -> Optional[Dict[str, float]]:
     """Многомасштабный поиск локального микродна (12/20/35/60/120/240 сек).
 
@@ -322,7 +422,6 @@ def detect_multiscale_dip_trigger(
     try:
         price = float(quote.get("price") or 0.0)
         price_age = float(quote.get("price_age_sec", math.inf))
-        book_age = float(quote.get("book_age_sec", math.inf))
         bid = float(quote.get("bid") or 0.0)
         ask = float(quote.get("ask") or 0.0)
         bid_size = float(quote.get("bid_volume") or 0.0)
@@ -340,19 +439,45 @@ def detect_multiscale_dip_trigger(
         report("последняя цена устарела", price_age_sec=price_age,
                ticks=len(raw_ticks))
         return None
-    if book_age > max_book_age_sec:
-        report("стакан устарел", book_age_sec=book_age, ticks=len(raw_ticks))
-        return None
-    if bid <= 0 or ask <= bid or bid_size <= 0 or ask_size <= 0:
-        report("нет корректного двустороннего стакана", ticks=len(raw_ticks))
-        return None
-    if not quote.get("book_consistent", True):
-        report("стакан не согласован", ticks=len(raw_ticks))
-        return None
+    # v1.17.2: спред сначала из котировки (стрим/REST-стакан), затем фолбэк
+    # (ISS-снимок или консервативная оценка из конфига). Спред = 0 больше
+    # не бракует сигнал автоматически, если есть оценка фолбэка.
+    if spread_pct <= 0:
+        spread_pct = float(spread_fallback_pct or 0.0)
     if spread_pct <= 0 or spread_pct > max_spread_pct:
         report(f"спред {spread_pct:.4f}% вне лимита {max_spread_pct:.4f}%",
                ticks=len(raw_ticks))
         return None
+    # v1.17.2: стакан - улика, а не шлагбаум. Свежий стакан (стрим или REST)
+    # включаёт проверки дисбаланса; без стакана детектор работает по цене,
+    # если разрешён price-only фолбэк (SCALP_MICRO_PRICE_ONLY).
+    book_mode = _book_mode(
+        quote,
+        max_book_age_sec=max_book_age_sec,
+        rest_book_max_age_sec=rest_book_max_age_sec,
+        max_spread_pct=max_spread_pct,
+    )
+    if book_mode == "none":
+        if not allow_price_only:
+            report("стакан устарел", book_age_sec=float(
+                quote.get("book_age_sec", math.inf)), ticks=len(raw_ticks))
+            return None
+        book_mode = "price_only"
+        imbalance = 1.0
+    elif bid <= 0 or ask <= bid or bid_size <= 0 or ask_size <= 0:
+        if not allow_price_only:
+            report("нет корректного двустороннего стакана", ticks=len(raw_ticks))
+            return None
+        book_mode = "price_only"
+        imbalance = 1.0
+    elif not quote.get("book_consistent", True):
+        if not allow_price_only:
+            report("стакан не согласован", ticks=len(raw_ticks))
+            return None
+        book_mode = "price_only"
+        imbalance = 1.0
+    else:
+        imbalance = bid_size / max(ask_size, 1e-12)
 
     parsed = []
     for item in raw_ticks:
@@ -380,8 +505,9 @@ def detect_multiscale_dip_trigger(
     noise_pct = sorted(moves)[len(moves) // 2] if moves else 0.0
     cost_pct = max(0.0, float(round_trip_cost_pct))
     depth_floor = max(float(min_local_drop_pct), noise_pct * 1.25, cost_pct * 0.12)
-    imbalance = bid_size / max(ask_size, 1e-12)
-    if imbalance < 0.95:
+    # Продавцы сильнее покупателей - только при реально видимом стакане.
+    # В price-only режиме стакан недоступен: решение по структуре цены.
+    if book_mode != "price_only" and imbalance < 0.95:
         report(f"продавцы сильнее покупателей в стакане (bid/ask={imbalance:.2f})",
                ticks=len(parsed), windows_checked=[])
         return None
@@ -460,7 +586,10 @@ def detect_multiscale_dip_trigger(
             bounce_score = min(25.0, 25.0 * off_low_pct /
                                max(drop_pct * 0.45, min_bounce, 1e-9))
             flow_score = min(20.0, 20.0 * up_ratio / 0.80)
-            book_score = min(15.0, max(0.0, (imbalance - 0.90) / 0.50 * 15.0))
+            # В price-only режиме стакан недоступен: бонус за дисбаланс
+            # не начисляется (0), остальные слагаемые работают как раньше.
+            book_score = (0.0 if book_mode == "price_only"
+                          else min(15.0, max(0.0, (imbalance - 0.90) / 0.50 * 15.0)))
             economics_score = min(15.0, 15.0 * potential_pct /
                                   max(min_potential * 1.5, 1e-9))
             score = min(100.0, depth_score + bounce_score + flow_score
@@ -483,7 +612,8 @@ def detect_multiscale_dip_trigger(
                 "min_rebound_pct": round(min_potential, 5),
                 "spread_pct": round(spread_pct, 5),
                 "price_age_sec": round(price_age, 3),
-                "book_age_sec": round(book_age, 3),
+                "book_age_sec": round(float(quote.get("book_age_sec", math.inf)), 3),
+                "book_mode": book_mode,
                 "dip_scale_sec": float(window_sec),
                 "micro_dip": 1.0,
             }
@@ -496,7 +626,8 @@ def detect_multiscale_dip_trigger(
     if best is not None:
         report("микродно подтверждено", ticks=len(parsed),
                windows_checked=windows_checked, rejects=rejects,
-               best_scale_sec=best["dip_scale_sec"], score=best["bottom_score"])
+               best_scale_sec=best["dip_scale_sec"], score=best["bottom_score"],
+               book_mode=book_mode)
         return best
 
     if not windows_checked:

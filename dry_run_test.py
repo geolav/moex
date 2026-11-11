@@ -124,6 +124,9 @@ def make_test_config(tmp: str) -> BotConfig:
         scalp_dip_enabled=True, scalp_dip_window_sec=240,
         scalp_dip_min_drop_pct=0.20, scalp_dip_stabilize_sec=20,
         scalp_dip_min_imbalance=1.15,
+        # v1.17.2: деградация без стакана (None ломает _price_only_kwargs).
+        scalp_book_rest_refresh_sec=30, scalp_rest_book_max_age_sec=45,
+        scalp_micro_price_only_fallback=True, scalp_default_spread_pct=0.05,
         memory_loss_streak_guard=False,
         scan_empty_shortlist_fallback=True,
         scan_enabled=False, scan_interval_min=10, scan_min_turnover=50.0,

@@ -254,6 +254,14 @@ class BotConfig:
     scalp_dip_min_imbalance: float # bid/ask дисбаланс у дна ямы
     scalp_micro_dip_min_drop_pct: float # минимальная локальная просадка для многомасштабного детектора
     scalp_micro_dip_min_score: float # минимальный score микродна 0..100
+    # --- Деградация без стакана (v1.17.2) -------------------------------------
+    # У владельца last_price по стриму приходит, а стакан - нет: раньше из-за
+    # этого браковались ВСЕ локальные ямы ("стакан устарел"). Теперь стакан
+    # освежается по REST, а без него детектор работает по цене.
+    scalp_book_rest_refresh_sec: int  # как часто освежать стакан по REST, если стрим молчит
+    scalp_rest_book_max_age_sec: int  # сколько секунд REST-стакан считается пригодным
+    scalp_micro_price_only_fallback: bool  # микродно без стакана: решение по структуре цены
+    scalp_default_spread_pct: float   # консервативный спред, если ни стрима, ни REST, ни ISS
     # --- Правила «недоверия после убытков» (v1.14.0) --------------------------
     # Пауза после 3 убытков подряд и повышенный порог после 2: по решению
     # владельца правило по умолчанию ВЫКЛЮЧЕНО (мешало скальпу повторно
@@ -495,6 +503,18 @@ def load_config() -> BotConfig:
             "SCALP_MICRO_DIP_MIN_DROP_PCT", 0.02, low=0.005, high=0.20),
         scalp_micro_dip_min_score=_env_float(
             "SCALP_MICRO_DIP_MIN_SCORE", 48.0, low=30.0, high=90.0),
+        # v1.17.2: деградация без стакана. REST-обновление стакана раз в 30 сек
+        # ограничено 6 вызовами за проход; price-only разрешён по умолчанию,
+        # потому что в конфигурации владельца стакан по стриму не приходит
+        # вовсе, и жёсткая проверка браковала все микродна подряд.
+        scalp_book_rest_refresh_sec=_env_int(
+            "SCALP_BOOK_REST_REFRESH_SEC", 30, low=5, high=300),
+        scalp_rest_book_max_age_sec=_env_int(
+            "SCALP_REST_BOOK_MAX_AGE_SEC", 45, low=10, high=300),
+        scalp_micro_price_only_fallback=_env_bool(
+            "SCALP_MICRO_PRICE_ONLY", True),
+        scalp_default_spread_pct=_env_float(
+            "SCALP_DEFAULT_SPREAD_PCT", 0.05, low=0.0, high=0.5),
         # v1.14.0: правило «после убытков бумаге не доверяем» по умолчанию
         # выключено (просьба владельца; в скальпе оно не работало в любом
         # случае). MEMORY_LOSS_STREAK_GUARD=true возвращает прежнее поведение.

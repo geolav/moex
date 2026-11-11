@@ -188,6 +188,16 @@ class TinkoffClient:
         self._scalp_feed_stop: Optional[asyncio.Event] = None
         self._scalp_feed_tickers: set[str] = set()
         self._scalp_feed_ready = False
+        # v1.17.2: диагностика подписок и REST-фолбэк стакана.
+        # Сервер может ОТКЛОНИТЬ подписку на стакан (лимит тарифа, превышение
+        # количества запросов и т.п.) - раньше это было полностью невидимо:
+        # стакан молча никогда не обновлялся, а детектор микродна браковал
+        # каждый сигнал с "стакан устарел". Теперь статусы подписок
+        # логируются, а молчащий стакан освежается по REST GetOrderBook.
+        self._scalp_subscribe_log_done = False
+        self._scalp_book_rest_ts: Dict[str, float] = {}
+        self._scalp_book_rest_lock = asyncio.Lock()
+        self._scalp_book_rest_roundrobin: int = 0
         self._ohlc_cache: Dict[str, List[Dict[str, float]]] = {}
         self._spread_cache: Dict[str, Tuple[float, float]] = {}
         # Полная вселенная акций основного режима торгов TQBR (~250 бумаг):
@@ -541,6 +551,7 @@ class TinkoffClient:
                     log.error("Scalp stream: у SDK нет market_data_stream.market_data_stream")
                     return
                 self._scalp_feed_ready = True
+                self._scalp_subscribe_log_done = False
                 log.info("Scalp stream: подписываюсь на last-price и стакан для %d бумаг",
                          len(tickers))
                 async for event in method(request_iterator()):
@@ -572,9 +583,161 @@ class TinkoffClient:
             except (TypeError, ValueError):
                 return 0.0
 
+    _SUBSCRIPTION_STATUS_NAMES = {
+        1: "SUCCESS", 2: "INSTRUMENT_NOT_FOUND", 3: "ACTION_IS_INVALID",
+        4: "DEPTH_IS_INVALID", 5: "INTERVAL_IS_INVALID", 6: "LIMIT_IS_EXCEEDED",
+        7: "INTERNAL_ERROR", 8: "TOO_MANY_REQUESTS", 9: "NOT_FOUND",
+        10: "SOURCE_IS_INVALID",
+    }
+
+    @classmethod
+    def _subscription_status_name(cls, value: Any) -> str:
+        """Человекочитаемый статус подписки: enum SDK или число."""
+        name = getattr(value, "name", None)
+        if name:
+            return str(name).replace("SUBSCRIPTION_STATUS_", "")
+        try:
+            num = int(getattr(value, "value", value) or 0)
+        except (TypeError, ValueError):
+            return "UNKNOWN"
+        return cls._SUBSCRIPTION_STATUS_NAMES.get(num, f"STATUS_{num}")
+
+    def _log_subscription_status(self, event: Any) -> None:
+        """Один отчёт о подтверждении/отказе подписок на каждое подключение.
+
+        Вызывается до флага _scalp_subscribe_log_done, поэтому отчёт
+        появляется на первом событии (обычно это subscribe-ответ) после
+        (пере)подключения. Это закрывает случай "стакан молча не приходит":
+        теперь причина отказа видна в логе по имени статуса.
+        """
+        self._scalp_subscribe_log_done = True
+        for kind, attr, plural in (
+                ("last_price", "subscribe_last_price_response", "last_price_subscriptions"),
+                ("orderbook", "subscribe_order_book_response", "order_book_subscriptions"),):
+            response = getattr(event, attr, None)
+            subs = getattr(response, plural, None) or []
+            if not subs:
+                continue
+            ok = [s for s in subs if self._subscription_status_name(
+                getattr(s, "subscription_status", None)) == "SUCCESS"]
+            rejected = [s for s in subs if s not in ok]
+            if ok:
+                log.info("Scalp stream: подписка %s подтверждена для %d бумаг",
+                         kind, len(ok))
+            for s in rejected:
+                uid = str(getattr(s, "instrument_uid", "") or "")
+                figi = str(getattr(s, "figi", "") or "")
+                ticker = (self._ticker_by_uid.get(uid)
+                          or self._ticker_by_figi.get(figi) or (uid or figi) or "?")
+                log.warning(
+                    "Scalp stream: сервер ОТКЛОНИЛ подписку %s для %s: %s "
+                    "(стакан по этой бумаге по stream приходить не будет; "
+                    "бот перейдёт на REST-обновление стакана)",
+                    kind, ticker, self._subscription_status_name(
+                        getattr(s, "subscription_status", None)))
+
+    async def refresh_stale_books(self, tickers: List[str]) -> int:
+        """REST-фолбэк стакана для бумаг, по которым stream-стакан молчит.
+
+        v1.17.2: в конфигурации владельца last_price по стриму приходит,
+        а стакан - нет (book_age=inf). Детекторы раньше из-за этого браковали
+        ВСЕ микродна. Теперь раз в SCALP_BOOK_REST_REFRESH_SEC секунд стакан
+        освежается REST-вызовом GetOrderBook (глубина 5): детекторы получают
+        bid/ask/объёмы, спред и дисбаланс, а quote помечается
+        book_source="rest". Свежий stream-стакан REST не перезаписывает.
+        Вызовы ограничены: максимум 6 REST-запросов за проход и не чаще
+        интервала обновления на бумагу.
+        """
+        if self._api is None or not tickers:
+            return 0
+        refresh_sec = max(5.0, float(
+            getattr(self._cfg, "scalp_book_rest_refresh_sec", 30) or 30))
+        now_mono = time.monotonic()
+        # Круговой обход: каждый проход сдвигаемся дальше по списку, чтобы
+        # при ограничении 6 вызовов за проход все бумаги со временем получали
+        # обновление, а не только первые из списка.
+        ordered = list(tickers)
+        if self._scalp_book_rest_roundrobin:
+            shift = self._scalp_book_rest_roundrobin % max(1, len(ordered))
+            ordered = ordered[shift:] + ordered[:shift]
+        updated = 0
+        async with self._scalp_book_rest_lock:
+            for ticker in ordered:
+                if updated >= 6:
+                    break
+                info = self._instruments.get(ticker)
+                if not info or not (info.get("figi") or info.get("uid")):
+                    continue
+                last_ts = self._scalp_book_rest_ts.get(ticker, 0.0)
+                if now_mono - last_ts < refresh_sec:
+                    continue
+                quote = self._scalp_quotes.get(ticker)
+                if quote:
+                    book_ts = float(quote.get("book_updated_mono", 0.0) or 0.0)
+                    if book_ts and now_mono - book_ts < refresh_sec:
+                        # Свежий стакан уже есть (например stream ожил).
+                        self._scalp_book_rest_ts[ticker] = now_mono
+                        continue
+                figi = str(info.get("figi") or "")
+                instrument_id = figi or str(info.get("uid") or "")
+                try:
+                    if figi:
+                        response = await self._call(
+                            "get_order_book",
+                            lambda f=figi: self._api.market_data.get_order_book(
+                                figi=f, depth=5),
+                            tries=1)
+                    else:
+                        response = await self._call(
+                            "get_order_book",
+                            lambda i=instrument_id: self._api.market_data.get_order_book(
+                                instrument_id=i, depth=5),
+                            tries=1)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - нет стакана = нет фолбэка
+                    self._scalp_book_rest_ts[ticker] = now_mono
+                    log.debug("REST-стакан %s недоступен: %s", ticker, exc)
+                    continue
+                self._scalp_book_rest_ts[ticker] = now_mono
+                bids = list(getattr(response, "bids", []) or [])
+                asks = list(getattr(response, "asks", []) or [])
+                if not bids or not asks:
+                    continue
+                bid = self._stream_number(getattr(bids[0], "price", None))
+                ask = self._stream_number(getattr(asks[0], "price", None))
+                bid_volume = sum(max(0.0, float(getattr(x, "quantity", 0) or 0))
+                                 for x in bids[:5])
+                ask_volume = sum(max(0.0, float(getattr(x, "quantity", 0) or 0))
+                                 for x in asks[:5])
+                if bid <= 0 or ask <= bid:
+                    continue
+                target = self._scalp_quotes.setdefault(
+                    ticker, {"ticks": deque(maxlen=120)})
+                mid = (bid + ask) / 2.0
+                target.update({
+                    "bid": bid, "ask": ask, "bid_volume": bid_volume,
+                    "ask_volume": ask_volume, "book_consistent": True,
+                    "book_updated_mono": now_mono, "book_age_sec": 0.0,
+                    "book_source": "rest",
+                    "spread_pct": (ask - bid) / mid * 100.0,
+                })
+                updated += 1
+        self._scalp_book_rest_roundrobin = (
+            (self._scalp_book_rest_roundrobin + max(1, updated)) if updated
+            else self._scalp_book_rest_roundrobin + 1)
+        return updated
+
     def _handle_scalp_stream_event(self, event: Any) -> None:
         """Обновляет локальный quote-cache по событию T-Invest stream."""
         now_mono = time.monotonic()
+        # v1.17.2: ответы на ПОДПИСКИ раньше игнорировались полностью. Если
+        # сервер отклонял стакан (например SUBSCRIPTION_STATUS_LIMIT_IS_EXCEEDED
+        # в песочнице или на тарифе без стаканов), это выглядело как "стакан
+        # никогда не приходит" без единой строки в логе. Теперь один отчёт
+        # на каждое (пере)подключение: SUCCESS - INFO, отказы - WARNING.
+        if not self._scalp_subscribe_log_done:
+            self._log_subscription_status(event)
         last = getattr(event, "last_price", None)
         if last is not None:
             uid = str(getattr(last, "instrument_uid", "") or "")
@@ -610,7 +773,10 @@ class TinkoffClient:
                 quote = self._scalp_quotes.setdefault(ticker, {"ticks": deque(maxlen=120)})
                 quote.update({"bid": bid, "ask": ask, "bid_volume": bid_volume,
                               "ask_volume": ask_volume, "book_consistent": consistent,
-                              "book_updated_mono": now_mono, "book_age_sec": 0.0})
+                              "book_updated_mono": now_mono, "book_age_sec": 0.0,
+                              "book_source": "stream"})
+                # Живой стримовый стакан снова есть - REST-фолбэк больше не нужен.
+                self._scalp_book_rest_ts.pop(ticker, None)
                 mid = (bid + ask) / 2.0 if bid > 0 and ask > bid else 0.0
                 quote["spread_pct"] = ((ask - bid) / mid * 100.0 if mid > 0 else 0.0)
 
@@ -625,6 +791,7 @@ class TinkoffClient:
         book_ts = float(quote.get("book_updated_mono", 0.0) or 0.0)
         quote["price_age_sec"] = max(0.0, now_mono - price_ts) if price_ts else float("inf")
         quote["book_age_sec"] = max(0.0, now_mono - book_ts) if book_ts else float("inf")
+        quote.setdefault("book_source", "stream" if book_ts else "none")
         quote["ticks"] = list(quote.get("ticks") or [])
         return quote
 
@@ -966,11 +1133,26 @@ class TinkoffClient:
             return None
 
     def get_spread_pct(self, ticker: str, max_age_sec: float = 120.0) -> Optional[float]:
-        """Спред: сначала живой T-Invest стакан, затем свежий снимок MOEX ISS."""
+        """Спред: живой T-Invest стакан, затем REST-стакан, затем снимок MOEX ISS.
+
+        v1.17.2: REST-стакан обновляется раз в ~20 сек, поэтому принимается
+        с запасом до scalp_rest_book_max_age_sec секунд. Раньше принимался
+        только стримовый стакан моложе 5 сек - при молчащем стриме стакана
+        спред почти всегда был None и каждый скальп-вход отбрасывался с
+        "нет свежего ATR(14)/спреда".
+        """
         live = self.get_scalp_quote(ticker)
         if live and live.get("book_age_sec", float("inf")) <= 5.0:
             value = float(live.get("spread_pct") or 0.0)
-            return value if value > 0 else None
+            if value > 0:
+                return value
+        if live and str(live.get("book_source") or "") == "rest":
+            rest_max_age = max(10.0, float(
+                getattr(self._cfg, "scalp_rest_book_max_age_sec", 45) or 45))
+            if live.get("book_age_sec", float("inf")) <= rest_max_age:
+                value = float(live.get("spread_pct") or 0.0)
+                if value > 0:
+                    return value
         item = self._spread_cache.get(ticker)
         if not item or time.monotonic() - item[1] > max_age_sec:
             return None

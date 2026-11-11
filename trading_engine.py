@@ -396,6 +396,26 @@ class TradingEngine:
         slippage = max(0.0, float(getattr(self._cfg, "slippage_pct", 0.0) or 0.0))
         return spread + commission + slippage
 
+    def _price_only_kwargs(self) -> Dict[str, Any]:
+        """Общие kwargs деградации без стакана (v1.17.2) для всех детекторов.
+
+        Стакан в этой конфигурации может молчать (book_age=inf): детекторы
+        получают разрешение на price-only анализ и консервативную оценку
+        спреда, чтобы локальные ямы обнаруживались по структуре цены.
+        Значения читаются None-защищённо: dry-run конфиг заполняет новые
+        поля BotConfig значением None по умолчанию.
+        """
+        price_only = getattr(self._cfg, "scalp_micro_price_only_fallback", True)
+        spread_fb = getattr(self._cfg, "scalp_default_spread_pct", 0.05)
+        rest_age = getattr(self._cfg, "scalp_rest_book_max_age_sec", 45)
+        return {
+            "allow_price_only": True if price_only is None else bool(price_only),
+            "spread_fallback_pct": max(0.0, float(
+                0.05 if spread_fb is None else spread_fb)),
+            "rest_book_max_age_sec": max(10.0, float(
+                45 if rest_age is None else rest_age)),
+        }
+
     def _micro_trigger(self, quote: Optional[Dict[str, Any]]) -> Optional[Dict[str, float]]:
         """Единая точка вызова локального микро-детектора со порогами из конфига.
 
@@ -419,6 +439,7 @@ class TradingEngine:
             min_up_ratio=float(cfg_up_ratio) if cfg_up_ratio else 0.55,
             min_imbalance=float(cfg_imbalance) if cfg_imbalance else 1.10,
             max_ret45_pct=float(cfg_max_ret45) if cfg_max_ret45 else 0.45,
+            **self._price_only_kwargs(),
         )
         if signal is not None:
             signal["kind"] = "micro_impulse"
@@ -444,6 +465,7 @@ class TradingEngine:
         # локально, не вызывает Groq и не ослабляет ограничения по спреду,
         # свежести данных или доступному потенциалу относительно издержек.
         signals = []
+        price_only_kwargs = self._price_only_kwargs()
         legacy = detect_dip_reversal_trigger(
             quote,
             max_spread_pct=float(self._cfg.scalp_max_spread_pct),
@@ -453,6 +475,7 @@ class TradingEngine:
             dip_stabilize_sec=float(max(5, int(getattr(
                 self._cfg, "scalp_dip_stabilize_sec", 20)))),
             dip_min_imbalance=float(getattr(self._cfg, "scalp_dip_min_imbalance", 1.15)),
+            **price_only_kwargs,
         )
         if legacy is not None:
             legacy["kind"] = "dip_reversal"
@@ -467,6 +490,7 @@ class TradingEngine:
             min_score=float(
                 getattr(self._cfg, "scalp_micro_dip_min_score", None) or 48.0),
             diagnostics=diagnostics,
+            **price_only_kwargs,
         )
         self._last_dip_diagnostics = diagnostics
         if micro is not None:
@@ -551,6 +575,20 @@ class TradingEngine:
                 await self.exit_cycle()
             return
 
+        # v1.17.2: если стримовый стакан молчит (сервер отклонил подписку или
+        # стакан просто не шлёт), освежаем bid/ask по REST GetOrderBook -
+        # детекторы получают спред и дисбаланс вместо book_age=inf.
+        book_refresher = getattr(self._client, "refresh_stale_books", None)
+        if callable(book_refresher):
+            try:
+                refreshed = await book_refresher(tickers)
+                if refreshed:
+                    log.debug("Scalp stream: REST-стакан обновлён для %d бумаг", refreshed)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - фолбэк не обязан работать
+                log.debug("REST-обновление стакана не удалось: %s", exc)
+
         for ticker in tickers:
             if self._stop_event.is_set():
                 break
@@ -558,6 +596,25 @@ class TradingEngine:
                 quote = getter(ticker)
                 if not quote:
                     continue
+                # v1.17.2: если у котировки нет спреда (стакан молчит),
+                # подставляем фолбэк: REST-стакан -> ISS-снимок ->
+                # консервативная оценка из конфига. Без этого детекторы
+                # браковали сигнал с "спред 0.0000% вне лимита".
+                if not float(quote.get("spread_pct") or 0.0):
+                    fallback_spread = None
+                    spread_getter = getattr(self._client, "get_spread_pct", None)
+                    if callable(spread_getter):
+                        try:
+                            fallback_spread = spread_getter(ticker)
+                        except Exception:  # noqa: BLE001
+                            fallback_spread = None
+                    if not fallback_spread:
+                        default_spread = getattr(
+                            self._cfg, "scalp_default_spread_pct", 0.05)
+                        fallback_spread = max(0.0, float(
+                            0.05 if default_spread is None else default_spread))
+                    quote["spread_pct"] = float(fallback_spread)
+                    quote["spread_source"] = "fallback"
                 price = float(quote.get("price") or 0.0)
                 price_age = float(quote.get("price_age_sec", float("inf")))
                 seq = int(quote.get("price_seq", 0) or 0)
@@ -604,14 +661,19 @@ class TradingEngine:
                         tick_count = diag.get("ticks", len(quote.get("ticks") or []))
                         windows = diag.get("windows_checked", "нет")
                         reason = diag.get("reason", "минимум/отскок/поток не подтвердили паттерн")
+                        book_mode = str(quote.get("book_source") or "none")
+                        if diag.get("book_mode"):
+                            book_mode = str(diag["book_mode"])
                         log.info(
                             "Микродно %s: локальный анализ выполнен; тиков=%s, "
-                            "окна=%s сек, спред=%.4f%%, цена свежая %.2f сек, "
-                            "стакан свежий %.2f сек; сигнал не подтверждён: %s",
+                            "окна=%s сек, спред=%.4f%% (%s), цена свежая %.2f сек, "
+                            "стакан свежий %.2f сек (%s); сигнал не подтверждён: %s",
                             ticker, tick_count, windows,
                             float(quote.get("spread_pct") or 0.0),
+                            str(quote.get("spread_source") or "стакан"),
                             float(quote.get("price_age_sec") or 0.0),
-                            float(quote.get("book_age_sec") or 0.0), reason)
+                            float(quote.get("book_age_sec") or 0.0), book_mode,
+                            reason)
                     continue
                 self._scalp_trigger_cache[ticker] = signal
                 last_signal_log = self._scalp_local_signal_log_last.get(ticker, 0.0)
@@ -639,31 +701,57 @@ class TradingEngine:
 
         # Контроль здоровья stream: ready=True само по себе не значит, что
         # по тикерам реально приходят свежие цены и стаканы. Один INFO/минуту.
+        # v1.17.2: цена и стакан считаются раздельно - при молчащем стакане
+        # видно, что цена живая и поиск идёт в price-only/REST-режиме.
         if now - self._scalp_stream_health_log_last >= 60.0:
-            fresh = []
-            stale = []
+            fresh_price = []
+            fresh_book = []
+            stale_price = []
             for symbol in tickers:
                 try:
                     q = getter(symbol)
-                    if (q and float(q.get("price_age_sec", float("inf"))) <= 3.0
-                            and float(q.get("book_age_sec", float("inf"))) <= 5.0):
-                        fresh.append(symbol)
+                    if not q:
+                        stale_price.append(symbol)
+                        continue
+                    if float(q.get("price_age_sec", float("inf"))) <= 3.0:
+                        fresh_price.append(symbol)
                     else:
-                        stale.append(symbol)
+                        stale_price.append(symbol)
+                    if float(q.get("book_age_sec", float("inf"))) <= 5.0:
+                        fresh_book.append(symbol)
                 except Exception:
-                    stale.append(symbol)
+                    stale_price.append(symbol)
+            # Буферы показываем по всем бумагам с тиками (а не только "свежим",
+            # как раньше - при молчащем стакане список всегда был "нет").
             buffer_sizes = []
-            for symbol in fresh[:6]:
+            with_ticks = []
+            for symbol in tickers:
                 try:
-                    buffer_sizes.append(f"{symbol}:{len((getter(symbol) or {}).get('ticks') or [])}")
+                    q = getter(symbol) or {}
+                    size = len(q.get("ticks") or [])
+                    if size:
+                        with_ticks.append((size, symbol))
+                except Exception:
+                    pass
+            for size, symbol in sorted(with_ticks, reverse=True)[:6]:
+                buffer_sizes.append(f"{symbol}:{size}")
+            rest_books = []
+            for symbol in tickers:
+                try:
+                    q = getter(symbol) or {}
+                    if str(q.get("book_source") or "") == "rest":
+                        rest_books.append(symbol)
                 except Exception:
                     pass
             log.info(
-                "Scalp stream ЗДОРОВ: свежие цена+стакан %d/%d бумаг; "
-                "буферы тиков [%s]; без свежих данных [%s]. "
-                "Локальный поиск микродон работает только по свежим тикам, Groq не вызывается на каждом тике.",
-                len(fresh), len(tickers), ", ".join(buffer_sizes) or "нет",
-                ", ".join(stale[:12]) or "нет")
+                "Scalp stream ЗДОРОВ: цена свежая %d/%d; стакан (стрим) %d/%d%s; "
+                "буферы тиков [%s]; без свежей цены [%s]. "
+                "Локальный поиск микродон работает по свежим тикам; "
+                "Groq не вызывается на каждом тике.",
+                len(fresh_price), len(tickers), len(fresh_book), len(tickers),
+                ("; стакан по REST: " + ", ".join(rest_books[:8])) if rest_books else "",
+                ", ".join(buffer_sizes) or "нет",
+                ", ".join(stale_price[:12]) or "нет")
             self._scalp_stream_health_log_last = now
 
         await self._flush_scalp_ai_queue()
@@ -1676,13 +1764,28 @@ class TradingEngine:
             })
         # Без ATR/спреда скальп не оцениваем: это критичные данные для стопа
         # и проверки, что цель покрывает издержки. Не подставляем выдуманные значения.
+        # v1.17.2: спред больше не жёсткий блок - если ни стримовый, ни REST-стакан,
+        # ни ISS-снимок не дали спред, берём консервативную оценку
+        # SCALP_DEFAULT_SPREAD_PCT (та же, что использовал детектор при
+        # генерации сигнала), иначе каждый сигнал гас на "нет свежего спреда".
         if self.scalp_mode():
             atr_getter = getattr(self._client, "get_atr_pct", None)
             spread_getter = getattr(self._client, "get_spread_pct", None)
             atr_pct = atr_getter(ticker, 14) if callable(atr_getter) else None
             spread_pct = spread_getter(ticker) if callable(spread_getter) else None
-            if atr_pct is None or atr_pct <= 0 or spread_pct is None:
-                log.info("%s: скальп-вход пропущен: нет свежего ATR(14)/спреда", ticker)
+            if spread_pct is None or float(spread_pct) <= 0:
+                default_spread = getattr(
+                    self._cfg, "scalp_default_spread_pct", 0.05)
+                spread_pct = max(0.0, float(
+                    0.05 if default_spread is None else default_spread))
+                if not float(spread_pct):
+                    log.info("%s: скальп-вход пропущен: спред неизвестен, а "
+                             "SCALP_DEFAULT_SPREAD_PCT = 0", ticker)
+                    return
+                log.info("%s: спред недоступен - использую консервативную "
+                         "оценку %.3f%%", ticker, float(spread_pct))
+            if atr_pct is None or atr_pct <= 0:
+                log.info("%s: скальп-вход пропущен: нет свежего ATR(14)", ticker)
                 return
             stop_pct = min(self._cfg.scalp_max_stop_pct,
                            max(self._cfg.scalp_min_stop_pct,
