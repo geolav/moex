@@ -96,7 +96,7 @@ def make_test_config(tmp: str) -> BotConfig:
         # None вместо числа ломал вход: None > 0 в анти-погоне и др.)
         surge_sense_from_pct=3.0, chase_guard_pct=0.0, chase_bounce_pct=0.0,
         morning_anchor_until=13,
-        scalp_max_positions=8, scalp_watchlist_max=10,
+        scalp_max_positions=8, scalp_watchlist_max=15,
         scalp_poll_sec=300, scalp_exit_poll_sec=30,
         scalp_ai_min_request_interval_sec=240,
         scalp_cooldown_min=20,
@@ -794,8 +794,8 @@ async def main() -> int:
     risk_state.set_scalp_mode(True)
     risk_client = FakeClient()
     risk_engine = TradingEngine(cfg, risk_state, risk_client, FakeAnalyst(), notify)
-    check("лимит скальп-watchlist равен 10 при максимуме 8 открытых позиций",
-          risk_engine.max_tickers() == 10 and cfg.scalp_max_positions == 8)
+    check("лимит скальп-watchlist равен 15 при максимуме 8 открытых позиций",
+          risk_engine.max_tickers() == 15 and cfg.scalp_max_positions == 8)
     check("дневной лимит скальпа позволяет 40 входов", risk_engine._max_buys_today() == 40)
     risk_state.set_position("SBER", {
         "lots": 1, "entry_price": 100.0, "scalp_risk_pct": 1.0,

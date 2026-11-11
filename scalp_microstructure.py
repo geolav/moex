@@ -294,3 +294,172 @@ def detect_dip_reversal_trigger(
         "price_age_sec": round(price_age, 3),
         "book_age_sec": round(book_age, 3),
     }
+
+
+
+def detect_multiscale_dip_trigger(
+    quote: Dict[str, Any],
+    *,
+    max_spread_pct: float,
+    round_trip_cost_pct: float,
+    min_local_drop_pct: float = 0.02,
+    min_score: float = 48.0,
+    max_price_age_sec: float = 3.0,
+    max_book_age_sec: float = 5.0,
+) -> Optional[Dict[str, float]]:
+    """Быстрый многомасштабный поиск локальных микродон (v1.17.0).
+
+    В отличие от старого детектора с фиксированным падением 0.20% и
+    стабилизацией 20 секунд, проверяет окна 12/20/35/60/120/240 секунд.
+    Ищет недавний локальный минимум, после которого появились несколько
+    подтверждающих uptick, покупательский баланс и достаточный потенциал
+    восстановления относительно ожидаемых издержек.
+
+    Это эвристический детектор событий, не гарантия нахождения каждого дна и
+    не вероятностная ML-модель. Не вызывает LLM и не делает торговых заявок.
+    """
+    try:
+        price = float(quote.get("price") or 0.0)
+        price_age = float(quote.get("price_age_sec", math.inf))
+        book_age = float(quote.get("book_age_sec", math.inf))
+        bid = float(quote.get("bid") or 0.0)
+        ask = float(quote.get("ask") or 0.0)
+        bid_size = float(quote.get("bid_volume") or 0.0)
+        ask_size = float(quote.get("ask_volume") or 0.0)
+        spread_pct = float(quote.get("spread_pct") or 0.0)
+        raw_ticks = quote.get("ticks") or []
+    except (TypeError, ValueError):
+        return None
+
+    if (price <= 0 or bid <= 0 or ask <= bid or bid_size <= 0 or ask_size <= 0
+            or price_age > max_price_age_sec or book_age > max_book_age_sec
+            or not quote.get("book_consistent", True)
+            or spread_pct <= 0 or spread_pct > max_spread_pct):
+        return None
+
+    parsed = []
+    for item in raw_ticks:
+        try:
+            ts, value = float(item["ts"]), float(item["price"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if ts > 0 and value > 0 and math.isfinite(ts) and math.isfinite(value):
+            parsed.append((ts, value))
+    if len(parsed) < 6:
+        return None
+    parsed.sort(key=lambda x: x[0])
+    # Поток хранит только изменения цены. Если последнее значение котировки
+    # новее последней записи кольцевого буфера, добавляем его в локальный расчёт.
+    price_ts = float(quote.get("price_updated_mono", 0.0) or 0.0)
+    latest_ts = max(parsed[-1][0], price_ts)
+    if abs(parsed[-1][1] - price) > 1e-12:
+        parsed.append((latest_ts, price))
+    else:
+        parsed[-1] = (latest_ts, price)
+
+    # Медианное изменение тика оценивает локальный шум, не подгоняя порог
+    # под абсолютную цену бумаги. Все изменения - в процентах.
+    moves = [abs((b[1] / a[1] - 1.0) * 100.0)
+             for a, b in zip(parsed[-32:], parsed[-31:]) if a[1] > 0 and b[1] > 0]
+    moves = [x for x in moves if x > 1e-9]
+    noise_pct = sorted(moves)[len(moves) // 2] if moves else 0.0
+    cost_pct = max(0.0, float(round_trip_cost_pct))
+    depth_floor = max(float(min_local_drop_pct), noise_pct * 1.25, cost_pct * 0.12)
+    imbalance = bid_size / max(ask_size, 1e-12)
+    if imbalance < 0.95:
+        return None
+
+    best: Optional[Dict[str, float]] = None
+    # Короткие масштабы ловят локальные откаты, длинные помогают отличить
+    # внутриминутную яму от обычного шума на более широком движении.
+    for window_sec in (12.0, 20.0, 35.0, 60.0, 120.0, 240.0):
+        pts = [(ts, p) for ts, p in parsed if latest_ts - window_sec <= ts <= latest_ts]
+        if len(pts) < 6 or pts[-1][0] - pts[0][0] < min(4.0, window_sec * 0.25):
+            continue
+        prices = [p for _, p in pts]
+        first_idx = max(3, len(pts) - 14)
+        # Проверяем несколько последних локальных trough, а не только минимум
+        # всего окна: это важно, если в окне уже был более глубокий старый лой.
+        for low_idx in range(len(pts) - 3, first_idx - 1, -1):
+            low = prices[low_idx]
+            left = prices[max(0, low_idx - 2):low_idx]
+            right = prices[low_idx + 1:low_idx + 3]
+            if len(left) < 2 or len(right) < 2:
+                continue
+            if low > min(left) or low > min(right):
+                continue
+            low_ts = pts[low_idx][0]
+            low_age = latest_ts - low_ts
+            if low_age < 1.0 or low_age > min(15.0, max(5.0, window_sec * 0.5)):
+                continue
+            # Любое обновление минимума после trough отменяет этот кандидат.
+            tail = prices[low_idx:]
+            if any(p < low - 1e-12 for p in tail[1:]):
+                continue
+            prior = prices[max(0, low_idx - min(12, max(5, len(pts) // 2))):low_idx]
+            if len(prior) < 3:
+                continue
+            top3 = sorted(prior)[-min(3, len(prior)):]
+            reference = sum(top3) / len(top3)
+            drop_pct = (reference / low - 1.0) * 100.0 if low > 0 else 0.0
+            if drop_pct < depth_floor:
+                continue
+
+            off_low_pct = (price / low - 1.0) * 100.0
+            min_bounce = max(0.005, noise_pct * 0.5)
+            if off_low_pct < min_bounce or off_low_pct > drop_pct * 0.70:
+                continue
+
+            post_changes = [b - a for a, b in zip(tail, tail[1:])]
+            nonzero = [x for x in post_changes if abs(x) > 1e-12]
+            up_ratio = (sum(x > 0 for x in nonzero) / len(nonzero)
+                        if nonzero else 0.0)
+            if sum(x > 0 for x in nonzero) < 2 or up_ratio < 0.60:
+                continue
+            # На микромасштабе цена должна быть выше минимума не случайным
+            # одиночным тиком: требуем положительное изменение последней части.
+            tail_start = max(0, len(tail) - 4)
+            if tail[-1] <= tail[tail_start]:
+                continue
+
+            potential_pct = (reference / price - 1.0) * 100.0 if price > 0 else 0.0
+            min_potential = max(0.015, cost_pct * 1.05)
+            if potential_pct < min_potential:
+                continue
+
+            # Интерпретируемый score 0..100 для ранжирования локальных ям.
+            depth_score = min(25.0, 12.5 * drop_pct / max(depth_floor, 1e-9))
+            bounce_score = min(25.0, 25.0 * off_low_pct /
+                               max(drop_pct * 0.45, min_bounce, 1e-9))
+            flow_score = min(20.0, 20.0 * up_ratio / 0.80)
+            book_score = min(15.0, max(0.0, (imbalance - 0.90) / 0.50 * 15.0))
+            economics_score = min(15.0, 15.0 * potential_pct /
+                                  max(min_potential * 1.5, 1e-9))
+            score = min(100.0, depth_score + bounce_score + flow_score
+                        + book_score + economics_score)
+            if score < float(min_score):
+                continue
+            result = {
+                "kind": "dip_reversal",
+                "dip_drop_pct": round(drop_pct, 5),
+                "off_low_pct": round(off_low_pct, 5),
+                "tail_15s_pct": round((price / tail[0] - 1.0) * 100.0, 5),
+                "tail_up_ratio": round(up_ratio, 4),
+                "higher_low_confirmed": 1.0,
+                "stabilize_sec": round(low_age, 1),
+                "bid_ask_imbalance": round(imbalance, 4),
+                "rebound_to_mean_pct": round(potential_pct, 5),
+                "rebound_to_vwap_pct": round(potential_pct, 5),
+                "bottom_score": round(score, 1),
+                "min_rebound_pct": round(min_potential, 5),
+                "spread_pct": round(spread_pct, 5),
+                "price_age_sec": round(price_age, 3),
+                "book_age_sec": round(book_age, 3),
+                "dip_scale_sec": float(window_sec),
+                "micro_dip": 1.0,
+            }
+            if best is None or result["bottom_score"] > best["bottom_score"]:
+                best = result
+            # Сначала проверяем наиболее свежий trough на каждом масштабе.
+            break
+    return best

@@ -205,7 +205,7 @@ class BotConfig:
     morning_anchor_until: int      # до скольки часов утренний якорь на вчерашний день
     # --- Скальп-режим (v1.7.0): /scalp в Telegram -----------------------------
     scalp_max_positions: int       # максимум одновременно открытых скальп-позиций (до 8)
-    scalp_watchlist_max: int        # сколько бумаг держать в скальп-watchlist (до 10)
+    scalp_watchlist_max: int        # сколько бумаг держать в скальп-watchlist (до 15)
     scalp_poll_sec: int            # legacy ENV; event-driven scalp не использует
     scalp_exit_poll_sec: int       # резервный интервал охраны при недоступном stream
     scalp_ai_min_request_interval_sec: int  # минимум секунд между Groq-оценками скальп-сигналов
@@ -252,6 +252,8 @@ class BotConfig:
     scalp_dip_min_drop_pct: float  # глубина провала от максимума окна, %
     scalp_dip_stabilize_sec: int   # сколько сек без нового минимума = падение остановилось
     scalp_dip_min_imbalance: float # bid/ask дисбаланс у дна ямы
+    scalp_micro_dip_min_drop_pct: float # минимальная локальная просадка для многомасштабного детектора
+    scalp_micro_dip_min_score: float # минимальный score микродна 0..100
     # --- Правила «недоверия после убытков» (v1.14.0) --------------------------
     # Пауза после 3 убытков подряд и повышенный порог после 2: по решению
     # владельца правило по умолчанию ВЫКЛЮЧЕНО (мешало скальпу повторно
@@ -398,7 +400,7 @@ def load_config() -> BotConfig:
                                       low=10, high=17),
         scalp_max_positions=_env_int("SCALP_MAX_POSITIONS", 8,
                                      low=1, high=8),
-        scalp_watchlist_max=_env_int("SCALP_WATCHLIST_MAX", 10, low=8, high=10),
+        scalp_watchlist_max=_env_int("SCALP_WATCHLIST_MAX", 15, low=8, high=15),
         scalp_poll_sec=_env_int("SCALP_POLL_SEC", 300, low=60, high=3600),
         scalp_exit_poll_sec=_env_int("SCALP_EXIT_POLL_SEC", 10,
                                      low=5, high=120),
@@ -489,6 +491,11 @@ def load_config() -> BotConfig:
                                          low=5, high=120),
         scalp_dip_min_imbalance=_env_float("SCALP_DIP_MIN_IMBALANCE", 1.15,
                                            low=1.0, high=3.0),
+        # v1.17.0: более короткие адаптивные ямы в окнах 12..240 секунд.
+        scalp_micro_dip_min_drop_pct=_env_float(
+            "SCALP_MICRO_DIP_MIN_DROP_PCT", 0.02, low=0.005, high=0.20),
+        scalp_micro_dip_min_score=_env_float(
+            "SCALP_MICRO_DIP_MIN_SCORE", 48.0, low=30.0, high=90.0),
         # v1.14.0: правило «после убытков бумаге не доверяем» по умолчанию
         # выключено (просьба владельца; в скальпе оно не работало в любом
         # случае). MEMORY_LOSS_STREAK_GUARD=true возвращает прежнее поведение.

@@ -64,7 +64,8 @@ import indicators
 import predictor
 import sessions
 from scalp_microstructure import (detect_dip_reversal_trigger,  # noqa: F401
-                                  detect_microstructure_trigger)
+                                  detect_microstructure_trigger,
+                                  detect_multiscale_dip_trigger)
 from news_filter import classify_headlines
 
 log = logging.getLogger("engine")
@@ -169,6 +170,7 @@ class TradingEngine:
         self._scalp_price_seq: Dict[str, int] = {}
         self._scalp_last_history_record: Dict[str, float] = {}
         self._scalp_last_local_eval: Dict[str, float] = {}
+        self._scalp_local_signal_log_last: Dict[str, float] = {}
         self._scalp_trigger_cache: Dict[str, Dict[str, float]] = {}
         self._scalp_ai_queue: Dict[str, Dict[str, Any]] = {}
         self._scalp_last_ai_batch_attempt = 0.0
@@ -407,18 +409,37 @@ class TradingEngine:
         """
         if not quote or not bool(getattr(self._cfg, "scalp_dip_enabled", True)):
             return None
-        signal = detect_dip_reversal_trigger(
+        cost_pct = self._scalp_micro_cost_pct(quote)
+        # Сохраняем прежний крупный паттерн для совместимости и дополняем его
+        # более короткими масштабами 12..240 секунд. Новый детектор работает
+        # локально, не вызывает Groq и не ослабляет ограничения по спреду,
+        # свежести данных или доступному потенциалу относительно издержек.
+        signals = []
+        legacy = detect_dip_reversal_trigger(
             quote,
             max_spread_pct=float(self._cfg.scalp_max_spread_pct),
-            round_trip_cost_pct=self._scalp_micro_cost_pct(quote),
-            dip_window_sec=float(max(60, int(self._cfg.scalp_dip_window_sec))),
-            dip_min_drop_pct=float(self._cfg.scalp_dip_min_drop_pct),
-            dip_stabilize_sec=float(max(5, int(self._cfg.scalp_dip_stabilize_sec))),
-            dip_min_imbalance=float(self._cfg.scalp_dip_min_imbalance),
+            round_trip_cost_pct=cost_pct,
+            dip_window_sec=float(max(60, int(getattr(self._cfg, "scalp_dip_window_sec", 240)))),
+            dip_min_drop_pct=float(getattr(self._cfg, "scalp_dip_min_drop_pct", 0.20)),
+            dip_stabilize_sec=float(max(5, int(getattr(
+                self._cfg, "scalp_dip_stabilize_sec", 20)))),
+            dip_min_imbalance=float(getattr(self._cfg, "scalp_dip_min_imbalance", 1.15)),
         )
-        if signal is not None:
-            signal["kind"] = "dip_reversal"
-        return signal
+        if legacy is not None:
+            legacy["kind"] = "dip_reversal"
+            signals.append(legacy)
+        micro = detect_multiscale_dip_trigger(
+            quote,
+            max_spread_pct=float(self._cfg.scalp_max_spread_pct),
+            round_trip_cost_pct=cost_pct,
+            min_local_drop_pct=float(getattr(
+                self._cfg, "scalp_micro_dip_min_drop_pct", 0.02)),
+            min_score=float(getattr(self._cfg, "scalp_micro_dip_min_score", 48.0)),
+        )
+        if micro is not None:
+            micro["kind"] = "dip_reversal"
+            signals.append(micro)
+        return max(signals, key=lambda item: float(item.get("bottom_score", 0.0))) if signals else None
 
     def _trigger_by_kind(self, quote: Optional[Dict[str, Any]],
                          kind: str) -> Optional[Dict[str, float]]:
@@ -429,10 +450,12 @@ class TradingEngine:
 
     def _any_micro_trigger(self, quote: Optional[Dict[str, Any]]) -> Optional[Dict[str, float]]:
         """Импульс ИЛИ остановившаяся яма: любой из двух локальных триггеров."""
-        signal = self._micro_trigger(quote)
+        # Для стратегии покупки от локального дна сначала проверяем именно
+        # разворот после просадки. Импульсный сигнал остаётся резервным типом.
+        signal = self._dip_trigger(quote)
         if signal is not None:
             return signal
-        return self._dip_trigger(quote)
+        return self._micro_trigger(quote)
 
     def _breadth_gate(self, breadth_value: Optional[float]) -> Tuple[str, float]:
         """Режим входа по ширине рынка (v1.13.0).
@@ -522,7 +545,10 @@ class TradingEngine:
                         self._cfg.scalp_time_stop_min):
                     continue
                 last_eval = self._scalp_last_local_eval.get(ticker, 0.0)
-                if now - last_eval < 8.0:
+                # Детектор полностью локальный и дешёвый: повторно оцениваем
+                # новый тик примерно раз в 2 сек, не расходуя токены ИИ.
+                # Groq отдельно ограничен пакетами до 3 бумаг раз в 4 минуты.
+                if now - last_eval < 2.0:
                     continue
                 # v1.14.0: сигнал даёт либо импульсный детектор, либо
                 # детектор остановившейся ямы (dip_reversal) - обе интуиции
@@ -532,6 +558,22 @@ class TradingEngine:
                     continue
                 self._scalp_last_local_eval[ticker] = now
                 self._scalp_trigger_cache[ticker] = signal
+                last_signal_log = self._scalp_local_signal_log_last.get(ticker, 0.0)
+                if now - last_signal_log >= 45.0:
+                    self._scalp_local_signal_log_last[ticker] = now
+                    if signal.get("micro_dip"):
+                        log.info(
+                            "Микрояма %s: масштаб %.0fс, глубина %.4f%%, отскок %.4f%%, "
+                            "потенциал %.4f%%, стакан %.2fx, score %.1f/100; "
+                            "кандидат передан в ограниченную AI-очередь",
+                            ticker, signal.get("dip_scale_sec", 0.0),
+                            signal.get("dip_drop_pct", 0.0), signal.get("off_low_pct", 0.0),
+                            signal.get("rebound_to_mean_pct", 0.0),
+                            signal.get("bid_ask_imbalance", 0.0),
+                            signal.get("bottom_score", 0.0))
+                    else:
+                        log.info("Микроструктурный сигнал %s: %s; кандидат передан в AI-очередь",
+                                 ticker, signal.get("kind", "micro_impulse"))
                 # _process_ticker запишет эту цену в историю один раз.
                 await self._process_ticker(ticker, current_price=price)
             except asyncio.CancelledError:
@@ -1155,7 +1197,7 @@ class TradingEngine:
     def max_tickers(self) -> int:
         """Лимит тикеров наблюдения; лимит открытых позиций проверяется отдельно."""
         if self.scalp_mode():
-            return int(getattr(self._cfg, "scalp_watchlist_max", 10) or 10)
+            return int(getattr(self._cfg, "scalp_watchlist_max", 15) or 15)
         return int(getattr(self._cfg, "max_tickers", 6) or 6)
 
     async def add_watchlist(self, ticker: str) -> str:
@@ -1715,6 +1757,10 @@ class TradingEngine:
                                   or micro.get("rebound_to_vwap_pct") or 0.0)
                 rank_score = 50.0 + max(-1.0, min(1.0, score)) * 20.0
                 rank_score += min(10.0, max(0.0, projected) * 100.0)
+                # Качество именно локального дна влияет на приоритет в batch:
+                # сильные свежие микроямы не теряются среди обычных импульсов.
+                rank_score += min(15.0, max(0.0, float(
+                    micro.get("bottom_score", 0.0) or 0.0)) * 0.15)
                 self._scalp_ai_queue[ticker] = {
                     "ticker": ticker,
                     "price": price,

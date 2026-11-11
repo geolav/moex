@@ -83,6 +83,41 @@ async def notify(_text: str) -> None:
 
 
 class ScalpEngineStreamTests(unittest.IsolatedAsyncioTestCase):
+    async def test_engine_dip_trigger_detects_a_shallow_local_bottom(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_config(tmp)
+            cfg.scalp_dip_enabled = True
+            cfg.scalp_dip_window_sec = 240
+            cfg.scalp_dip_min_drop_pct = 0.20
+            cfg.scalp_dip_stabilize_sec = 20
+            cfg.scalp_dip_min_imbalance = 1.15
+            cfg.scalp_round_trip_cost_pct = 0.01
+            cfg.slippage_pct = 0.0
+            cfg.scalp_micro_dip_min_drop_pct = 0.02
+            cfg.scalp_micro_dip_min_score = 48.0
+            state = StateStore(str(Path(tmp) / "state.json"),
+                               initial_overrides={"trading_enabled": True})
+            state.set_scalp_mode(True)
+            engine = TradingEngine(cfg, state, FakeStreamClient(),
+                                   FakeBatchAnalyst(), notify)
+            now = time.monotonic()
+            values = [100.08, 100.09, 100.10, 100.07, 100.04,
+                      100.01, 100.00, 100.005, 100.015, 100.025, 100.035]
+            price = values[-1]
+            quote = {
+                "price": price, "price_age_sec": 0.1, "book_age_sec": 0.2,
+                "bid": price - 0.005, "ask": price + 0.005,
+                "bid_volume": 2000, "ask_volume": 1000,
+                "spread_pct": 0.01, "book_consistent": True,
+                "ticks": [{"ts": now - len(values) + i, "price": value}
+                          for i, value in enumerate(values)],
+            }
+            signal = engine._dip_trigger(quote)
+            self.assertIsNotNone(signal)
+            self.assertEqual(signal["kind"], "dip_reversal")
+            self.assertEqual(signal["dip_scale_sec"], 12.0)
+            self.assertTrue(signal["micro_dip"])
+
     async def test_scalp_history_window_contains_required_closed_5m_candles(self):
         with tempfile.TemporaryDirectory() as tmp:
             state = StateStore(str(Path(tmp) / "state.json"),

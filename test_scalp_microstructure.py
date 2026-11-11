@@ -1,7 +1,8 @@
 import unittest
 
 from scalp_microstructure import (detect_dip_reversal_trigger,
-                                  detect_microstructure_trigger)
+                                  detect_microstructure_trigger,
+                                  detect_multiscale_dip_trigger)
 
 
 class MicrostructureTests(unittest.TestCase):
@@ -110,6 +111,62 @@ class DipReversalTests(unittest.TestCase):
         q = self.dip_quote()
         q["book_age_sec"] = 30
         self.assertIsNone(detect_dip_reversal_trigger(q, **self.base_kwargs()))
+
+
+class MultiscaleMicroDipTests(unittest.TestCase):
+    """v1.17.0: быстрые локальные ямы без фиксированного падения 0.20%."""
+
+    def quote(self, values=None, *, bid_volume=2000, ask_volume=1000,
+              spread_pct=0.01, price_age=0.1, book_age=0.2):
+        import time
+        values = values or [100.08, 100.09, 100.10, 100.07, 100.04,
+                            100.01, 100.00, 100.005, 100.015, 100.025, 100.035]
+        now = time.monotonic()
+        return {
+            "price": values[-1], "price_age_sec": price_age,
+            "book_age_sec": book_age, "bid": values[-1] - 0.005,
+            "ask": values[-1] + 0.005, "bid_volume": bid_volume,
+            "ask_volume": ask_volume, "spread_pct": spread_pct,
+            "book_consistent": True,
+            "ticks": [{"ts": now - len(values) + i, "price": value}
+                      for i, value in enumerate(values)],
+        }
+
+    def detect(self, quote):
+        return detect_multiscale_dip_trigger(
+            quote, max_spread_pct=0.1, round_trip_cost_pct=0.02)
+
+    def test_detects_small_dip_on_short_12s_scale(self):
+        signal = self.detect(self.quote())
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal["dip_scale_sec"], 12.0)
+        self.assertLess(signal["dip_drop_pct"], 0.20)
+        self.assertGreaterEqual(signal["bottom_score"], 48.0)
+
+    def test_does_not_buy_falling_knife(self):
+        values = [100.10, 100.09, 100.08, 100.07, 100.06, 100.05,
+                  100.04, 100.03, 100.02, 100.01, 100.00]
+        self.assertIsNone(self.detect(self.quote(values)))
+
+    def test_does_not_buy_if_recovery_cannot_cover_costs(self):
+        q = self.quote()
+        # Make the prior local reference too close to the current price
+        # relative to the round-trip cost.
+        values = [100.03, 100.031, 100.032, 100.030, 100.028,
+                  100.026, 100.025, 100.026, 100.027, 100.028, 100.029]
+        q.update(self.quote(values))
+        self.assertIsNone(detect_multiscale_dip_trigger(
+            q, max_spread_pct=0.1, round_trip_cost_pct=0.20))
+
+    def test_rejects_stale_quote_or_wide_spread(self):
+        q = self.quote(price_age=10.0)
+        self.assertIsNone(self.detect(q))
+        q = self.quote(spread_pct=0.2)
+        self.assertIsNone(self.detect(q))
+
+    def test_rejects_seller_dominated_order_book(self):
+        q = self.quote(bid_volume=500, ask_volume=2000)
+        self.assertIsNone(self.detect(q))
 
 
 if __name__ == "__main__":
