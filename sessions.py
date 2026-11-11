@@ -21,7 +21,6 @@ sessions.py - торговое время Мосбиржи и "утренний 
 """
 from __future__ import annotations
 
-import time
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 

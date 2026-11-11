@@ -25,20 +25,21 @@ scanner.py - сканер рынка Мосбиржи: раз в SCAN_INTERVAL_M
 слоты занимают лучшие кандидаты (до 10 бумаг; открытых позиций не более 8) - так бот торгует весь рынок,
 а не только ручной список.
 
-АВТОПОКУПКА (v1.7.1, SCAN_AUTO_BUY, переключение /autobuy): после отправки
-отчёта сканер передаёт лучших кандидатов движку (auto_buy_from_scan) - и тот
-может САМ купить до SCAN_AUTO_BUY_PER_SCAN бумаг за скан. Это НЕ обход
-проверок: каждый кандидат прогоняется через полный путь входа движка
-(порог сигнала, анти-погоня, новости, ИИ, лимиты, бюджет). Не прошёл -
-остаётся только в отчёте и watchlist.
+АВТОПОКУПКА (v1.7.1, SCAN_AUTO_BUY, переключение /autobuy): сканер передаёт
+лучших кандидатов движку (auto_buy_from_scan) - и тот может САМ купить до
+SCAN_AUTO_BUY_PER_SCAN бумаг за скан. Это НЕ обход проверок: каждый кандидат
+прогоняется через полный путь входа движка (порог сигнала, анти-погоня,
+новости, ИИ, лимиты, бюджет). Не прошёл - остаётся только в отчёте и
+watchlist.
+
+v1.15.0: фоновые сканы НЕ ПИШУТ в Telegram - полный отчёт уходит в журнал,
+а наружу приходит только сообщение о реальной покупке (тикер, объём, цена,
+повод). Полный отчёт с фото и кнопками - по ручному /scan.
 
 История бага v1.6.x (исправлено в v1.7.0): живые обороты читались из блока
 securities, где их НЕТ (они в marketdata), поэтому сканер всегда видел нули и
-писал "рынок не торгуется" даже в разгар торгового дня. Теперь:
-  - обороты живые; сообщение "торгов нет" приходит только когда биржа
-    РЕАЛЬНО не отдаёт оборотов, с точным временем и днём недели;
-  - такое сообщение в автоматическом режиме приходит не чаще одного раза
-    в 3 часа (раньше оно повторялось каждые 10 минут и заспамивало владельца).
+писал "рынок не торгуется" даже в разгар торгового дня. Теперь обороты живые,
+а с v1.15.0 это сообщение и вовсе не уходит в Telegram в фоновом режиме.
 
 Ручные покупки: кнопка «Купить ТИКЕР (по риску)» или /buy ТИКЕР без числа считают объём по риск-бюджету; /buy ТИКЕР ШТ задаёт точное количество,
 под автоторговлю - кнопка «Торгуй» или /watch ТИКЕР.
@@ -67,9 +68,8 @@ _SCAN_FAST_N = 24          # SMA fast = 2 часа; slow = 4 часа
 _SCAN_HISTORY_H = 8.0
 _MIN_CANDLES = 51          # max(2*24, 35) + 3 - как в TradingEngine
 
-#: "Рынок не торгуется": не чаще одного сообщения за столько секунд
-#: (3 часа), чтобы не спамить владельца каждые 10 минут.
-_CLOSED_NOTIFY_TTL_SEC = 3 * 3600
+# v1.15.0: TTL-константа "рынок не торгуется не чаще раза в 3 часа" удалена -
+# фоновые сканы больше не пишут в Telegram вообще (тихий режим).
 
 
 def _report_keyboard(top: List[Dict[str, Any]]):
@@ -126,11 +126,9 @@ class MarketScanner:
         self._stop_event = asyncio.Event()
         # Защита от наложения ручного /scan на фоновый проход.
         self._busy = asyncio.Lock()
-        # Когда последний раз отправляли сообщение "рынок не торгуется"
-        # (анти-спам: не чаще раза в 3 часа; на ручной /scan не влияет).
-        # -1e12 вместо 0.0: time.monotonic() на свежем сервере может быть
-        # меньше 3 часов, и нулевая заглушка задавила бы ПЕРВОЕ сообщение.
-        self._last_closed_notify: float = -1e12
+        # v1.15.0: фоновые сканы БОЛЬШЕ НЕ ПИШУТ в Telegram. Анти-спам
+        # "рынок не торгуется не чаще раза в 3 часа" больше не нужен:
+        # в тихом режиме это сообщение вообще не уходит наружу.
 
     # -------------------------------------------------------------- жизненный цикл
     def request_stop(self) -> None:
@@ -174,11 +172,17 @@ class MarketScanner:
     # ------------------------------------------------------------------ проход
     async def scan_once(self, *, manual: bool = False) -> str:
         """
-        Один проход сканера: отчёт + фото уходят в Telegram, текст возвращается.
+        Один проход сканера.
 
-        manual=True (команда /scan): то же самое, но занятый сканер отвечает
-        вежливым отказом вместо молчаливого пропуска, а сообщение "торгов
-        нет" приходит без анти-спам-подавления.
+        v1.15.0: фоновый скан (manual=False) МОЛЧИТ в Telegram - ни отчёта,
+        ни "рынок не торгуется", ни "кандидатов нет". Полный текст отчёта
+        пишется в журнал, а наружу уходит ТОЛЬКО сообщение о том, что бот
+        реально купил по итогам этого скана (какие акции, сколько, по какой
+        цене и кратко почему).
+
+        manual=True (команда /scan): полный отчёт с фото и кнопками - как
+        раньше; занятый сканер отвечает вежливым отказом вместо молчаливого
+        пропуска.
         """
         if self._busy.locked():
             if manual:
@@ -186,19 +190,29 @@ class MarketScanner:
             return ""
         async with self._busy:
             text, photos, top, ai_candidates = await self._scan_and_render()
-            # Ночной/праздничный "рынок не торгуется" в авто-режиме шлём
-            # не чаще раза в 3 часа (правка v1.7.0: не спамить каждые 10 мин).
-            if (not manual and text.startswith("😴")
-                    and (time.monotonic() - self._last_closed_notify)
-                    < _CLOSED_NOTIFY_TTL_SEC):
-                log.info("Сканер: рынок не торгуется - отчёт подавлен "
-                         "(недавно уже сообщал)")
+            if not manual:
+                # Тихий режим: отчёт живёт в логе, Telegram не тревожим.
+                # Ни отчёт, ни "рынок не торгуется" - только факт покупки.
+                log.info("Сканер: фоновый отчёт (в Telegram не отправляется):\n%s",
+                         text)
+                note = await self._maybe_auto_buy(ai_candidates, manual=False)
+                if note:
+                    try:
+                        await self._notify(note)
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("Сканер: не удалось отправить сводку "
+                                    "покупки: %s", exc)
                 return text
+            # Ручной /scan: полный отчёт как раньше.
             await self._deliver(text, photos, top)
-            if text.startswith("😴"):
-                self._last_closed_notify = time.monotonic()
             # v1.7.1: автопокупка - лучшего кандидата можно купить самому.
-            await self._maybe_auto_buy(ai_candidates, manual=manual)
+            note = await self._maybe_auto_buy(ai_candidates, manual=True)
+            if note:
+                try:
+                    await self._notify(note)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("Сканер: не удалось отправить сводку "
+                                "покупки: %s", exc)
             return text
 
     # ------------------------------------------------------------------ анализ
@@ -311,6 +325,36 @@ class MarketScanner:
                 "спред<=%g%%: %d, ATR: %d, издержки/R: %d, совместно прошло: %d; Groq не вызываю",
                 len(scored), min_rank, len(rank_ok), len(setup_ok),
                 max_spread_pct, len(spread_ok), len(atr_ok), len(cost_ok), len(eligible))
+        # v1.14.0: если строгие фильтры отсеяли ВСЕХ (типичный кейс из логов:
+        # "сканер не нашёл кандидатов, прошедших все фильтры, - Groq не
+        # вызывался"), отправляем ИИ до трёх лучших бумаг, прошедших только
+        # жёсткие ограничения безопасности: ликвидность/цена, свежий ATR и
+        # (в скальпе) узкий спред. Финальный отбор делает Groq, а не порог
+        # рейтинга: такие кандидаты помечены fallback_candidate=true, и ИИ
+        # знает, что локальные "мягкие" ворота их не подтвердили.
+        if (not ai_candidates and scored
+                and bool(getattr(cfg, "scan_empty_shortlist_fallback", True))):
+            def _hard_safe(row: Dict[str, Any]) -> bool:
+                if float(row.get("price") or 0.0) <= 0:
+                    return False
+                if not self._engine_scalp():
+                    return True
+                spread_val = row.get("spread_pct")
+                if spread_val is None or float(spread_val) > max_spread_pct:
+                    return False
+                return float(row.get("atr_pct") or 0.0) > 0
+            fallback_rows = [r for r in scored if _hard_safe(r)][
+                :max(1, int(getattr(cfg, "scan_ai_candidates", 3)))]
+            for r in fallback_rows:
+                r["fallback_candidate"] = True
+            if fallback_rows:
+                ai_candidates = fallback_rows
+                log.info(
+                    "Сканер: строгий shortlist пуст - включаю fallback: ИИ "
+                    "оценивает %d лучших безопасных бумаг (%s); окончательный "
+                    "отбор за ним",
+                    len(fallback_rows),
+                    ", ".join(str(r["ticker"]) for r in fallback_rows))
         if self._engine_scalp() and not sessions.can_open_scalp_entry(45):
             log.info("Сканер: новые скальп-входы запрещены временем/недостаточным "
                      "остатком сессии для 45-минутного горизонта; Groq не вызываю")
@@ -373,45 +417,56 @@ class MarketScanner:
         return text, photos, top, ai_candidates
 
     async def _maybe_auto_buy(self, top: List[Dict[str, Any]],
-                              *, manual: bool = False) -> None:
+                              *, manual: bool = False) -> Optional[str]:
         """Автопокупка кандидатов сканера (v1.7.1).
 
         Передаём тикеры из отчёта движку: каждый проходит полный путь
         входа, и движок может купить до SCAN_AUTO_BUY_PER_SCAN бумаг.
-        О покупке придёт обычное сообщение от движка; сюда - короткая
-        сводка, если что-то куплено.
+        О покупке движок пришлёт своё подробное сообщение; здесь собираем
+        КОРОТКУЮ сводку для владельца (v1.15.0): какие акции, сколько,
+        по какой цене и кратко почему. Возвращаем текст или None -
+        отправкой занимается scan_once.
         """
         # В скальпе заявки разрешены только после event-driven сигнала потока
         # и свежего AI batch; автопокупка от 10-минутного scanner snapshot
         # иначе обходит микроструктурный триггер и покупает запоздалую цену.
         if self._engine_scalp():
-            return
+            return None
         if not top or not _auto_buy_enabled(self._cfg, self._state):
-            return
+            return None
         method = getattr(self._engine, "auto_buy_from_scan", None)
         if method is None:   # тестовый/старый движок без автопокупки
-            return
+            return None
         candidates = [row["ticker"] for row in top]
         try:
             bought = await method(candidates)
         except Exception as exc:  # noqa: BLE001 - сканер обязан пережить сбой
             log.warning("Сканер: автопокупка не удалась (%s)", exc)
-            return
+            return None
         if not bought:
             log.info("Сканер: автопокупка - кандидаты проверки движка не "
                      "прошли (сигнал/ИИ/новости/лимиты)")
-            return
+            return None
         log.info("Сканер: сам купил по итогам скана: %s", ", ".join(bought))
+        # v1.15.0: сводка "что купил" с числами и коротким поводом.
+        lines: List[str] = []
+        for ticker in bought:
+            pos = dict(self._state.positions.get(ticker) or {})
+            lots = int(pos.get("lots", 0) or 0)
+            price = float(pos.get("entry_price", 0) or 0)
+            lot_size = self._client.get_lot_size(ticker) or 1
+            shares = lots * lot_size
+            setup = str(pos.get("setup") or "сигнал индикаторов")
+            conf = float(pos.get("llm_confidence", 0.0) or 0.0)
+            why = (f"сетап «{setup}», уверенность ИИ {conf:.0%}" if conf > 0
+                   else f"сетап «{setup}»")
+            lines.append(f"• {ticker}: {lots} лот(а) = {shares} шт "
+                         f"по {price:.2f} ₽ - {why}")
         scope = "ручного скана" if manual else "скана"
-        note = (f"🤖 Автопокупка по итогам {scope}: сам купил "
-                f"{', '.join(bought)} - сигнал, новости и вердикт ИИ "
-                f"сошлись. Подробности сделки - сообщением выше.")
-        try:
-            await self._notify(note)
-        except TypeError:
-            pass
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Сканер: не удалось отправить сводку автопокупки: %s", exc)
+        note = (f"🤖 Купил по итогам {scope}: "
+                f"{len(bought)} бумагу(и).\n" + "\n".join(lines)
+                + "\nПодробности по каждой сделке - сообщением выше.")
+        return note
 
     async def _deep_analyze(self, pool: List[Dict[str, Any]], *,
                             breadth_pct: Optional[float] = None
@@ -553,7 +608,6 @@ class MarketScanner:
                       verdicts: Dict[str, str],
                       scalp_note: str = "",
                       advice: str = "") -> str:
-        cfg = self._cfg
         stamp = time.strftime("%d.%m %H:%M")
         lines = [f"🔎 Сканер рынка {stamp} - топ {len(top)} кандидатов "
                  f"на покупку (сортировка - от более интересных к менее):"]

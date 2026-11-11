@@ -743,6 +743,14 @@ class AIAnalyst:
                 "day_change_pct": round(float(row.get("day_chg_pct") or 0.0), 2),
                 "bollinger_pct_b": round(float(bb.get("pct_b") or 0.0), 2)
                     if bb.get("pct_b") is not None else None,
+                # v1.14.0: какой локальный триггер породил кандидата
+                # (micro_impulse = импульс потока, dip_reversal = остановившаяся
+                # локальная яма) и был ли кандидат отправлен по fallback-
+                # правилу (строгий shortlist пуст, ИИ - последний фильтр).
+                "trigger": str(row.get("trigger_kind") or "")[:24]
+                    if scalp_mode else None,
+                "fallback_candidate": bool(row.get("fallback_candidate"))
+                    if row.get("fallback_candidate") is not None else None,
                 "microstructure": row.get("microstructure") if scalp_mode else None,
             })
         user = json.dumps({

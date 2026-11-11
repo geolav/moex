@@ -1,7 +1,5 @@
 """Безсетевой тест подписок и разбора T-Invest market-data stream."""
 import asyncio
-import sys
-import types
 import unittest
 from decimal import Decimal
 from types import SimpleNamespace

@@ -11,6 +11,7 @@ systemd). Никаких хардкодных токенов - только os.g
 """
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import math
@@ -231,6 +232,30 @@ class BotConfig:
     scalp_loss_pause_minutes: int
     scalp_stop_cooldown_min: int
     scalp_max_sector_positions: int
+    # --- Быстрый тейк «как у владельца» (v1.14.0) -----------------------------
+    # Продать ВСЁ, как только цена поднялась достаточно, чтобы быть в плюсе
+    # и покрыть круговые издержки (комиссия x2 + спред + проскальзывание)
+    # плюс небольшая маржа. Проверяется на каждом тике потока/охраны.
+    scalp_quick_tp_enabled: bool
+    scalp_quick_tp_margin_pct: float  # запас сверху издержек, п.п.
+    # --- Режим рынка и локальный микро-детектор (v1.13.0) ---------------------
+    market_breadth_riskoff_pct: float
+    # ниже этого breadth новые лонги запрещены (раньше был жёсткий 35%)
+    scalp_micro_min_ticks: int      # минимум изменений цены в окне детектора
+    scalp_micro_min_up_ratio: float  # доля uptick среди ненулевых тиков
+    scalp_micro_min_imbalance: float  # bid/ask дисбаланс стакана
+    scalp_micro_max_ret45_pct: float  # выше - уже «улетел», не догоняем
+    # --- Детектор «локальной ямы» (v1.14.0): разворот после провала -----------
+    scalp_dip_enabled: bool        # второй триггер потока: покупка остановившейся ямы
+    scalp_dip_window_sec: int      # окно поиска провала, сек
+    scalp_dip_min_drop_pct: float  # глубина провала от максимума окна, %
+    scalp_dip_stabilize_sec: int   # сколько сек без нового минимума = падение остановилось
+    scalp_dip_min_imbalance: float # bid/ask дисбаланс у дна ямы
+    # --- Правила «недоверия после убытков» (v1.14.0) --------------------------
+    # Пауза после 3 убытков подряд и повышенный порог после 2: по решению
+    # владельца правило по умолчанию ВЫКЛЮЧЕНО (мешало скальпу повторно
+    # заходить в ту же бумагу). MEMORY_LOSS_STREAK_GUARD=true включает снова.
+    memory_loss_streak_guard: bool
     # --- Сканер рынка (scanner.py) -------------------------------------------
     scan_enabled: bool            # фоновый поиск кандидатов раз в N минут
     scan_interval_min: int        # период сканирования рынка, минут
@@ -241,6 +266,7 @@ class BotConfig:
     scan_llm: bool                # пакетная оценка 2-3 лучших кандидатов (1 запрос на скан)
     scan_ai_candidates: int       # сколько лучших кандидатов отправлять ИИ за один запрос
     scan_min_candidate_rank: float  # минимальный математический рейтинг кандидата 0..100
+    scan_empty_shortlist_fallback: bool  # v1.14.0: пустой shortlist -> Groq всё равно получает лучших безопасных
     ai_batch_decision_ttl_sec: int  # срок действия пакетного вердикта ИИ
     ai_min_request_interval_sec: int  # защита от повторных /scan и лишних Groq-запросов
     ai_batch_required: bool       # запрет индивидуальных LLM-вызовов для автопокупок
@@ -373,11 +399,11 @@ def load_config() -> BotConfig:
                                      low=1, high=8),
         scalp_watchlist_max=_env_int("SCALP_WATCHLIST_MAX", 10, low=8, high=10),
         scalp_poll_sec=_env_int("SCALP_POLL_SEC", 300, low=60, high=3600),
-        scalp_exit_poll_sec=_env_int("SCALP_EXIT_POLL_SEC", 30,
-                                     low=10, high=300),
+        scalp_exit_poll_sec=_env_int("SCALP_EXIT_POLL_SEC", 10,
+                                     low=5, high=120),
         scalp_ai_min_request_interval_sec=_env_int(
             "SCALP_AI_MIN_REQUEST_INTERVAL_SEC", 240, low=120, high=1800),
-        scalp_cooldown_min=_env_int("SCALP_COOLDOWN_MIN", 20,
+        scalp_cooldown_min=_env_int("SCALP_COOLDOWN_MIN", 10,
                                     low=0, high=600),
         scalp_harvest_tiers=parse_harvest_tiers(
             _env_str("SCALP_HARVEST_TIERS", "2.0:0.4,3.0:0.25,5.0:0.15")),
@@ -416,26 +442,67 @@ def load_config() -> BotConfig:
         # безубыточная вероятность = (R+c)/(2R); при R>=4c она <= 62.5%.
         scalp_min_reward_cost_multiple=_env_float("SCALP_MIN_REWARD_COST_MULTIPLE", 4.0,
                                                   low=1.0, high=10.0),
-        scalp_time_stop_min=_env_int("SCALP_TIME_STOP_MIN", 45, low=5, high=240),
+        scalp_time_stop_min=_env_int("SCALP_TIME_STOP_MIN", 30, low=5, high=240),
         scalp_min_progress_r=_env_float("SCALP_MIN_PROGRESS_R", 0.3,
                                         low=0.0, high=2.0),
         scalp_loss_pause_minutes=_env_int("SCALP_LOSS_PAUSE_MIN", 60,
                                           low=5, high=360),
-        scalp_stop_cooldown_min=_env_int("SCALP_STOP_COOLDOWN_MIN", 120,
+        scalp_stop_cooldown_min=_env_int("SCALP_STOP_COOLDOWN_MIN", 45,
                                          low=30, high=1440),
         scalp_max_sector_positions=_env_int("SCALP_MAX_SECTOR_POSITIONS", 2,
                                             low=1, high=4),
+        # v1.14.0: быстрый тейк «как у владельца». Цель = круговые издержки
+        # (комиссия x2 + спред + проскальзывание) + маржа. Позиция продаётся
+        # ЦЕЛИКОМ на первом тике, когда плюс покрыл расходы на продажу.
+        scalp_quick_tp_enabled=_env_bool("SCALP_QUICK_TP", True),
+        scalp_quick_tp_margin_pct=_env_float("SCALP_QUICK_TP_MARGIN_PCT", 0.05,
+                                             low=0.0, high=1.0),
+        # v1.13.0: настраиваемый порог risk-off и пороги локального
+        # микро-детектора (см. scalp_microstructure.py). Порог 30% вместо
+        # прежнего жёсткого 35%: между 30% и 55% входы разрешены с половинным
+        # риском, полностью запрещены только ниже порога.
+        market_breadth_riskoff_pct=_env_float("MARKET_BREADTH_RISKOFF_PCT", 30.0,
+                                              low=20.0, high=45.0),
+        scalp_micro_min_ticks=_env_int("SCALP_MICRO_MIN_TICKS", 6,
+                                       low=4, high=20),
+        scalp_micro_min_up_ratio=_env_float("SCALP_MICRO_MIN_UP_RATIO", 0.55,
+                                            low=0.50, high=0.90),
+        scalp_micro_min_imbalance=_env_float("SCALP_MICRO_MIN_IMBALANCE", 1.10,
+                                             low=1.0, high=3.0),
+        scalp_micro_max_ret45_pct=_env_float("SCALP_MICRO_MAX_RET45_PCT", 0.45,
+                                             low=0.10, high=2.0),
+        # v1.14.0: детектор «локальной ямы» (dip_reversal). Он ловит вторую
+        # интуицию владельца: свежий провал, падение остановилось, покупатели
+        # перевешивают у дна - отскок к VWAP окна обязан покрыть издержки.
+        scalp_dip_enabled=_env_bool("SCALP_DIP_ENABLED", True),
+        scalp_dip_window_sec=_env_int("SCALP_DIP_WINDOW_SEC", 240,
+                                      low=60, high=900),
+        scalp_dip_min_drop_pct=_env_float("SCALP_DIP_MIN_DROP_PCT", 0.20,
+                                          low=0.05, high=2.0),
+        scalp_dip_stabilize_sec=_env_int("SCALP_DIP_STABILIZE_SEC", 20,
+                                         low=5, high=120),
+        scalp_dip_min_imbalance=_env_float("SCALP_DIP_MIN_IMBALANCE", 1.15,
+                                           low=1.0, high=3.0),
+        # v1.14.0: правило «после убытков бумаге не доверяем» по умолчанию
+        # выключено (просьба владельца; в скальпе оно не работало в любом
+        # случае). MEMORY_LOSS_STREAK_GUARD=true возвращает прежнее поведение.
+        memory_loss_streak_guard=_env_bool("MEMORY_LOSS_STREAK_GUARD", False),
         scan_enabled=_env_bool("SCAN_ENABLED", True),
         scan_interval_min=_env_int("SCAN_INTERVAL_MIN", 10, low=5, high=1440),
         scan_min_turnover=_env_float("SCAN_MIN_TURNOVER_MLN", 50.0,
                                      low=0.0, high=1e12),
         scan_min_price=_env_float("SCAN_MIN_PRICE", 5.0, low=0.0, high=1e9),
         scan_deep_n=_env_int("SCAN_DEEP_N", 20, low=5, high=60),
-        scan_report_top=_env_int("SCAN_REPORT_TOP", 6, low=3, high=10),
+        scan_report_top=_env_int("SCAN_REPORT_TOP", 4, low=3, high=10),
         scan_llm=_env_bool("SCAN_LLM", True),
         scan_ai_candidates=_env_int("SCAN_AI_CANDIDATES", 3, low=1, high=3),
         scan_min_candidate_rank=_env_float("SCAN_MIN_CANDIDATE_RANK", 48.0,
                                            low=0.0, high=100.0),
+        # v1.14.0: если после всех локальных фильтров shortlist пуст, ИИ
+        # всё равно получает до 3 лучших бумаг, прошедших жёсткие
+        # ограничения безопасности (ликвидность/спред/ATR). Финальный
+        # отбор делает Groq, а не порог рейтинга.
+        scan_empty_shortlist_fallback=_env_bool("SCAN_EMPTY_SHORTLIST_FALLBACK", True),
         ai_batch_decision_ttl_sec=_env_int("AI_BATCH_DECISION_TTL_SEC", 900,
                                            low=60, high=1800),
         ai_min_request_interval_sec=_env_int("AI_MIN_REQUEST_INTERVAL_SEC", 600,
@@ -498,11 +565,22 @@ class StateStore:
         "stop_cooldowns": {},     # тикер -> unix-ts запрета входа после стопа
         "scalp_pause_until": 0,   # глобальная пауза после серии убыточных скальпов
         "realized_pnl_today": {"date": "", "value": 0.0},
+        # v1.15.0: журнал СДЕЛОК за сегодня (по московской полуночи). Единый
+        # источник счётчика "сколько сделок сегодня" для /stats, /status,
+        # /memory и дневного стопа. last_actions держит всего 3 строки и
+        # для подсчёта сделок не годился (отсюда "0 сделок, но -200 ₽").
+        "trade_journal": [],      # [{date, ts, ticker, side, lots, price, pnl?}]
     }
 
     def __init__(self, path: str, initial_overrides: Optional[Dict[str, Any]] = None):
         self._path = path
-        self._data: Dict[str, Any] = dict(self._DEFAULTS)
+        # v1.13.0: глубокая копия дефолтов. dict() поверхностный, и все
+        # изменяемые значения (_DEFAULTS: positions, stop_cooldowns,
+        # price_history...) были ОДНИМ объектом на весь процесс: данные одного
+        # StateStore протекали во все остальные (кулдаун стопа SBER из одного
+        # теста блокировал вход в новом state; в проде - латентная мина при
+        # втором экземпляре StateStore).
+        self._data: Dict[str, Any] = copy.deepcopy(self._DEFAULTS)
         self._load(initial_overrides)
 
     # --- внутреннее ---------------------------------------------------------
@@ -607,6 +685,68 @@ class StateStore:
         }
         self.save()
         return current + float(amount)
+
+    # --- журнал сделок за сегодня (v1.15.0) ------------------------------------
+    #: Сколько последних событий сделки держать в журнале дня.
+    TRADE_JOURNAL_MAX = 200
+
+    def record_trade_event(self, ticker: str, side: str, lots: int,
+                           price: float,
+                           pnl: Optional[float] = None) -> None:
+        """Записывает РЕАЛЬНО исполненную сделку в журнал дня.
+
+        Вызывается движком после подтверждения исполнения брокером
+        (покупка, продажа, частичная продажа). pnl пишется только для
+        полного закрытия позиции. Журнал чистится по московской полуночи,
+        поэтому счётчик "сделок за сегодня" всегда совпадает с фактом.
+        """
+        today = _trading_date_msk()
+        journal = [e for e in (self._data.get("trade_journal") or [])
+                   if isinstance(e, dict) and e.get("date") == today]
+        event: Dict[str, Any] = {
+            "date": today,
+            "ts": round(time.time(), 1),
+            "ticker": str(ticker or "").upper(),
+            "side": "buy" if side == "buy" else "sell",
+            "lots": int(lots or 0),
+            "price": round(float(price or 0.0), 4),
+        }
+        if pnl is not None:
+            event["pnl"] = round(float(pnl), 2)
+        journal.append(event)
+        del journal[:-self.TRADE_JOURNAL_MAX]
+        self._data["trade_journal"] = journal
+        self.save()
+
+    def trades_today(self, side: Optional[str] = None) -> List[Dict[str, Any]]:
+        """События сделок за сегодня (опционально только buy или только sell)."""
+        today = _trading_date_msk()
+        rows = [e for e in (self._data.get("trade_journal") or [])
+                if isinstance(e, dict) and e.get("date") == today]
+        if side:
+            rows = [e for e in rows if e.get("side") == side]
+        return rows
+
+    def trades_today_count(self, side: Optional[str] = None) -> int:
+        """Сколько сделок реально исполнено сегодня (по журналу)."""
+        return len(self.trades_today(side))
+
+    def day_result_line(self) -> str:
+        """ЕДИНАЯ строка дневного результата для всех сообщений (v1.15.0).
+
+        Раньше /status, /memory и движок брали число из трёх разных мест
+        (state, память сделок, счётчик покупок) - цифры расходились.
+        Теперь везде один источник: state.realized_pnl_today() и журнал
+        сделок - те же значения, по которым работает дневной стоп."""
+        pnl = self.realized_pnl_today()
+        buys = self.trades_today_count("buy")
+        sells = self.trades_today_count("sell")
+        deals = buys + sells
+        deals_txt = f"{deals} сделк" + (
+            "а" if deals % 10 == 1 and deals % 100 != 11 else
+            "и" if 2 <= deals % 10 <= 4 and not 12 <= deals % 100 <= 14 else "")
+        return (f"реализовано сегодня {pnl:+.0f} ₽ по {deals_txt} "
+                f"(покупок {buys}, продаж {sells})")
 
     # --- журнал действий и аудит -----------------------------------------------
     def record_action(self, text: str) -> None:

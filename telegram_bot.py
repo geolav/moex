@@ -75,7 +75,7 @@ import predictor
 
 log = logging.getLogger("telegram")
 
-VERSION = "1.12.0"
+VERSION = "1.15.0"
 
 HELP_TEXT = (
     "Команды (можно не печатать - жмите кнопки на клавиатуре ниже чата):\n"
@@ -84,7 +84,7 @@ HELP_TEXT = (
     "/charts - графики всех моих бумаг (2 фото, по 3 графика)\n"
     "/stats - статистика и график по акциям за 6 часов\n"
     "/stats 12 - то же за 12 часов (можно 1-48)\n"
-    "/scan - сканер рынка прямо сейчас: топ кандидатов на покупку\n"
+    "/scan - сканер рынка прямо сейчас: топ-4 кандидата с графиками\n"
     "/predict SBER 6 - прогноз цены на 6 ч: график + текст (можно 1-24 ч)\n"
     "/buy SBER 100 - купить вручную (тикер и штуки, не лоты)\n"
     "/sell GAZP 30 - продать вручную (без числа - продать всё)\n"
@@ -260,6 +260,8 @@ def create_router(ctx: AppContext) -> Router:
                  if ctx.state.scalp_mode else "")
         # v1.7.1: приветствие и справка РАЗДЕЛЬНО - справка (~7 тыс. символов)
         # не влезает в лимит Telegram 4096, из-за чего /start падал целиком.
+        # v1.14.0: позиции теперь проверяются каждые 5-10 секунд отдельно от
+        # полных входных циклов.
         greeting = (
             f"🤖 Бот-трейдер для Мосбиржи (v{VERSION})\n"
             f"Режим: {mode}\n"
@@ -268,7 +270,8 @@ def create_router(ctx: AppContext) -> Router:
             f"ИИ-аудитор: {auditor}\n"
             f"{balance_line}\n"
             f"Слежу за: {', '.join(ctx.engine.watchlist())} "
-            f"(проверка каждые {ctx.config.poll_interval_sec // 60} мин)\n"
+            f"(входы: раз в {ctx.config.poll_interval_sec // 60} мин; "
+            f"позиции: каждые {max(5, int(ctx.config.scalp_exit_poll_sec))} сек)\n"
             f"Работаю уже: {uptime}\n\n"
             "Команды можно не печатать - жмите кнопки на клавиатуре ниже "
             "или синюю кнопку «Меню» слева от поля ввода. Полная справка "
@@ -349,7 +352,21 @@ def create_router(ctx: AppContext) -> Router:
 
         if ctx.memory is not None:
             try:
-                parts.append(f"\n🧠 Память сделок: {ctx.memory.short_line()}.")
+                today_pnl = None
+                pnl_getter = getattr(ctx.state, "realized_pnl_today", None)
+                if callable(pnl_getter):
+                    today_pnl = pnl_getter()
+                parts.append("\n🧠 Память сделок: "
+                             + ctx.memory.short_line(today_pnl=today_pnl) + ".")
+            except Exception:  # noqa: BLE001
+                pass
+        # v1.15.0: единая строка дневного результата (state: реализованный
+        # P&L + журнал сделок). ТЕ ЖЕ цифры, по которым работает дневной
+        # стоп, - раньше /status, /memory и движок писали разные суммы.
+        day_line_getter = getattr(ctx.state, "day_result_line", None)
+        if callable(day_line_getter):
+            try:
+                parts.append(f"📈 Результат дня: {day_line_getter()}.")
             except Exception:  # noqa: BLE001
                 pass
 
@@ -674,7 +691,24 @@ def create_router(ctx: AppContext) -> Router:
             await message.answer(
                 "Память сделок не подключена (LEARNING=False в настройках).")
             return
-        await _answer_long(message, ctx.memory.summary_text())
+        # v1.15.0: дневной результат и число сделок - из state (единый
+        # источник с дневным стопом), память показывает только свою статистику.
+        today_pnl = None
+        today_deals = None
+        pnl_getter = getattr(ctx.state, "realized_pnl_today", None)
+        if callable(pnl_getter):
+            try:
+                today_pnl = pnl_getter()
+            except Exception:  # noqa: BLE001
+                today_pnl = None
+        cnt_getter = getattr(ctx.state, "trades_today_count", None)
+        if callable(cnt_getter):
+            try:
+                today_deals = cnt_getter()
+            except Exception:  # noqa: BLE001
+                today_deals = None
+        await _answer_long(message, ctx.memory.summary_text(
+            today_pnl=today_pnl, today_deals=today_deals))
 
     # --------------------------------------------------------- /reset_memory
     @router.message(Command("reset_memory"))
@@ -783,6 +817,10 @@ def create_router(ctx: AppContext) -> Router:
                 text=f"💸 Продать {ticker}", callback_data=f"sell:{ticker}")])
         parts.append("Продать можно кнопкой под этим сообщением или "
                      "командой /sell ТИКЕР ШТ (без числа - продаст всё).")
+        parts.append("«Продавать можно» считается с комиссией за продажу "
+                     "и по тому же порогу, по которому скальп-режим продаёт "
+                     "сам: издержки круга (комиссия ×2 + спред + "
+                     "проскальзывание) + небольшая маржа.")
         await message.answer("\n".join(parts),
                              reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
@@ -1057,16 +1095,19 @@ def create_router(ctx: AppContext) -> Router:
                 f"(текущий: {', '.join(ctx.engine.watchlist())}) - "
                 f"лишние уберите: /unwatch ТИКЕР.\n"
                 f"• Открытые позиции продолжаю охранять до закрытия "
-                f"(стопы/тейки/фиксация прибыли работают).\n"
-                f"• Интервалы снова обычные: цикл каждые "
+                f"(стопы/тейки/фиксация прибыли работают, проверка цены "
+                f"каждые {max(5, int(ctx.config.scalp_exit_poll_sec))} сек).\n"
+                f"• Входы снова по полному циклу: каждые "
                 f"{ctx.config.poll_interval_sec // 60} мин.")
             return
         # Лимит вложенности не повышается автоматически: в скальпе он
         # дополнительно ограничен 70% equity и 15% номинала на бумагу.
         cap_note = (f"• Лимит вложенности {min(ctx.state.max_invested_pct(), 70)}% equity; "
                     "автоматически не повышается.\n")
+        quick_target = (float(ctx.config.scalp_round_trip_cost_pct)
+                        + float(ctx.config.scalp_quick_tp_margin_pct))
         await message.answer(
-            "⚡ СКАЛЬП-РЕЖИМ ВКЛЮЧЁН — строгие правила входа и выхода:\n"
+            "⚡ СКАЛЬП-РЕЖИМ ВКЛЮЧЁН — правила входа и выхода:\n"
             f"• максимум {ctx.config.scalp_max_positions} позиции одновременно, "
             f"{ctx.config.scalp_max_entries_per_day} входов в день;\n"
             f"• риск на сделку {ctx.config.scalp_risk_per_trade_pct:.2f}% equity, "
@@ -1075,10 +1116,21 @@ def create_router(ctx: AppContext) -> Router:
             f"• ATR-стоп clamp({ctx.config.scalp_atr_multiplier:.1f}×ATR, "
             f"{ctx.config.scalp_min_stop_pct:.1f}–{ctx.config.scalp_max_stop_pct:.1f}%), "
             f"TP1=1R с частичной фиксацией, остаток — 2R/ATR-трейлинг;\n"
+            f"• БЫСТРЫЙ ТЕЙК: продаю позицию ЦЕЛИКОМ при "
+            f"+{quick_target:.2f}% (издержки круга + маржа) — как только плюс "
+            f"покрыл комиссию за продажу; цена пингуется каждые "
+            f"{max(5, int(ctx.config.scalp_exit_poll_sec))} сек;\n"
+            f"• ВХОДЫ: два локальных детектора — микро-импульс потока и "
+            f"остановившаяся «локальная яма» (dip_reversal); Groq подтверждает "
+            f"шорт-лист пакетом не чаще 1 раза в "
+            f"{ctx.config.scalp_ai_min_request_interval_sec // 60} мин;\n"
             f"• тайм-стоп {ctx.config.scalp_time_stop_min} мин; входы только "
             "10:15–18:20 МСК; спред ≤0.10%;\n"
-            f"• после стопа пауза по бумаге {ctx.config.scalp_stop_cooldown_min} мин; "
-            f"после 2 убытков — пауза {ctx.config.scalp_loss_pause_minutes} мин;\n"
+            f"• правило «после убытков бумаге не доверяем» ВЫКЛЮЧЕНО; после "
+            f"стопа пауза по бумаге {ctx.config.scalp_stop_cooldown_min} мин;\n"
+            f"• ручные покупки (/buy) сопровождаю ровно так же: быстрый тейк, "
+            f"стоп, опрос цены каждые "
+            f"{max(5, int(ctx.config.scalp_exit_poll_sec))} сек;\n"
             f"{cap_note}"
             "При отсутствии свежего ATR/спреда или ответа Groq бот не открывает сделку. "
             "Выключить: /scalp off")
@@ -1299,28 +1351,33 @@ async def _stats_text(ctx: AppContext, hours: float) -> Tuple[str, list]:
                 f"полчаса-час, данных наберётся.", series)
 
     if trades_in_window is not None:
-        lines.append(f"\nСделок за период: {trades_in_window}.")
+        lines.append(f"\nСделок исполнено: {trades_in_window} "
+                     "(журнал сделок ведётся с полуночи по Москве).")
     lines.append("\nГрафик цен прикладываю картинкой выше "
                  "(пунктиром - цена вашей покупки, если позиция открыта).")
     return "\n".join(lines), series
 
 
 def _count_trades_in_window(ctx: AppContext, hours: float) -> Optional[int]:
-    """Считает сделки (купл.../прода...) из last_actions за окно часов."""
-    cutoff = time.time() - hours * 3600
-    year = time.strftime("%Y")
-    count = 0
-    try:
-        for action in ctx.state.last_actions:
-            # Формат строки: "DD.MM HH:MM: текст"
-            head = action.split(":", 1)[0]
-            stamp = datetime.strptime(f"{year} {head}", "%Y %d.%m %H:%M")
-            if stamp.timestamp() >= cutoff and (
-                    "Купил" in action or "Продал" in action):
-                count += 1
-    except ValueError:
+    """Сколько сделок реально исполнено за окно часов (v1.15.0).
+
+    Раньше сделки считали по строкам last_actions ("Купил..."/"Продал..."),
+    но там хранится всего 3 последних события - почти всегда отвечало
+    "0 сделок", даже когда сегодня уже были закрытые сделки с минусом.
+    Теперь считаем по журналу сделок движка (state.trade_journal): запись
+    добавляется после подтверждения исполнения брокером, один источник
+    с /status, /memory и дневным стопом. Журнал ведётся с полуночи МСК,
+    поэтому для окна больше суток это число сделок СЕГОДНЯ."""
+    counter = getattr(ctx.state, "trades_today", None)
+    if not callable(counter):
         return None
-    return count
+    try:
+        events = counter()
+    except Exception:  # noqa: BLE001 - статистика не должна ломать /stats
+        return None
+    cutoff = time.time() - hours * 3600
+    return len([e for e in events
+                if float(e.get("ts", 0) or 0) >= cutoff])
 
 
 def _render_chart(series: List[Tuple[str, list]], hours: float,
@@ -1514,12 +1571,15 @@ async def _balance_line(ctx: AppContext) -> str:
 
 
 async def _position_pnl_line(ctx: AppContext, ticker: str, pos: dict) -> str:
-    """Для /positions и /status: '+0.9% (+129 ₽)' по позиции.
+    """Для /positions и /status: результат позиции с учётом комиссии.
 
-    v1.7.2: если живой цены нет (тикер ещё не подключён к работе), берём
-    последнюю сохранённую точку из своей истории цен - раньше у таких бумаг
-    строка результата молча пропадала, и казалось, что бот не следит за
-    позицией.
+    v1.15.0: раньше строка показывала ГРУБЫЙ процент (цена/покупка - 1),
+    и было непонятно, можно ли продавать в плюс после комиссии за продажу.
+    Теперь рядом: брутто-результат, результат ЧИСТЫМИ после оценки
+    издержек продажи (половина круговых издержек позиции: комиссия +
+    спред/проскальзывание на выход) и вердикт с порогом бота - тем же,
+    по которому скальп-режим продаёт сам (быстрый тейк = издержки круга +
+    маржа). Так владелец сразу видит: продажа уже в плюсе или рано.
     """
     try:
         price = None
@@ -1534,12 +1594,46 @@ async def _position_pnl_line(ctx: AppContext, ticker: str, pos: dict) -> str:
         entry = float(pos.get("entry_price", 0) or 0)
         if not price or entry <= 0:
             return ""
-        pnl_pct = (price / entry - 1.0) * 100.0
+        lots = int(pos.get("lots", 0) or 0)
         lot_size = ctx.client.get_lot_size(ticker) or 1
-        pnl_rub = (price - entry) * int(pos.get("lots", 0)) * lot_size
+        shares = lots * lot_size
+        pnl_pct = (price / entry - 1.0) * 100.0
+        pnl_rub = (price - entry) * shares
+        # Издержки продажи: половина оценочных круговых издержек позиции
+        # (вторая половина - покупка). Для legacy-позиций без поля -
+        # дефолт конфига.
+        round_trip = float(
+            pos.get("scalp_expected_round_trip_cost_pct")
+            or pos.get("scalp_round_trip_cost_pct")
+            or pos.get("estimated_round_trip_cost_pct")
+            or getattr(ctx.config, "scalp_round_trip_cost_pct", 0.1) or 0.0)
+        round_trip = max(0.0, round_trip)
+        sell_cost_pct = round_trip / 2.0
+        net_pct = pnl_pct - sell_cost_pct
+        net_rub = pnl_rub - (entry * shares * sell_cost_pct / 100.0)
         pnl_str = f"{abs(pnl_rub):,.0f}".replace(",", " ")
-        return (f", сейчас {price:.2f} ₽ → {pnl_pct:+.1f}% "
-                f"({'+' if pnl_rub >= 0 else '−'}{pnl_str} ₽)")
+        net_str = f"{abs(net_rub):,.0f}".replace(",", " ")
+        margin = float(getattr(ctx.config, "scalp_quick_tp_margin_pct", 0.05) or 0.0)
+        bot_target = round_trip + margin
+        target_price = entry * (1.0 + bot_target / 100.0)
+        if pnl_pct >= bot_target:
+            verdict = (f"✅ продавать можно: чистыми ~{net_pct:+.2f}% "
+                       f"({('+' if net_rub >= 0 else '−')}{net_str} ₽) после "
+                       f"комиссии за продажу; бот продал бы и сам "
+                       f"(его порог +{bot_target:.2f}% ≈ {target_price:.2f} ₽)")
+        elif net_pct > 0:
+            verdict = (f"🟡 продажа уже покрывает комиссию (чистыми ~"
+                       f"{net_pct:+.2f}%), но бот ждёт свой порог "
+                       f"+{bot_target:.2f}% ≈ {target_price:.2f} ₽")
+        else:
+            gap = bot_target - pnl_pct
+            verdict = (f"⏳ продавать рано: после комиссии за продажу "
+                       f"пока {net_pct:+.2f}% "
+                       f"({('+' if net_rub >= 0 else '−')}{net_str} ₽); до "
+                       f"порога бота +{bot_target:.2f}% не хватает "
+                       f"{gap:.2f} п.п. (цена ≥ {target_price:.2f} ₽)")
+        return (f", сейчас {price:.2f} ₽ → брутто {pnl_pct:+.2f}% "
+                f"({'+' if pnl_rub >= 0 else '−'}{pnl_str} ₽). {verdict}")
     except Exception:  # noqa: BLE001 - статус не должен падать из-за цены
         return ""
 

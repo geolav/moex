@@ -113,8 +113,21 @@ def make_test_config(tmp: str) -> BotConfig:
         scalp_time_stop_min=45, scalp_min_progress_r=0.3,
         scalp_loss_pause_minutes=60, scalp_stop_cooldown_min=120,
         scalp_max_sector_positions=2,
+        # v1.13.0: порог risk-off и пороги микро-детектора (обязательны:
+        # None вместо числа ломает вход - см. комментарий выше про все поля).
+        market_breadth_riskoff_pct=30.0,
+        scalp_micro_min_ticks=6, scalp_micro_min_up_ratio=0.55,
+        scalp_micro_min_imbalance=1.10, scalp_micro_max_ret45_pct=0.45,
+        # v1.14.0: быстрый тейк, детектор ямы, отключённый пакет недоверия,
+        # фолбэк сканера (обязательны: None ломает вход/выход).
+        scalp_quick_tp_enabled=True, scalp_quick_tp_margin_pct=0.05,
+        scalp_dip_enabled=True, scalp_dip_window_sec=240,
+        scalp_dip_min_drop_pct=0.20, scalp_dip_stabilize_sec=20,
+        scalp_dip_min_imbalance=1.15,
+        memory_loss_streak_guard=False,
+        scan_empty_shortlist_fallback=True,
         scan_enabled=False, scan_interval_min=10, scan_min_turnover=50.0,
-        scan_min_price=5.0, scan_deep_n=20, scan_report_top=6, scan_llm=False,
+        scan_min_price=5.0, scan_deep_n=20, scan_report_top=4, scan_llm=False,
         scan_ai_candidates=3, scan_min_candidate_rank=48.0,
         ai_batch_decision_ttl_sec=900, ai_min_request_interval_sec=600,
         ai_batch_required=False,
@@ -162,7 +175,6 @@ class FakeClient:
     async def get_candles_history(self, ticker: str, hours_back: float,
                                   step_h: float = 1.0) -> list[tuple[float, float]]:
         """Закрытые свечи: плоско ~252, в конце откат до 250 - цена ниже SMA."""
-        count = max(10, min(400, int(float(hours_back) / max(step_h, 1e-9) * 1.5) + 3))
         now = time.time()
         # Детерминированная история с умеренным восстановлением и откатом;
         # RSI не экстремальный, MACD перестал ухудшаться, цена не у локального хая.
@@ -219,6 +231,15 @@ class FakeClient:
         return {"order_id": f"sell-{len(self.sells)}", "status": 4,
                 "lots_executed": lots, "requested_lots": lots}
 
+    async def get_market_snapshot(self) -> list[dict]:
+        """Снимок MOEX ISS для сканера: две ликвидные бумаги (v1.15.0)."""
+        return [
+            {"ticker": "SBER", "price": self.price, "turnover": 5e8,
+             "day_chg_pct": 0.4, "spread_pct": 0.05},
+            {"ticker": "LKOH", "price": self.price, "turnover": 3e8,
+             "day_chg_pct": -0.2, "spread_pct": 0.06},
+        ]
+
 
 class FakeAnalyst:
     """Позитивный сентимент; вердикт трейдера задаётся вручную."""
@@ -245,7 +266,7 @@ class FakeAnalyst:
 
 async def main() -> int:
     print("=" * 64)
-    print("DRY-RUN самопроверка MOEX Trading Bot v1.12.0 (моки, без сети)")
+    print("DRY-RUN самопроверка MOEX Trading Bot v1.15.0 (моки, без сети)")
     print("=" * 64)
 
     tmp = tempfile.mkdtemp(prefix="bot_dryrun_")
@@ -564,12 +585,17 @@ async def main() -> int:
     check("ИИ не опрашивался для разрешения стопа", stop_analyst.market_calls == 0)
 
     # --- Тест 13: скальп TP1/2R и P&L всей позиции ------------------------------
+    # v1.14.0: при включённом по умолчанию быстром тейке (SCALP_QUICK_TP=true)
+    # позиция продаётся целиком уже при издержки+маржа (+0.15%), поэтому сам
+    # TP1/2R-лестницу проверяем на конфиге с выключенным быстрым тейком
+    # (SCALP_QUICK_TP=false) - это сохраняет оба сценария.
     print("\n[13] Скальп: TP1 половиной, перенос стопа, остаток закрывается на 2R")
+    no_quick_cfg = dataclasses.replace(cfg, scalp_quick_tp_enabled=False)
     scalp_state = StateStore(os.path.join(tmp, "scalp_partial_state.json"),
                              initial_overrides={"trading_enabled": True})
     scalp_state.set_scalp_mode(True)
     scalp_client = FakeClient()
-    scalp_engine = TradingEngine(cfg, scalp_state, scalp_client, FakeAnalyst(), notify)
+    scalp_engine = TradingEngine(no_quick_cfg, scalp_state, scalp_client, FakeAnalyst(), notify)
     scalp_position = {"lots": 4, "initial_lots": 4, "realized_lots": 0,
                       "realized_exit_value": 0.0, "entry_price": 100.0,
                       "entry_epoch": time.time(), "entry_ts": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -612,7 +638,7 @@ async def main() -> int:
                              initial_overrides={"trading_enabled": True})
     timed_state.set_scalp_mode(True)
     timed_client = FakeClient()
-    timed_engine = TradingEngine(cfg, timed_state, timed_client, FakeAnalyst(), notify)
+    timed_engine = TradingEngine(no_quick_cfg, timed_state, timed_client, FakeAnalyst(), notify)
     timed_pos = {"lots": 1, "initial_lots": 1, "entry_price": 100.0,
                  "entry_epoch": time.time() - 46 * 60, "max_price": 100.0,
                  "scalp_managed": True, "scalp_risk_pct": 0.6,
@@ -1026,7 +1052,7 @@ async def main() -> int:
                                initial_overrides={"trading_enabled": True})
     max_age_state.set_scalp_mode(True)
     max_age_client = FakeClient()
-    max_age_engine = TradingEngine(cfg, max_age_state, max_age_client, FakeAnalyst(), notify)
+    max_age_engine = TradingEngine(no_quick_cfg, max_age_state, max_age_client, FakeAnalyst(), notify)
     old_but_profitable = {"lots": 1, "initial_lots": 1, "entry_price": 100.0,
                           "entry_epoch": time.time() - 50 * 60,
                           "scalp_managed": True, "scalp_risk_pct": 0.8,
@@ -1119,10 +1145,352 @@ async def main() -> int:
                     "llm_confidence": 0.8,
                     "scalp_session_key": "2026-11-09:main"}
     rollover_state.set_position("VTBR", rollover_pos)
-    await rollover_engine._check_scalp_exit("VTBR", 100.1, rollover_pos)
+    # Детерминизм (урок v1.10.1): тест раньше зависел от времени суток -
+    # вне торгового окна sessions.scalp_session_key() возвращал None и
+    # закрытие не срабатывало (в архиве chatgpt v1.12.0 тест был красным).
+    orig_session_key = sessions.scalp_session_key
+    sessions.scalp_session_key = lambda *a, **k: "2026-11-11:main"
+    try:
+        await rollover_engine._check_scalp_exit("VTBR", 100.1, rollover_pos)
+    finally:
+        sessions.scalp_session_key = orig_session_key
     check("разница session key вызывает закрытие до переноса позиции",
           "VTBR" not in rollover_state.positions
           and rollover_client.sells == [("VTBR", 1)])
+
+    # --- Test 34 (v1.13.0): настраиваемый risk-off по breadth -----------------
+    print("\n[34] v1.13.0: breadth-гейт настраивается, нейтральная зона x0.5")
+    gate_engine = TradingEngine(
+        cfg, StateStore(os.path.join(tmp, "gate_state.json"),
+                        initial_overrides={"trading_enabled": True}),
+        FakeClient(), FakeAnalyst(), notify)
+    check("breadth 25% ниже порога 30 - risk-off блок",
+          gate_engine._breadth_gate(25.0) == ("blocked", 0.0))
+    check("breadth 31.9% (кейс из лога 10.11) теперь нейтральная зона x0.5",
+          gate_engine._breadth_gate(31.9) == ("neutral", 0.5))
+    check("breadth 60% - открытый рынок, полный риск",
+          gate_engine._breadth_gate(60.0) == ("open", 1.0))
+    check("breadth неизвестен - входы не блокируем (fail-open как раньше)",
+          gate_engine._breadth_gate(None) == ("open", 1.0))
+    strict_cfg = dataclasses.replace(cfg, market_breadth_riskoff_pct=40.0)
+    strict_engine = TradingEngine(
+        strict_cfg, StateStore(os.path.join(tmp, "gate_strict_state.json"),
+                               initial_overrides={"trading_enabled": True}),
+        FakeClient(), FakeAnalyst(), notify)
+    check("порог из конфига работает: 35% блокируется при пороге 40",
+          strict_engine._breadth_gate(35.0) == ("blocked", 0.0))
+
+    # --- Test 35 (v1.13.0): пороги микро-детектора из конфига -----------------
+    print("\n[35] v1.13.0: микро-детектор читает SCALP_MICRO_* из конфига")
+    mono0 = time.monotonic()
+    micro_quote = {
+        "price": 100.2, "price_age_sec": 0.2, "book_age_sec": 0.5,
+        "bid": 100.19, "ask": 100.21, "bid_volume": 1500, "ask_volume": 800,
+        "spread_pct": 0.02, "book_consistent": True,
+        "ticks": [{"ts": mono0 - 45.0 + i * 9.0, "price": 100.0 + i * 0.04}
+                  for i in range(6)],
+    }
+    micro_signal = gate_engine._micro_trigger(dict(micro_quote))
+    check("6 тиков с порогом 6 дают сигнал (раньше требовалось 8)",
+          micro_signal is not None, str(micro_signal))
+    tight_cfg = dataclasses.replace(cfg, scalp_micro_min_ticks=8)
+    tight_engine = TradingEngine(
+        tight_cfg, StateStore(os.path.join(tmp, "micro_tight_state.json"),
+                              initial_overrides={"trading_enabled": True}),
+        FakeClient(), FakeAnalyst(), notify)
+    check("с порогом 8 тиков тот же поток не проходит",
+          tight_engine._micro_trigger(dict(micro_quote)) is None)
+    ret_cfg = dataclasses.replace(cfg, scalp_micro_max_ret45_pct=0.15)
+    ret_engine = TradingEngine(
+        ret_cfg, StateStore(os.path.join(tmp, "micro_ret_state.json"),
+                            initial_overrides={"trading_enabled": True}),
+        FakeClient(), FakeAnalyst(), notify)
+    check("потолок ret45 из конфига работает: 0.2% > 0.15% -> отказ",
+          ret_engine._micro_trigger(dict(micro_quote)) is None)
+
+    # --- Test 36 (v1.13.0): micro_impulse заменяет свечной сетап --------------
+    print("\n[36] Скальп: свежий микро-импульс проходит вход без свечного сетапа")
+    entry_state = StateStore(os.path.join(tmp, "micro_entry_state.json"),
+                             initial_overrides={"trading_enabled": True})
+    entry_state.set_scalp_mode(True)
+    entry_client = FakeClient()
+    mono1 = time.monotonic()
+    entry_quote = {
+        "price": 100.2, "price_seq": 42, "price_age_sec": 0.2,
+        "book_age_sec": 0.5, "bid": 100.19, "ask": 100.21,
+        "bid_volume": 1500, "ask_volume": 800, "spread_pct": 0.02,
+        "book_consistent": True,
+        "ticks": [{"ts": mono1 - 45.0 + i * 9.0, "price": 100.0 + i * 0.04}
+                  for i in range(6)],
+    }
+    entry_client.get_scalp_quote = lambda ticker: dict(entry_quote)
+    # 0.04%: round_trip = 0.04+0.1+0.05 = 0.19, x3 = 0.57 < стоп 0.6 -
+    # гейт издержек проходит (при 0.05 ловим float-ловушку 0.6 < 0.6000001).
+    entry_client.get_spread_pct = lambda ticker: 0.04
+
+    async def flat_history(ticker: str, hours_back: float,
+                           step_h: float = 1.0) -> list[tuple[float, float]]:
+        n = 60
+        base_ts = time.time()
+        return [(base_ts - (n - 1 - j) * step_h * 3600.0,
+                 100.0 + 0.01 * math.sin(j)) for j in range(n)]
+
+    entry_client.get_candles_history = flat_history
+    entry_client.get_entry_context = (
+        lambda ticker, lookback=20: {
+            "last_close": 100.0, "last_high": 100.05, "last_low": 99.95,
+            "previous_high": 100.04, "previous_low": 99.94,
+            "close_above_prev_high": False, "higher_low": False,
+            "volume_ratio": 1.0, "pullback_volume_fade": False,
+            "avg_volume": 1000.0, "current_volume": 1000.0,
+            "session_vwap": 100.0, "range_high_12": 100.05,
+        })
+    entry_engine = TradingEngine(
+        # learning_enabled=False: память ошибок общая на tmp-папку, и стопы из
+        # предыдущих тестов ставят SBER на паузу - изолируем проверку bypass.
+        dataclasses.replace(cfg, learning_enabled=False),
+        entry_state, entry_client, FakeAnalyst(), notify)
+    # Нейтральная зона breadth 32%: вход разрешён с половинным риском.
+    entry_engine.set_market_context({"breadth_pct": 32.0, "symbols": 80})
+    orig_can_open = sessions.can_open_scalp_entry
+    orig_flatten = sessions.should_force_flatten_scalp
+    orig_detect_setups = indicators.detect_entry_setups
+    sessions.can_open_scalp_entry = lambda *a, **k: True
+    sessions.should_force_flatten_scalp = lambda *a, **k: False
+    # Свечной сетап детерминированно молчит: проверяем именно bypass.
+    indicators.detect_entry_setups = lambda *a, **k: ([], 0)
+    try:
+        await entry_engine._evaluate_entry("SBER", 100.2)
+    finally:
+        sessions.can_open_scalp_entry = orig_can_open
+        sessions.should_force_flatten_scalp = orig_flatten
+        indicators.detect_entry_setups = orig_detect_setups
+    queued = entry_engine._scalp_ai_queue.get("SBER")
+    check("кандидат с micro_impulse попал в очередь Groq без свечного сетапа",
+          bool(queued) and queued.get("allowed_setups") == ["micro_impulse"],
+          str((queued or {}).get("allowed_setups")))
+    check("нейтральная зона breadth помечает кандидата риском x0.5",
+          bool(queued)
+          and float(((queued or {}).get("summary") or {})
+                    .get("breadth_size_mult") or 1.0) == 0.5)
+
+    # --- Test 37 (v1.13.0): нормализация позиций идемпотентна -----------------
+    print("\n[37] Скальп: повторная нормализация не трогает позицию (кейс ALRS)")
+    norm_state = StateStore(os.path.join(tmp, "norm_idem_state.json"),
+                            initial_overrides={"trading_enabled": True})
+    norm_state.set_scalp_mode(True)
+    norm_engine = TradingEngine(cfg, norm_state, FakeClient(), FakeAnalyst(), notify)
+    norm_entry = 23.23
+    norm_risk = 1.0
+    norm_state.set_position("ALRS", {
+        "lots": 35, "initial_lots": 35, "realized_lots": 0,
+        "realized_exit_value": 0.0, "entry_price": norm_entry,
+        "entry_epoch": time.time(),
+        "entry_ts": sessions.msk_now().strftime("%Y-%m-%d %H:%M:%S"),
+        "scalp_managed": True, "scalp_risk_pct": norm_risk,
+        "scalp_atr_pct": 0.5, "scalp_round_trip_cost_pct": 0.1,
+        "scalp_expected_round_trip_cost_pct": 0.15,
+        "stop_price": round(norm_entry * (1.0 - norm_risk / 100.0), 4),
+        "llm_confidence": 0.7, "tp1_done": False,
+        "scalp_session_key": sessions.scalp_session_key(time.time()) or "unknown",
+    })
+    norm_engine._migrate_legacy_scalp_positions()
+    before_norm = dict(norm_state.positions.get("ALRS", {}))
+    norm_engine._migrate_legacy_scalp_positions()
+    after_norm = dict(norm_state.positions.get("ALRS", {}))
+    check("второй прогон миграции не меняет позицию (нет бесконечного спама)",
+          before_norm == after_norm
+          and abs(float(after_norm.get("stop_price", 0))
+                  - round(norm_entry * (1.0 - norm_risk / 100.0), 4)) < 1e-9,
+          f"stop_price={after_norm.get('stop_price')}")
+
+    # --- Test 38 (v1.14.0): быстрый тейк «как у владельца» ---------------------
+    print("\n[38] v1.14.0: быстрый тейк продаёт ВСЮ позицию при издержки+маржа")
+    quick_state = StateStore(os.path.join(tmp, "quick_tp_state.json"),
+                             initial_overrides={"trading_enabled": True})
+    quick_state.set_scalp_mode(True)
+    quick_client = FakeClient()
+    quick_engine = TradingEngine(cfg, quick_state, quick_client, FakeAnalyst(), notify)
+    quick_pos = {"lots": 4, "initial_lots": 4, "realized_lots": 0,
+                 "realized_exit_value": 0.0, "entry_price": 100.0,
+                 "entry_epoch": time.time(),
+                 "entry_ts": sessions.msk_now().strftime("%Y-%m-%d %H:%M:%S"),
+                 "max_price": 100.0, "scalp_managed": True,
+                 "scalp_risk_pct": 0.6, "scalp_atr_pct": 0.2,
+                 "scalp_round_trip_cost_pct": 0.1,
+                 "scalp_expected_round_trip_cost_pct": 0.15,
+                 "stop_price": 99.4, "tp1_done": False,
+                 "llm_confidence": 0.75,
+                 "scalp_session_key": sessions.scalp_session_key(time.time()) or "unknown"}
+    quick_state.set_position("SBER", dict(quick_pos))
+    # Плюс +0.10% < издержки 0.15% + маржа 0.05% - позиция продолжает жить.
+    await quick_engine._check_scalp_exit("SBER", 100.10, dict(quick_pos))
+    check("плюс ниже издержек+маржи (+0.10% < +0.15%) - позиция не продаётся",
+          "SBER" in quick_state.positions and not quick_client.sells)
+    # Плюс +0.25% >= 0.20% - продаётся ВСЯ позиция целиком, без 1R-лестницы.
+    await quick_engine._check_scalp_exit("SBER", 100.25, dict(quick_pos))
+    check("плюс покрыл издержки+маржу (+0.25% >= +0.20%) - продано всё (4 лота)",
+          "SBER" not in quick_state.positions
+          and quick_client.sells == [("SBER", 4)],
+          f"sells={quick_client.sells}")
+    check("в уведомлении названа причина «быстрый плюс»",
+          any("ПРОДАЖА" in n and "быстрый плюс" in n for n in notifications))
+    # Выключенный флаг возвращает прежнее поведение (продажа только по 1R).
+    off_state = StateStore(os.path.join(tmp, "quick_tp_off_state.json"),
+                           initial_overrides={"trading_enabled": True})
+    off_state.set_scalp_mode(True)
+    off_client = FakeClient()
+    off_engine = TradingEngine(no_quick_cfg, off_state, off_client, FakeAnalyst(), notify)
+    off_pos = dict(quick_pos)
+    off_state.set_position("SBER", dict(off_pos))
+    await off_engine._check_scalp_exit("SBER", 100.25, dict(off_pos))
+    check("SCALP_QUICK_TP=false: +0.25% ещё не 1R (0.6%) - позиция жива, ждёт TP1",
+          "SBER" in off_state.positions and not off_client.sells)
+
+    # --- Test 39 (v1.14.0): детектор «локальной ямы» ---------------------------
+    print("\n[39] v1.14.0: dip_reversal видит остановившуюся яму, не падающий нож")
+    dip_state = StateStore(os.path.join(tmp, "dip_state.json"),
+                           initial_overrides={"trading_enabled": True})
+    dip_state.set_scalp_mode(True)
+    dip_engine = TradingEngine(cfg, dip_state, FakeClient(), FakeAnalyst(), notify)
+    mono_dip = time.monotonic()
+    dip_prices = ([100.0 - (0.5 / 19) * i for i in range(20)]
+                  + [99.50 + 0.01 * i for i in range(6)])
+    dip_quote = {
+        "price": 99.55, "price_seq": 7, "price_age_sec": 0.2,
+        "book_age_sec": 0.5, "bid": 99.54, "ask": 99.56,
+        "bid_volume": 2000, "ask_volume": 1000,
+        "spread_pct": 0.02, "book_consistent": True,
+        "ticks": [{"ts": mono_dip + i * 10.0, "price": p}
+                  for i, p in enumerate(dip_prices)],
+    }
+    dip_signal = dip_engine._dip_trigger(dict(dip_quote))
+    check("остановившаяся яма с покупателями у дна даёт сигнал",
+          dip_signal is not None and dip_signal.get("kind") == "dip_reversal",
+          str(dip_signal))
+    check("глубина провала распознана (~0.43% от максимума окна)",
+          dip_signal is not None and 0.30 <= dip_signal.get("dip_drop_pct", 0) <= 0.55,
+          str((dip_signal or {}).get("dip_drop_pct")))
+    check("импульсный детектор на той же ленте молчит (цена ещё не растёт)",
+          dip_engine._micro_trigger(dict(dip_quote)) is None)
+    check("_any_micro_trigger выбирает dip_reversal как единственный сигнал",
+          (dip_engine._any_micro_trigger(dict(dip_quote)) or {}).get("kind")
+          == "dip_reversal")
+    falling_quote = dict(dip_quote)
+    falling_quote["ticks"] = dip_quote["ticks"][:-1] + [
+        {"ts": mono_dip + 250.0, "price": 99.45}]
+    falling_quote["price"] = 99.45
+    check("новый минимум в хвосте - яма ещё копается, сигнала нет (не нож)",
+          dip_engine._dip_trigger(dict(falling_quote)) is None)
+    rebound_quote = dict(dip_quote)
+    rebound_quote["price"] = 99.80
+    rebound_quote["ticks"] = dip_quote["ticks"][:-1] + [
+        {"ts": mono_dip + 250.0, "price": 99.80}]
+    check("цена уже отыграла больше половины провала - это не вход в яму",
+          dip_engine._dip_trigger(dict(rebound_quote)) is None)
+    no_dip_cfg = dataclasses.replace(cfg, scalp_dip_enabled=False)
+    no_dip_engine = TradingEngine(no_dip_cfg, dip_state, FakeClient(), FakeAnalyst(), notify)
+    check("SCALP_DIP_ENABLED=false отключает детектор ямы",
+          no_dip_engine._dip_trigger(dict(dip_quote)) is None
+          and no_dip_engine._any_micro_trigger(dict(dip_quote)) is None)
+
+    # --- Test 40 (v1.14.0): недоверие после убытков выключено ------------------
+    print("\n[40] v1.14.0: правило «после убытков не доверяем» отключено")
+    guard_cfg = dataclasses.replace(cfg, learning_enabled=True)
+    check("в конфиге по умолчанию MEMORY_LOSS_STREAK_GUARD=false",
+          guard_cfg.memory_loss_streak_guard is False)
+    loss_memory = TradeMemory(os.path.join(tmp, "loss_streak_memory.json"),
+                              max_trades=100)
+    for _ in range(3):
+        loss_memory.record(
+            ticker="SBER", entry_price=100.0, exit_price=99.0,
+            lots=1, lot_size=1, reason="стоп-лосс", profit_pct=-1.0,
+            entry_ts_str=sessions.msk_now().strftime("%Y-%m-%d %H:%M:%S"),
+            cost_rub=0.0, setup="micro_impulse", mode="scalp", entry_tf_min=5)
+    check("память честно видит 3 убытка подряд",
+          loss_memory.loss_streak("SBER") == 3)
+    check("при включённом флаге пауза была бы (правило не удалено, а выключено)",
+          loss_memory.pause_reason("SBER", 4.0) is not None)
+    plain_lessons = loss_memory.lesson_lines("SBER", include_streak_warning=False)
+    check("факты сделок в промпте остаются",
+          any("Память о моих завершённых сделках" in ln for ln in plain_lessons))
+    check("строки-предвзятости «убытков подряд/плохие часы» больше не подмешиваются",
+          not any("подряд" in ln or "требуй более сильных" in ln
+                  for ln in plain_lessons),
+          " | ".join(plain_lessons))
+
+    # --- Test 41 (v1.14.0): ручная покупка сопровождается как скальп -----------
+    print("\n[41] v1.14.0: /buy вручную в скальпе получает быстрый тейк и стоп")
+    manual_state = StateStore(os.path.join(tmp, "manual_buy_state.json"),
+                              initial_overrides={"trading_enabled": True})
+    manual_state.set_scalp_mode(True)
+    manual_client = FakeClient()
+    manual_client.price = 100.0
+    manual_engine = TradingEngine(cfg, manual_state, manual_client, FakeAnalyst(), notify)
+    manual_result = await manual_engine.force_buy("SBER", 10)
+    manual_pos = manual_state.positions.get("SBER") or {}
+    check("ручная покупка прошла и позиция создана",
+          bool(manual_pos), manual_result[:80])
+    check("позиция помечена scalp_managed - сопровождается как своя сделка",
+          manual_pos.get("scalp_managed") is True
+          and manual_pos.get("source") == "manual")
+    check("у позиции есть ожидаемые издержки и стоп-цена",
+          float(manual_pos.get("scalp_expected_round_trip_cost_pct") or 0) > 0
+          and 0 < float(manual_pos.get("stop_price") or 0) < 100.0)
+    # Цена выросла на +0.30%: быстрый тейк продаёт ручную позицию так же.
+    # (издержки ручной позиции = 0.1% комиссия + 0.05% slippage + 0.05% спред
+    # = 0.20%, плюс маржа 0.05% -> цель +0.25%)
+    await manual_engine._check_scalp_exit("SBER", 100.30, dict(manual_pos))
+    check("рост до издержки+маржа закрывает и ручную позицию целиком",
+          "SBER" not in manual_state.positions
+          and manual_client.sells == [("SBER", 1)],
+          f"sells={manual_client.sells}")
+    check("ответ на /buy обещает быстрый тейк и частый опрос цены",
+          "Быстрый тейк" in manual_result and "сек" in manual_result)
+
+    # --- Test 42 (v1.15.0): журнал сделок и единая дневная статистика --------
+    print("\n[42] v1.15.0: журнал сделок - один источник счётчика и дневного P&L")
+    check("журнал дня: 1 покупка и 1 продажа по ручной сделке",
+          manual_state.trades_today_count("buy") == 1
+          and manual_state.trades_today_count("sell") == 1)
+    sell_events = manual_state.trades_today("sell")
+    check("pnl продажи в журнале совпадает с реализованным P&L за день",
+          bool(sell_events)
+          and abs(sum(float(e.get("pnl", 0)) for e in sell_events)
+                  - manual_state.realized_pnl_today()) < 0.02)
+    day_line = manual_state.day_result_line()
+    check("day_result_line сходится с state (P&L и счётчики)",
+          f"{manual_state.realized_pnl_today():+.0f} ₽" in day_line
+          and "покупок 1" in day_line and "продаж 1" in day_line,
+          day_line)
+    check("/stats: все события журнала несут свежий ts (счётчик по журналу)",
+          all(float(e.get("ts", 0) or 0) >= time.time() - 3600
+              for e in manual_state.trades_today()))
+
+    # --- Test 43 (v1.15.0): тихий фоновый скан, ручной /scan как раньше ------
+    print("\n[43] v1.15.0: фоновый скан молчит, ручной /scan шлёт отчёт")
+    quiet_state = StateStore(os.path.join(tmp, "quiet_scan_state.json"),
+                             initial_overrides={"trading_enabled": False})
+    quiet_client = FakeClient()
+    quiet_engine = TradingEngine(cfg, quiet_state, quiet_client,
+                                 FakeAnalyst(), notify)
+    quiet_scanner = MarketScanner(cfg, quiet_state, quiet_client, FakeAnalyst(),
+                                  quiet_engine, notify, None)
+    before = len(notifications)
+    await quiet_scanner.scan_once()
+    check("фоновый скан не отправляет отчёт в Telegram",
+          len(notifications) == before,
+          f"новых уведомлений: {len(notifications) - before}")
+    await quiet_scanner.scan_once(manual=True)
+    manual_notes = notifications[before:]
+    check("ручной /scan шлёт полный отчёт как раньше",
+          manual_notes and any("Сканер рынка" in n for n in manual_notes),
+          f"сообщений: {len(manual_notes)}")
+    check("лимит отчёта сканера - 4 кандидата (не 6), в шапке не больше 4",
+          cfg.scan_report_top == 4
+          and all(int(n.split("топ ", 1)[1].split(" ", 1)[0]) <= 4
+                  for n in manual_notes if "топ " in n),
+          "; ".join(n.splitlines()[0][:60] for n in manual_notes if n))
 
     print("\n" + "=" * 64)
     print(f"ИТОГО: пройдено {len(PASSED)}, провалено {len(FAILED)}")

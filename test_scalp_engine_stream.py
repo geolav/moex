@@ -1,7 +1,6 @@
 """Регрессии event-driven scalp engine и пакетной очереди Groq."""
 from __future__ import annotations
 
-import asyncio
 import tempfile
 import time
 import unittest

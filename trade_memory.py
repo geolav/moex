@@ -256,11 +256,18 @@ class TradeMemory:
         return 0.10 * min(streak - LOSS_STRICT_THRESHOLD + 1, 2)
 
     # ---------------------------------------------------------------- уроки
-    def lesson_lines(self, ticker: str, max_lines: int = LESSON_LINES_MAX
-                     ) -> List[str]:
+    def lesson_lines(self, ticker: str, max_lines: int = LESSON_LINES_MAX,
+                     include_streak_warning: bool = True) -> List[str]:
         """
         Короткие строки для промпта ИИ-трейдера: чем закончились мои сделки
         по этой бумаге и какие выводы из этого следуют.
+
+        v1.14.0: параметр include_streak_warning. Строки «сейчас N убытков
+        подряд - будь требовательнее» и «в такие-то часы не покупай» -
+        это пакет «недоверие после убытков», который владелец выключил
+        (MEMORY_LOSS_STREAK_GUARD=false, и он всегда не действует в
+        скальпе). Движок передаёт include_streak_warning=False, и предвзятых
+        подсказок в промпте нет, при этом факты прошлых сделок остаются.
         """
         trades = self.trades(ticker)
         if not trades:
@@ -279,16 +286,17 @@ class TradeMemory:
                          f"{float(trade.get('pnl_pct', 0)):+.1f}%")
         if parts:
             lines.append("Последние сделки: " + "; ".join(parts) + ".")
-        bad_hours = self.worst_hours(ticker)
-        if bad_hours:
-            hours_txt = ", ".join(f"{h:02d}:00" for h in bad_hours[:6])
-            lines.append(f"Вывод: покупки, сделанные в {hours_txt}, пока "
-                         f"каждый раз заканчивались убытком - в это время "
-                         f"требуй более сильных аргументов за покупку.")
-        streak = self.loss_streak(ticker)
-        if streak >= LOSS_STRICT_THRESHOLD:
-            lines.append(f"Сейчас у меня {streak} убытка подряд по этой "
-                         f"бумаге - будь особенно требователен к сигналу.")
+        if include_streak_warning:
+            bad_hours = self.worst_hours(ticker)
+            if bad_hours:
+                hours_txt = ", ".join(f"{h:02d}:00" for h in bad_hours[:6])
+                lines.append(f"Вывод: покупки, сделанные в {hours_txt}, пока "
+                             f"каждый раз заканчивались убытком - в это время "
+                             f"требуй более сильных аргументов за покупку.")
+            streak = self.loss_streak(ticker)
+            if streak >= LOSS_STRICT_THRESHOLD:
+                lines.append(f"Сейчас у меня {streak} убытка подряд по этой "
+                             f"бумаге - будь особенно требователен к сигналу.")
         return lines[:max_lines]
 
     def performance_metrics(self, trades: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
@@ -325,26 +333,41 @@ class TradeMemory:
                 if len(rows) >= min_n}
 
     # ------------------------------------------------------------ витрина
-    def short_line(self) -> str:
-        """Одна строка для /status."""
+    def short_line(self, *, today_pnl: Optional[float] = None) -> str:
+        """Одна строка для /status и промпта ИИ.
+
+        v1.15.0: "результат сегодня" берётся из переданного today_pnl
+        (state.realized_pnl_today() - единый источник с дневным стопом).
+        Память сделок может не совпадать с ним (LEARNING выключен, память
+        очищена вручную) - поэтому раньше цифры в разных командах
+        расходились. Если today_pnl не передан - считаем по памяти."""
         stats_all = self._all_stats()
-        today = self.today_realized_pnl()
+        today = (float(today_pnl) if today_pnl is not None
+                 else self.today_realized_pnl())
         return (f"результат сегодня {today:+.0f} ₽, в памяти "
                 f"{stats_all['n']} сделок, прибыльных "
                 f"{stats_all['winrate']:.0%}, суммарно "
                 f"{stats_all['total_pnl']:+.0f} ₽")
 
-    def summary_text(self) -> str:
-        """Полный отчёт для команды /memory."""
+    def summary_text(self, *, today_pnl: Optional[float] = None,
+                     today_deals: Optional[int] = None) -> str:
+        """Полный отчёт для команды /memory.
+
+        v1.15.0: строка "Сегодня реализовано" показывает единый дневной
+        результат из state (today_pnl + число сделок из журнала дня) -
+        тот же, что у дневного стопа и /status. Статистика памяти идёт
+        отдельной строкой, чтобы не путать две "сегодняшних" суммы."""
         stats_all = self._all_stats()
-        today = self.today_realized_pnl()
-        today_n = self._today_count()
+        today = (float(today_pnl) if today_pnl is not None
+                 else self.today_realized_pnl())
+        today_n = (int(today_deals) if today_deals is not None
+                   else self._today_count())
         perf = self.performance_metrics()
         pf = ("∞" if math.isinf(perf["profit_factor"]) else f"{perf['profit_factor']:.2f}")
         sample_note = " (малая выборка; ориентир, не доказательство edge)" if perf["n"] < 30 else ""
-        lines = [f"🧠 Память сделок (последние {stats_all['n']}):",
-                 f"Сегодня реализовано: {today:+.0f} ₽ ({today_n} сделок). "
-                 f"Всего в памяти: прибыльных {stats_all['wins']} из "
+        lines = [f"📊 Сегодня реализовано (по счёту): {today:+.0f} ₽, "
+                 f"сделок {today_n} - это число использует и дневной стоп.",
+                 f"В памяти: прибыльных {stats_all['wins']} из "
                  f"{stats_all['n']} ({stats_all['winrate']:.0%}), суммарный "
                  f"итог {stats_all['total_pnl']:+.0f} ₽.",
                  f"Метрики NET: PF={pf}; матожидание {perf['expectancy']:+.2f} ₽/сделку; "

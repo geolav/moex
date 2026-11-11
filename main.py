@@ -215,15 +215,30 @@ async def async_main() -> int:
 
     async def send_admin_photos(caption: str, pngs: list,
                                 reply_markup=None) -> None:
-        """Отправка картинок админу (сканер: топ кандидатов, 2 фото)."""
+        """Отправка картинок админу (сканер: топ кандидатов, 2 фото).
+
+        v1.15.0: у Telegram жёсткий лимит ПОДПИСИ к фото - 1024 символа.
+        Раньше полный текст отчёта резался жёстко (caption[:1024]) и до
+        владельца не долетал хвост отчёта ("не весь текст влезает").
+        Теперь: на фото вешается только короткая шапка (первая строка),
+        а ПОЛНЫЙ текст уходит следом обычным сообщением - по частям,
+        с кнопками на первой части."""
         from aiogram.types import BufferedInputFile
+        first_line = (caption or "").strip().split("\n", 1)[0]
+        head = first_line[:1000] if first_line else None
         for i, png in enumerate(pngs):
-            await bot.send_photo(
-                chat_id=config.telegram_admin_id,
-                photo=BufferedInputFile(png, filename=f"scan-{i + 1}.png"),
-                caption=caption[:1024] if i == 0 else None,
-                reply_markup=reply_markup if i == 0 else None,
-            )
+            try:
+                await bot.send_photo(
+                    chat_id=config.telegram_admin_id,
+                    photo=BufferedInputFile(png, filename=f"scan-{i + 1}.png"),
+                    caption=head if i == 0 else None,
+                )
+            except Exception as exc:  # noqa: BLE001 - фото не важнее текста
+                log.warning("Не удалось отправить фото %d: %s", i + 1, exc)
+        if caption:
+            # Полный текст - отдельно, через резку длинных сообщений.
+            await send_admin_message(bot, config.telegram_admin_id, caption,
+                                     reply_markup=reply_markup)
 
     # Сканер рынка: раз в SCAN_INTERVAL_MIN минут ищет кандидаты по всему
     # рынку TQBR и присылает топ с графиками. v1.7.1: лучших кандидатов он

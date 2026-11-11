@@ -498,7 +498,6 @@ def detect_entry_setups(closes: List[float], price: float,
     ema9 = float(ema9_series[-1]) if ema9_series else None
     ema21 = float(ema21_series[-1]) if ema21_series else None
     ema9_prev = float(ema9_series[-2]) if ema9_series and len(ema9_series) > 1 else None
-    ema21_prev = float(ema21_series[-2]) if ema21_series and len(ema21_series) > 1 else None
     if ema9 is not None:
         summary["ema9"] = ema9
     if ema21 is not None:
@@ -519,7 +518,6 @@ def detect_entry_setups(closes: List[float], price: float,
     prev_close = float(entry_context.get("previous_close") or closes[-2])
     last_low = float(entry_context.get("last_low") or last_close)
     prev_low = float(entry_context.get("previous_low") or last_low)
-    last_high = float(entry_context.get("last_high") or last_close)
     recent_lows = entry_context.get("recent_lows") or [last_low, prev_low]
     try:
         min_recent_low = min(float(v) for v in recent_lows if float(v) > 0)

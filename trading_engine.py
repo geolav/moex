@@ -63,7 +63,8 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 import indicators
 import predictor
 import sessions
-from scalp_microstructure import detect_microstructure_trigger
+from scalp_microstructure import (detect_dip_reversal_trigger,  # noqa: F401
+                                  detect_microstructure_trigger)
 from news_filter import classify_headlines
 
 log = logging.getLogger("engine")
@@ -170,6 +171,13 @@ class TradingEngine:
         self._scalp_last_feed_sync = 0.0
         self._scalp_last_rest_guard = 0.0
         self._scalp_ai_disabled_logged = False
+        # v1.13.0: троттлинг сообщений risk-off по тикерам (не чаще 1/60 сек).
+        self._riskoff_log_last: Dict[str, float] = {}
+        # v1.14.0: раздельные таймеры полного цикла и охраны позиций в обычном
+        # режиме: позиции (в т.ч. ручные /buy) проверяются каждые 5-10 сек,
+        # не дожидаясь следующего полного цикла POLL_INTERVAL_SEC.
+        self._last_entry_cycle = 0.0
+        self._last_pos_guard = 0.0
         self._migrate_legacy_scalp_positions()
 
     def _migrate_legacy_scalp_positions(self) -> None:
@@ -226,7 +234,12 @@ class TradingEngine:
             except (TypeError, ValueError):
                 atr_pct = risk_pct / max(0.1, self._cfg.scalp_atr_multiplier)
 
-            safe_stop_price = entry * (1.0 - risk_pct / 100.0)
+            # v1.13.0: округляем safe_stop_price ДО сравнения со сохранённым
+            # стопом. Раньше сравнивались неокруглённое safe с округлённым
+            # старым значением: из-за этого old_stop_price < stop_price было
+            # истинно КАЖДЫЙ раз и позиция «нормализовалась» бесконечно,
+            # забивая лог WARNING'ом каждые 30 секунд (кейс ALRS).
+            safe_stop_price = round(entry * (1.0 - risk_pct / 100.0), 4)
             try:
                 old_stop_price = float(pos.get("stop_price") or 0.0)
             except (TypeError, ValueError):
@@ -247,7 +260,7 @@ class TradingEngine:
                 or not pos.get("stop_price")
                 or not pos.get("scalp_session_key")
                 or bool(pos.get("scalp_time_unknown")) != time_unknown
-                or old_stop_price < stop_price
+                or old_stop_price + 1e-9 < stop_price
                 or pos.get("scalp_session_key") != (entry_session or "unknown")
             )
             if not needs_update:
@@ -277,12 +290,15 @@ class TradingEngine:
             self._state.set_position(ticker, pos)
             changed += 1
             age_min = max(0.0, (now_epoch - entry_epoch) / 60.0)
-            log.warning("%s: позиция нормализована для scalp management; age=%.0f мин, "
-                        "risk=%.2f%%, session=%s, time_unknown=%s", ticker, age_min,
-                        risk_pct, pos["scalp_session_key"], time_unknown)
+            # INFO, а не WARNING: событие штатное (первичная миграция или
+            # сужение стопа), а не проблема; при идемпотентном повторе
+            # needs_update=False и сообщение не появляется вовсе.
+            log.info("%s: позиция нормализована для scalp management; age=%.0f мин, "
+                     "risk=%.2f%%, session=%s, time_unknown=%s", ticker, age_min,
+                     risk_pct, pos["scalp_session_key"], time_unknown)
         if changed:
-            log.warning("Нормализация scalp-позиций: %d шт.; проверены стопы, "
-                        "время входа и идентификаторы торговой сессии", changed)
+            log.info("Нормализация scalp-позиций: %d шт.; проверены стопы, "
+                     "время входа и идентификаторы торговой сессии", changed)
 
     # -------------------------------------------------------------- жизненный цикл
     def request_stop(self) -> None:
@@ -320,8 +336,19 @@ class TradingEngine:
                     stopper = getattr(self._client, "stop_scalp_feed", None)
                     if callable(stopper):
                         await stopper()
-                    await self.cycle()
-                    await self._sleep(self._cfg.poll_interval_sec)
+                    # v1.14.0: обычный режим больше не привязан к одному
+                    # длинному циклу: входы оцениваем раз в POLL_INTERVAL_SEC,
+                    # а охрану позиций (стоп/тейк/быстрый тейк, в том числе
+                    # по ручным покупкам) - каждые SCALP_EXIT_POLL_SEC (5-10 сек).
+                    now_mono = time.monotonic()
+                    if now_mono - self._last_entry_cycle >= self._cfg.poll_interval_sec:
+                        self._last_entry_cycle = now_mono
+                        await self.cycle()
+                    if self._state.positions and now_mono - self._last_pos_guard >= max(
+                            5.0, float(self._cfg.scalp_exit_poll_sec)):
+                        self._last_pos_guard = now_mono
+                        await self.exit_cycle()
+                    await self._sleep(1.0)
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 - движок обязан пережить ЛЮБОЙ сбой
@@ -335,6 +362,93 @@ class TradingEngine:
         commission = max(0.0, float(self._cfg.scalp_round_trip_cost_pct or 0.0))
         slippage = max(0.0, float(getattr(self._cfg, "slippage_pct", 0.0) or 0.0))
         return spread + commission + slippage
+
+    def _micro_trigger(self, quote: Optional[Dict[str, Any]]) -> Optional[Dict[str, float]]:
+        """Единая точка вызова локального микро-детектора со порогами из конфига.
+
+        v1.13.0: пороги SCALP_MICRO_* больше не захардкожены в модуле
+        детектора; все вызовы идут через этот хелпер, чтобы настройки менялись
+        из .env без правки кода. v1.14.0: к сигналу добавляется поле kind
+        (micro_impulse), чтобы повторная проверка перед заявкой вызывала
+        именно тот детектор, который породил сигнал.
+        """
+        if not quote:
+            return None
+        cfg_min_ticks = getattr(self._cfg, "scalp_micro_min_ticks", None)
+        cfg_up_ratio = getattr(self._cfg, "scalp_micro_min_up_ratio", None)
+        cfg_imbalance = getattr(self._cfg, "scalp_micro_min_imbalance", None)
+        cfg_max_ret45 = getattr(self._cfg, "scalp_micro_max_ret45_pct", None)
+        signal = detect_microstructure_trigger(
+            quote,
+            max_spread_pct=float(self._cfg.scalp_max_spread_pct),
+            round_trip_cost_pct=self._scalp_micro_cost_pct(quote),
+            min_ticks=int(cfg_min_ticks) if cfg_min_ticks else 6,
+            min_up_ratio=float(cfg_up_ratio) if cfg_up_ratio else 0.55,
+            min_imbalance=float(cfg_imbalance) if cfg_imbalance else 1.10,
+            max_ret45_pct=float(cfg_max_ret45) if cfg_max_ret45 else 0.45,
+        )
+        if signal is not None:
+            signal["kind"] = "micro_impulse"
+        return signal
+
+    def _dip_trigger(self, quote: Optional[Dict[str, Any]]) -> Optional[Dict[str, float]]:
+        """Детектор «локальной ямы» (v1.14.0): провал остановился, ждём отскок.
+
+        Это формализация интуиции владельца: «вижу локальную яму на графике -
+        покупаю и жду, пока цена вернётся хотя бы до безубытка+комиссия».
+        Детектор не ловит падающий нож: требует остановки падения и
+        перевеса покупателей в стакане у дна.
+        """
+        if not quote or not bool(getattr(self._cfg, "scalp_dip_enabled", True)):
+            return None
+        signal = detect_dip_reversal_trigger(
+            quote,
+            max_spread_pct=float(self._cfg.scalp_max_spread_pct),
+            round_trip_cost_pct=self._scalp_micro_cost_pct(quote),
+            dip_window_sec=float(max(60, int(self._cfg.scalp_dip_window_sec))),
+            dip_min_drop_pct=float(self._cfg.scalp_dip_min_drop_pct),
+            dip_stabilize_sec=float(max(5, int(self._cfg.scalp_dip_stabilize_sec))),
+            dip_min_imbalance=float(self._cfg.scalp_dip_min_imbalance),
+        )
+        if signal is not None:
+            signal["kind"] = "dip_reversal"
+        return signal
+
+    def _trigger_by_kind(self, quote: Optional[Dict[str, Any]],
+                         kind: str) -> Optional[Dict[str, float]]:
+        """Повторная проверка сигнала по его типу перед отправкой заявки."""
+        if kind == "dip_reversal":
+            return self._dip_trigger(quote)
+        return self._micro_trigger(quote)
+
+    def _any_micro_trigger(self, quote: Optional[Dict[str, Any]]) -> Optional[Dict[str, float]]:
+        """Импульс ИЛИ остановившаяся яма: любой из двух локальных триггеров."""
+        signal = self._micro_trigger(quote)
+        if signal is not None:
+            return signal
+        return self._dip_trigger(quote)
+
+    def _breadth_gate(self, breadth_value: Optional[float]) -> Tuple[str, float]:
+        """Режим входа по ширине рынка (v1.13.0).
+
+        Возвращает (режим, масштаб риска):
+          "blocked" - breadth ниже порога MARKET_BREADTH_RISKOFF_PCT, входы запрещены;
+          "neutral" - между порогом и 55%: вход разрешён с риском x0.5;
+          "open"    - breadth >= 55% или данные отсутствуют/устарели.
+
+        Раньше порог был жёстко 35% и блокировал ВСЕ входы без зоны
+        промежуточного риска (кейс breadth 31.9% в логах 10.11.2026).
+        """
+        if breadth_value is None:
+            return "open", 1.0
+        value = float(breadth_value)
+        cfg_riskoff = getattr(self._cfg, "market_breadth_riskoff_pct", None)
+        riskoff_pct = float(cfg_riskoff) if cfg_riskoff else 30.0
+        if value < riskoff_pct:
+            return "blocked", 0.0
+        if value < 55.0:
+            return "neutral", 0.5
+        return "open", 1.0
 
     async def scalp_stream_cycle(self) -> None:
         """Обрабатывает свежие T-Invest ticks: локально ищет импульс,
@@ -395,11 +509,10 @@ class TradingEngine:
                 last_eval = self._scalp_last_local_eval.get(ticker, 0.0)
                 if now - last_eval < 8.0:
                     continue
-                signal = detect_microstructure_trigger(
-                    quote,
-                    max_spread_pct=float(self._cfg.scalp_max_spread_pct),
-                    round_trip_cost_pct=self._scalp_micro_cost_pct(quote),
-                )
+                # v1.14.0: сигнал даёт либо импульсный детектор, либо
+                # детектор остановившейся ямы (dip_reversal) - обе интуиции
+                # владельца теперь проверяются локально на каждом тике.
+                signal = self._any_micro_trigger(quote)
                 if signal is None:
                     continue
                 self._scalp_last_local_eval[ticker] = now
@@ -442,11 +555,8 @@ class TradingEngine:
             if not quote:
                 self._scalp_ai_queue.pop(ticker, None)
                 continue
-            signal = detect_microstructure_trigger(
-                quote,
-                max_spread_pct=float(self._cfg.scalp_max_spread_pct),
-                round_trip_cost_pct=self._scalp_micro_cost_pct(quote),
-            )
+            signal = self._trigger_by_kind(
+                quote, str(row.get("trigger_kind") or "micro_impulse"))
             price = float(quote.get("price") or 0.0)
             old_price = float(row.get("price") or 0.0)
             if (signal is None or price <= 0 or old_price <= 0
@@ -501,14 +611,11 @@ class TradingEngine:
                 self._ai_batch_candidates.pop(ticker, None)
                 self._ai_batch_shortlist.discard(ticker)
                 continue
-            signal = detect_microstructure_trigger(
-                quote,
-                max_spread_pct=float(self._cfg.scalp_max_spread_pct),
-                round_trip_cost_pct=self._scalp_micro_cost_pct(quote),
-            )
+            signal = self._trigger_by_kind(
+                quote, str(row.get("trigger_kind") or "micro_impulse"))
             if signal is None:
-                log.info("%s: AI BUY отменён: локальный импульс/стакан больше не подтверждает вход",
-                         ticker)
+                log.info("%s: AI BUY отменён: локальный триггер (%s) больше не подтверждает вход",
+                         ticker, str(row.get("trigger_kind") or "micro_impulse"))
                 self._ai_batch_candidates.pop(ticker, None)
                 self._ai_batch_shortlist.discard(ticker)
                 continue
@@ -556,12 +663,13 @@ class TradingEngine:
                     log.exception("Ошибка обработки %s", ticker)
 
     async def exit_cycle(self) -> None:
-        """Быстрая охрана позиций (скальп-режим, v1.7.0): только выходы.
+        """Быстрая охрана позиций: только выходы, без полных входных циклов.
 
-        Между полными циклами каждые SCALP_EXIT_POLL_SEC секунд проверяем
-        открытые позиции: если цена перестала расти (радар разворота,
-        фиксация прибыли, трейлинг) или пробила стоп - продаём сразу,
-        не дожидаясь следующего полного цикла.
+        Каждые SCALP_EXIT_POLL_SEC секунд (по умолчанию 10, минимум 5) для
+        КАЖДОЙ открытой позиции - включая ручные покупки владельца - берём
+        свежую цену и проверяем все локальные правила выхода: жёсткий стоп,
+        быстрый тейк «издержки+маржа», частичную фиксацию, безубыток,
+        трейлинг и тайм-стоп. ИИ на охрану не тратится.
         """
         self._migrate_legacy_scalp_positions()
         now_mono = time.monotonic()
@@ -571,11 +679,11 @@ class TradingEngine:
         for ticker in list(self._state.positions.keys()):
             if self._stop_event.is_set():
                 break
-            position = self._state.positions.get(ticker) or {}
-            confidence = float(position.get("llm_confidence", 0.0) or 0.0)
-            weak_position = confidence < 0.70
-            interval = (30.0 if weak_position else
-                        max(10.0, float(self._cfg.scalp_exit_poll_sec)))
+            # v1.14.0: единый интервал охраны для всех позиций (в т.ч. ручных
+            # покупок). Раньше слабые позиции проверялись РЕЖЕ сильных (30 сек
+            # против 10) - это было backwards: слабый вердикт требует более
+            # частого присмотра, а быстрый тейк должен срабатывать у всех.
+            interval = max(5.0, float(self._cfg.scalp_exit_poll_sec))
             last_guard = self._position_guard_last.get(ticker, 0.0)
             if now_mono - last_guard < interval:
                 continue
@@ -1153,11 +1261,8 @@ class TradingEngine:
                 return
             quote_getter = getattr(self._client, "get_scalp_quote", None)
             quote = quote_getter(ticker) if callable(quote_getter) else None
-            trigger = (detect_microstructure_trigger(
-                quote,
-                max_spread_pct=float(self._cfg.scalp_max_spread_pct),
-                round_trip_cost_pct=self._scalp_micro_cost_pct(quote),
-            ) if quote else None)
+            # v1.14.0: триггером может быть и импульс, и остановившаяся яма.
+            trigger = self._any_micro_trigger(quote)
             if trigger is None:
                 log.debug("%s: локальный микроструктурный триггер уже неактуален - HOLD", ticker)
                 return
@@ -1174,13 +1279,23 @@ class TradingEngine:
 
         # Шаг 0.5. Память об ошибках: пауза после серии убытков, "плохие"
         # часы входа, повышенный порог после неудач (см. trade_memory.py).
+        # v1.14.0: правило «после убытков бумаге не доверяем» отключено
+        # (MEMORY_LOSS_STREAK_GUARD=false) и даже при включённом флаге НЕ
+        # действует в скальпе: после стопа бумага снова доступна сразу
+        # после обычного кулдауна SCALP_COOLDOWN_MIN/SCALP_STOP_COOLDOWN_MIN.
         needed = self._score_threshold()
         conf_req = self._required_confidence()
         # Пользовательские регуляторы агрессивности не могут опустить
         # минимальный порог качества сигнала/уверенности.
         needed = max(0.25, needed)
         conf_req = max(0.60, conf_req)
-        if self._cfg.learning_enabled and self._memory is not None:
+        # v1.14.0: правила недоверия (пауза после серии убытков, плохие часы,
+        # повышенный порог) применяются только в обычном режиме И только при
+        # включённом MEMORY_LOSS_STREAK_GUARD (по умолчанию выключен).
+        loss_guard = (self._cfg.learning_enabled and self._memory is not None
+                      and bool(getattr(self._cfg, "memory_loss_streak_guard", False))
+                      and not self.scalp_mode())
+        if loss_guard:
             pause = self._memory.pause_reason(ticker,
                                               self._cfg.loss_streak_pause_h)
             if pause:
@@ -1312,19 +1427,47 @@ class TradingEngine:
             closes, price, summary, entry_context, fast_n,
             scalp_mode=self.scalp_mode(), market_breadth_pct=market_breadth)
         if not allowed_setups:
-            log.info("%s: нет подтверждённого OHLCV-сетапа pullback/breakout/reversal; HOLD",
-                     ticker)
-            return
+            # v1.13.0: свежий микроструктурный триггер потока (цена+стакан) в
+            # скальпе заменяет строгий свечной сетап. Раньше требовалось И то,
+            # И другое одновременно - кандидаты не проходили ни при каком
+            # импульсе (в логах: "строгий сетап-детектор молчит", сетап: 0).
+            # v1.14.0: триггером может быть и остановившаяся яма - тогда ИИ
+            # оценивает сетап dip_reversal со своими числами потока.
+            if self.scalp_mode() and trigger is not None:
+                trigger_kind = str(trigger.get("kind") or "micro_impulse")
+                allowed_setups = [trigger_kind]
+                if trigger_kind == "dip_reversal":
+                    log.info("%s: свечной сетап молчит - вход по остановившейся "
+                             "локальной яме (поток цены/стакана подтверждает дно)", ticker)
+                else:
+                    log.info("%s: свечной сетап молчит - вход по свежему микро-"
+                             "импульсу потока цены/стакана", ticker)
+            else:
+                log.info("%s: нет подтверждённого OHLCV-сетапа pullback/breakout/reversal; HOLD",
+                         ticker)
+                return
         summary["allowed_setups"] = allowed_setups
         if entry_context:
             summary["reversal_confirmations"] = reversal_confirmations
-        # Режим рынка: при слабой ширине рынка новые лонги запрещены.
+        # Режим рынка (v1.13.0): ниже порога вход запрещён; в нейтральной
+        # зоне (порог..55%) вход разрешён с половинным риском. См. _breadth_gate.
         context = self._market_context
         if context and time.time() - float(context.get("received_ts", 0)) <= 900:
-            breadth = context.get("breadth_pct")
-            if breadth is not None and float(breadth) < 35.0:
-                log.info("%s: risk-off по breadth %.1f%% - вход запрещён", ticker, breadth)
-                return
+            breadth_raw = context.get("breadth_pct")
+            if breadth_raw is not None:
+                breadth_value = float(breadth_raw)
+                gate, gate_scale = self._breadth_gate(breadth_value)
+                if gate == "blocked":
+                    last_log = self._riskoff_log_last.get(ticker, 0.0)
+                    if time.time() - last_log >= 60.0:
+                        self._riskoff_log_last[ticker] = time.time()
+                        log.info("%s: risk-off по breadth %.1f%% - вход запрещён",
+                                 ticker, breadth_value)
+                    return
+                if gate == "neutral":
+                    summary["breadth_size_mult"] = gate_scale
+                    log.info("%s: breadth %.1f%% - нейтральная зона, вход с "
+                             "половинным риском", ticker, breadth_value)
         score = indicators.build_score(summary)
         log.info("%s: score %.2f (порог %.2f, агрессивность %d, активность %d, "
                  "SMA-%.4g ч, свечи %.0f мин%s) RSI %.0f",
@@ -1333,7 +1476,14 @@ class TradingEngine:
                  ", утренний якорь на вчера" if morning else "",
                  summary.get("rsi14") or 0.0)
         if score < needed:
-            return
+            # v1.13.0: у локального скальп-входа сигнал - сам свежий микро-
+            # импульс потока (детектор уже учёл uptick, стакан и издержки),
+            # поэтому legacy score по 5m-свечам не блокирует кандидата.
+            # v1.14.0: то же относится к сигналу остановившейся ямы.
+            if not (self.scalp_mode() and trigger is not None):
+                return
+            log.info("%s: score %.2f ниже порога %.2f, но свежий микро-импульс "
+                     "потока цены/стакана подтверждает вход", ticker, score, needed)
 
         # Шаг 1.5. Анти-погоня (v1.7.0): не покупать у локального максимума.
         # Классическая ошибка: бумага весь день росла, средняя догоняла цену,
@@ -1388,8 +1538,13 @@ class TradingEngine:
                 be_conf = self._breakeven_confidence(be_stop, be_stop, be_cost)
                 summary["breakeven_confidence"] = round(be_conf, 3)
                 # Рейтинг нужен только для выбора трёх лучших из очереди.
+                # v1.14.0: у ямы нет projected_30s_pct - берём её потенциал
+                # отскока к VWAP окна; у импульса - прогноз на 30 сек.
+                trigger_kind = str(micro.get("kind") or "micro_impulse")
+                projected = float(micro.get("projected_30s_pct")
+                                  or micro.get("rebound_to_vwap_pct") or 0.0)
                 rank_score = 50.0 + max(-1.0, min(1.0, score)) * 20.0
-                rank_score += min(10.0, max(0.0, micro.get("projected_30s_pct", 0.0)) * 100.0)
+                rank_score += min(10.0, max(0.0, projected) * 100.0)
                 self._scalp_ai_queue[ticker] = {
                     "ticker": ticker,
                     "price": price,
@@ -1397,6 +1552,7 @@ class TradingEngine:
                     "score": score,
                     "summary": summary,
                     "allowed_setups": list(allowed_setups),
+                    "trigger_kind": trigger_kind,
                     "atr_pct": summary.get("atr_pct"),
                     "planned_stop_pct": summary.get("planned_stop_pct"),
                     "round_trip_cost_pct": summary.get("round_trip_cost_pct"),
@@ -1408,8 +1564,8 @@ class TradingEngine:
                     "day_chg_pct": summary.get("chg_1h"),
                     "turnover": 0.0,
                 }
-                log.info("%s: локальные фильтры пройдены; кандидат добавлен в очередь Groq batch",
-                         ticker)
+                log.info("%s: локальные фильтры пройдены (%s); кандидат добавлен в очередь Groq batch",
+                         ticker, trigger_kind)
                 return
             decision = await self._get_llm_decision(ticker, price, summary, score,
                                                     sentiment, history,
@@ -1716,6 +1872,11 @@ class TradingEngine:
             budget = min(budget, cash * self._cfg.max_position_pct / 100.0)
 
         size_mult = 0.5 if decision.get("size_mult") == 0.5 else 1.0
+        # v1.13.0: нейтральная зона breadth урезает риск сделки вдвое.
+        if float(summary.get("breadth_size_mult") or 1.0) < 1.0:
+            size_mult *= 0.5
+            log.info("%s: нейтральная зона breadth - риск сделки уменьшен вдвое",
+                     ticker)
         budget *= size_mult
         lots = int(budget // lot_cost) if lot_cost > 0 else 0
         if lots < 1:
@@ -1776,6 +1937,13 @@ class TradingEngine:
         self._state.set_position(ticker, pos_data)
         self._state.set_last_buy_ts(ticker, time.time())
         self._state.record_buy_today()
+        # v1.15.0: исполненная сделка - в журнал дня (единый счётчик сделок).
+        trade_rec = getattr(self._state, "record_trade_event", None)
+        if callable(trade_rec):
+            try:
+                trade_rec(ticker, "buy", lots, price)
+            except Exception as exc:  # noqa: BLE001 - журнал не решает сделку
+                log.warning("%s: сделка не записана в журнал дня: %s", ticker, exc)
         short = f"Купил {ticker}: {lots} лот(а) по {price:.2f} руб"
         self._state.record_action(short)
         log.info("%s, ордер %s исполнено лотов: %s",
@@ -1952,6 +2120,26 @@ class TradingEngine:
                              profit_pct, "принудительное закрытие перед окончанием торгов")
             return
 
+        # v1.14.0: БЫСТРЫЙ ТЕЙК «КАК У ВЛАДЕЛЬЦА». Его интуиция: часто пинговать
+        # цену и продавать, как только цена поднялась так, что позиция в плюсе
+        # и плюс покрывает комиссию за продажу (и все остальные расходы круга).
+        # Цель = ожидаемые круговые издержки (комиссия x2 + спред + проскальзывание)
+        # + маржа SCALP_QUICK_TP_MARGIN_PCT. Продаём ВСЮ позицию немедленно,
+        # без подтверждающих циклов и без LLM. Проверка стоит до 1R/TP1:
+        # для скальпа издержки + маржа всегда ближе, чем полный рис.
+        if self._cfg.scalp_quick_tp_enabled:
+            quick_target = expected_cost_pct + float(
+                self._cfg.scalp_quick_tp_margin_pct)
+            if quick_target > 0 and profit_pct >= quick_target:
+                await self._sell(ticker, price, update, "скальп: быстрый плюс",
+                                 profit_pct,
+                                 f"+{profit_pct:.2f}% покрывает издержки "
+                                 f"{expected_cost_pct:.2f}% + маржу "
+                                 f"{self._cfg.scalp_quick_tp_margin_pct:.2f}%; "
+                                 f"позиция закрыта целиком (опрос цены каждые "
+                                 f"{max(5, int(self._cfg.scalp_exit_poll_sec))} сек)")
+                return
+
         entry_epoch = float(position.get("entry_epoch", 0) or 0)
         if entry_epoch <= 0:
             try:
@@ -2108,6 +2296,15 @@ class TradingEngine:
                     f"{new_remaining}. Причина: {reason}.\n"
                     f"Остаток позиции продолжает сопровождаться по стопу/трейлингу.")
             self._state.record_action(f"Частично продал {ticker}: {executed} лот(а), {reason}")
+            # v1.15.0: частичная продажа - тоже сделка в журнале дня (без pnl:
+            # итог позиции считается при полном закрытии).
+            trade_rec = getattr(self._state, "record_trade_event", None)
+            if callable(trade_rec):
+                try:
+                    trade_rec(ticker, "sell", executed, price)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("%s: сделка не записана в журнал дня: %s",
+                                ticker, exc)
             log.info("%s: частично исполнено %d/%d лотов, осталось %d",
                      ticker, executed, requested, new_remaining)
             await self._safe_notify(note)
@@ -2128,6 +2325,13 @@ class TradingEngine:
         pnl_adder = getattr(self._state, "add_realized_pnl_today", None)
         if callable(pnl_adder):
             pnl_adder(pnl)
+        # v1.15.0: полное закрытие - сделка с итоговым pnl в журнале дня.
+        trade_rec = getattr(self._state, "record_trade_event", None)
+        if callable(trade_rec):
+            try:
+                trade_rec(ticker, "sell", executed, price, pnl=pnl)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("%s: сделка не записана в журнал дня: %s", ticker, exc)
         self._state.drop_position(ticker)
         short = (f"Продал {ticker}: закрыто {initial_lots} лот(а), средняя цена выхода "
                  f"{avg_exit:.2f} ₽ ({reason} {actual_profit_pct:+.2f}%)")
@@ -2158,13 +2362,19 @@ class TradingEngine:
                     llm_confidence=position.get("llm_confidence"))
                 streak = self._memory.loss_streak(ticker)
                 if pnl < 0 and was_scalp:
-                    recent = self._memory.trades()[-2:]
-                    if len(recent) == 2 and all(float(t.get("pnl", 0) or 0) < 0 for t in recent):
-                        pause_setter = getattr(self._state, "set_scalp_pause_until", None)
-                        if callable(pause_setter):
-                            pause_setter(time.time() + self._cfg.scalp_loss_pause_minutes * 60.0)
-                        lesson += (f"\n\n🛑 Две убыточные скальп-сделки подряд: "
-                                   f"пауза новых входов на {self._cfg.scalp_loss_pause_minutes} мин.")
+                    # v1.14.0: глобальная пауза скальпа после 2 убытков подряд
+                    # теперь тоже часть пакета «недоверие после убытков»:
+                    # включается только MEMORY_LOSS_STREAK_GUARD=true
+                    # (по умолчанию выключена). Владелец скальпит вручную и
+                    # хочет, чтобы бот продолжал заходить после убытков.
+                    if bool(getattr(self._cfg, "memory_loss_streak_guard", False)):
+                        recent = self._memory.trades()[-2:]
+                        if len(recent) == 2 and all(float(t.get("pnl", 0) or 0) < 0 for t in recent):
+                            pause_setter = getattr(self._state, "set_scalp_pause_until", None)
+                            if callable(pause_setter):
+                                pause_setter(time.time() + self._cfg.scalp_loss_pause_minutes * 60.0)
+                            lesson += (f"\n\n🛑 Две убыточные скальп-сделки подряд: "
+                                       f"пауза новых входов на {self._cfg.scalp_loss_pause_minutes} мин.")
                 if pnl < 0 and streak >= 2:
                     lesson += (f"\n\n🧠 Урок: {streak}-й убыток подряд по {ticker}; "
                                "повторный вход требует более сильного сигнала.")
@@ -2335,7 +2545,7 @@ class TradingEngine:
                 result = await self._client.buy(ticker, lots, price=price)
             except Exception as exc:  # noqa: BLE001
                 return f"❌ Брокер не принял ордер: {exc}"
-            self._state.set_position(ticker, {
+            pos_data = {
                 "lots": lots,
                 "initial_lots": lots,
                 "realized_lots": 0,
@@ -2343,22 +2553,78 @@ class TradingEngine:
                 "entry_price": round(price, 4),
                 "estimated_round_trip_cost_pct": self._cfg.estimated_round_trip_cost_pct,
                 "entry_ts": sessions.msk_now().strftime("%Y-%m-%d %H:%M:%S"),
+                "entry_epoch": time.time(),
                 "order_id": result.get("order_id", ""),
                 "max_profit_pct": 0.0,
+                "max_price": price,
                 "sl_confirm": 0,
                 "source": "manual",
-            })
+            }
+            if self.scalp_mode():
+                # v1.14.0: ручная покупка в скальпе сопровождается РОВНО так
+                # же, как покупки бота: быстрый тейк «издержки+маржа» на каждом
+                # тике, жёсткий стоп, сессионные проверки, тайм-стоп. Цену
+                # пингуем каждые SCALP_EXIT_POLL_SEC (5-10 сек) или на каждом
+                # тике потока.
+                spread_getter = getattr(self._client, "get_spread_pct", None)
+                spread_val = (spread_getter(ticker)
+                              if callable(spread_getter) else None)
+                expected_cost = (self._cfg.scalp_round_trip_cost_pct
+                                 + max(0.0, float(getattr(self._cfg, "slippage_pct", 0.0) or 0.0))
+                                 + (float(spread_val) if spread_val else 0.0))
+                risk_pct = min(self._cfg.scalp_max_stop_pct,
+                               max(self._cfg.scalp_min_stop_pct,
+                                   float(self._cfg.scalp_stop_loss_pct)))
+                pos_data.update({
+                    "scalp_managed": True,
+                    "scalp_session_key": sessions.scalp_session_key() or "unknown",
+                    "scalp_risk_pct": risk_pct,
+                    "scalp_round_trip_cost_pct": float(self._cfg.scalp_round_trip_cost_pct),
+                    "scalp_expected_round_trip_cost_pct": round(expected_cost, 4),
+                    "stop_price": round(price * (1.0 - risk_pct / 100.0), 4),
+                    "tp1_done": False,
+                    "setup": "manual",
+                })
+            self._state.set_position(ticker, pos_data)
             self._state.set_last_buy_ts(ticker, time.time())
+            # v1.15.0: ручная покупка тоже в журнал дня.
+            trade_rec = getattr(self._state, "record_trade_event", None)
+            if callable(trade_rec):
+                try:
+                    trade_rec(ticker, "buy", lots, price)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("%s: сделка не записана в журнал дня: %s",
+                                ticker, exc)
 
         shares = lots * lot_size
         short = (f"Купил вручную {ticker}: {lots} лот(а) = {shares} шт "
                  f"по {price:.2f} ₽")
         self._state.record_action(short)
         log.info("%s, ордер %s", short, result.get("order_id"))
+        if self.scalp_mode():
+            # В скальпе у позиции свои стоп/издержки (см. pos_data выше).
+            scalp_stop = float(pos_data.get("stop_price") or
+                               price * (1.0 - self._cfg.scalp_stop_loss_pct / 100.0))
+            quick_target = (float(pos_data.get("scalp_expected_round_trip_cost_pct")
+                                  or self._cfg.scalp_round_trip_cost_pct)
+                            + float(self._cfg.scalp_quick_tp_margin_pct))
+            return (f"✅ РУЧНАЯ ПОКУПКА {ticker}: {lots} лот(а) = {shares} шт "
+                    f"по ~{price:.2f} ₽ (≈{_fmt_rub(cost)} ₽).\n"
+                    f"Сопровождаю как свою скальп-сделку: цена пингуется каждые "
+                    f"{max(5, int(self._cfg.scalp_exit_poll_sec))} сек (или на каждом "
+                    f"тике потока).\n"
+                    f"• Быстрый тейк: продам ВСЁ при +{quick_target:.2f}% "
+                    f"(издержки круга + маржа) - как только плюс покроет "
+                    f"комиссию за продажу.\n"
+                    f"• Жёсткий стоп: {scalp_stop:.2f} ₽ "
+                    f"(−{float(pos_data.get('scalp_risk_pct') or 0):.2f}%).\n"
+                    f"• Тайм-стоп {self._cfg.scalp_time_stop_min} мин и "
+                    f"закрытие перед концом сессии работают как обычно.")
         stop_price = price * (1.0 - self._cfg.stop_loss_pct / 100.0)
         return (f"✅ РУЧНАЯ ПОКУПКА {ticker}: {lots} лот(а) = {shares} шт "
                 f"по ~{price:.2f} ₽ (≈{_fmt_rub(cost)} ₽).\n"
-                f"Позиция взята под присмотр: жёсткий стоп-лосс "
+                f"Позиция взята под присмотр: цена проверяется каждые "
+                f"{max(5, int(self._cfg.scalp_exit_poll_sec))} сек; жёсткий стоп-лосс "
                 f"{stop_price:.2f} ₽ (−{self._cfg.stop_loss_pct:.1f}%), тейк-профит "
                 f"+{self._cfg.take_profit_pct:.0f}%, умная фиксация прибыли "
                 f"и трейлинг работают как обычно.")
@@ -2432,6 +2698,13 @@ class TradingEngine:
                         "realized_lots": realized_lots,
                         "realized_exit_value": realized_value,
                     })
+                    trade_rec = getattr(self._state, "record_trade_event", None)
+                    if callable(trade_rec):
+                        try:
+                            trade_rec(ticker, "sell", executed, price)
+                        except Exception as exc:  # noqa: BLE001
+                            log.warning("%s: сделка не записана в журнал дня: %s",
+                                        ticker, exc)
                 else:
                     avg_exit = realized_value / max(1, realized_lots)
                     total_profit_pct = ((avg_exit / entry) - 1.0) * 100.0 if entry > 0 else 0.0
@@ -2449,6 +2722,14 @@ class TradingEngine:
                     pnl_adder = getattr(self._state, "add_realized_pnl_today", None)
                     if callable(pnl_adder):
                         pnl_adder(total_pnl)
+                    trade_rec = getattr(self._state, "record_trade_event", None)
+                    if callable(trade_rec):
+                        try:
+                            trade_rec(ticker, "sell", executed, price,
+                                      pnl=total_pnl)
+                        except Exception as exc:  # noqa: BLE001
+                            log.warning("%s: сделка не записана в журнал дня: %s",
+                                        ticker, exc)
                     self._state.drop_position(ticker)
                     if self._cfg.learning_enabled and self._memory is not None and entry > 0:
                         try:
@@ -2516,6 +2797,14 @@ class TradingEngine:
             pnl_adder = getattr(self._state, "add_realized_pnl_today", None)
             if callable(pnl_adder) and avg > 0:
                 pnl_adder(pnl)
+            trade_rec = getattr(self._state, "record_trade_event", None)
+            if callable(trade_rec):
+                try:
+                    trade_rec(ticker, "sell", executed, price,
+                              pnl=pnl if avg > 0 else None)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("%s: сделка не записана в журнал дня: %s",
+                                ticker, exc)
             if self._cfg.learning_enabled and self._memory is not None and avg > 0:
                 try:
                     self._memory.record(
@@ -2732,9 +3021,17 @@ class TradingEngine:
             lines.append(extra)
         # Память о завершённых сделках: ИИ видит, чем кончались его прошлые
         # решения по этой бумаге, и не повторяет ошибок (скилл рефлексии).
+        # v1.14.0: строки «у тебя N убытков подряд - будь требовательнее» и
+        # «в такие-то часы не покупай» - часть отключённого пакета недоверия:
+        # в скальпе они не добавляются вовсе, в обычном режиме - только при
+        # MEMORY_LOSS_STREAK_GUARD=true. Иначе ИИ заранее предвзят против
+        # бумаги, по которой был стоп, а это блокировало повторные входы.
         if self._cfg.learning_enabled and self._memory is not None:
             try:
-                lines.extend(self._memory.lesson_lines(ticker))
+                include_streak = (bool(getattr(self._cfg, "memory_loss_streak_guard", False))
+                                  and not self.scalp_mode())
+                lines.extend(self._memory.lesson_lines(
+                    ticker, include_streak_warning=include_streak))
             except Exception:  # noqa: BLE001 - память не должна ломать промпт
                 pass
         lines.append("\nДай вердикт строго JSON: "
@@ -2870,9 +3167,25 @@ class TradingEngine:
             lines.append(f"Счёт: узнать не удалось ({exc}).")
 
         # Память сделок: результат сегодня и что бот выучил из ошибок.
+        # v1.15.0: "результат сегодня" передаём из state (единый источник с
+        # дневным стопом), память добавляет только свою статистику.
+        day_line = ""
+        day_getter = getattr(self._state, "day_result_line", None)
+        if callable(day_getter):
+            try:
+                day_line = day_getter()
+            except Exception:  # noqa: BLE001
+                day_line = ""
+        if day_line:
+            lines.append("Дневной результат: " + day_line + ".")
         if self._cfg.learning_enabled and self._memory is not None:
             try:
-                lines.append("Память сделок: " + self._memory.short_line())
+                today_pnl = None
+                pnl_getter = getattr(self._state, "realized_pnl_today", None)
+                if callable(pnl_getter):
+                    today_pnl = pnl_getter()
+                lines.append("Память сделок: "
+                             + self._memory.short_line(today_pnl=today_pnl))
             except Exception:  # noqa: BLE001
                 pass
 
@@ -2964,8 +3277,17 @@ class TradingEngine:
         aggr = self._state.aggressiveness()
         act = self._activity()
         info = self.activity_info()
+        # v1.15.0: дневной результат - из state (реализованный P&L, тот же
+        # источник, что у дневного стопа и /memory), а НЕ отдельно из памяти
+        # сделок. Раньше цифры в /status, /memory и здесь расходились.
         memory_txt = ""
-        if self._cfg.learning_enabled and self._memory is not None:
+        pnl_getter = getattr(self._state, "realized_pnl_today", None)
+        if callable(pnl_getter):
+            try:
+                memory_txt = f", результат сегодня {pnl_getter():+.0f} ₽"
+            except Exception:  # noqa: BLE001
+                memory_txt = ""
+        elif self._cfg.learning_enabled and self._memory is not None:
             try:
                 memory_txt = (f", результат сегодня "
                               f"{self._memory.today_realized_pnl():+.0f} ₽")
