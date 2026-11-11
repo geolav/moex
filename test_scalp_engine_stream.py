@@ -388,6 +388,74 @@ class ScalpEngineStreamTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(analyst.calls, [])
             self.assertEqual(engine._scalp_ai_queue, {})
 
+    async def test_quick_take_ignores_legacy_margin_and_logs_monitor_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = StateStore(str(Path(tmp) / "state.json"),
+                               initial_overrides={"trading_enabled": True})
+            state.set_scalp_mode(True)
+            cfg = make_config(tmp)
+            cfg.scalp_quick_tp_enabled = True
+            cfg.scalp_quick_tp_margin_pct = 0.05  # Старое .env не должно добавлять запас.
+            cfg.scalp_round_trip_cost_pct = 0.15
+            cfg.scalp_stop_loss_pct = 0.8
+            cfg.scalp_min_stop_pct = 0.6
+            cfg.scalp_max_stop_pct = 1.0
+            cfg.scalp_trailing_activate_pct = 1.0
+            cfg.scalp_trailing_drop_pct = 0.5
+            cfg.scalp_surge_from_pct = 1.5
+            cfg.scalp_harvest_tiers = ()
+            cfg.harvest_tiers = ()
+            cfg.scalp_time_stop_min = 45
+            cfg.scalp_quick_tp_margin_pct = 0.05
+            cfg.learning_enabled = False
+            cfg.slippage_pct = 0.0
+            cfg.scalp_round_trip_cost_pct = 0.15
+            cfg.scalp_max_stop_pct = 1.0
+            cfg.scalp_min_stop_pct = 0.6
+            cfg.scalp_stop_loss_pct = 0.8
+            cfg.scalp_atr_multiplier = 1.2
+            cfg.scalp_max_positions = 4
+            cfg.scalp_max_entries_per_day = 20
+            cfg.scalp_risk_per_trade_pct = 0.1
+            cfg.scalp_max_portfolio_risk_pct = 1.0
+            cfg.scalp_max_position_pct = 10.0
+            cfg.scalp_daily_loss_limit_pct = 1.0
+            cfg.scalp_loss_pause_minutes = 0
+            cfg.scalp_stop_cooldown_min = 0
+            cfg.scalp_max_sector_positions = 2
+            client = FakeStreamClient()
+            engine = TradingEngine(cfg, state, client, None, notify)
+
+            class SellClient(FakeStreamClient):
+                def __init__(self):
+                    super().__init__()
+                    self.sells = []
+                async def sell(self, ticker, lots, price=None):
+                    self.sells.append((ticker, lots))
+                    return {"lots_executed": lots, "order_id": "test-sell"}
+                def get_lot_size(self, ticker):
+                    return 1
+
+            engine._client = SellClient()
+            pos = {
+                "lots": 1, "initial_lots": 1, "entry_price": 100.0,
+                "entry_ts": "2026-11-11 12:00:00", "entry_epoch": time.time(),
+                "max_price": 100.0, "scalp_managed": True,
+                "scalp_risk_pct": 0.8, "scalp_atr_pct": 0.3,
+                "scalp_round_trip_cost_pct": 0.15,
+                "scalp_expected_round_trip_cost_pct": 0.15,
+                "stop_price": 99.2, "tp1_done": False,
+                "scalp_session_key": "unknown", "llm_confidence": 0.9,
+            }
+            state.set_position("SBER", pos)
+            with self.assertLogs("engine", level="INFO") as captured:
+                await engine._check_scalp_exit("SBER", 100.07, dict(pos))
+            self.assertTrue(any("Скальп-мониторинг SBER" in line for line in captured.output))
+            self.assertIn("SBER", state.positions)
+            await engine._check_scalp_exit("SBER", 100.08, dict(pos))
+            self.assertNotIn("SBER", state.positions)
+            self.assertEqual(engine._client.sells, [("SBER", 1)])
+
 
 if __name__ == "__main__":
     unittest.main()

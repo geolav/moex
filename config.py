@@ -459,7 +459,9 @@ def load_config() -> BotConfig:
         # (комиссия x2 + спред + проскальзывание) + маржа. Позиция продаётся
         # ЦЕЛИКОМ на первом тике, когда плюс покрыл расходы на продажу.
         scalp_quick_tp_enabled=_env_bool("SCALP_QUICK_TP", True),
-        scalp_quick_tp_margin_pct=_env_float("SCALP_QUICK_TP_MARGIN_PCT", 0.05,
+        # Legacy-настройка оставлена для совместимости .env. Быстрый тейк
+        # больше не добавляет маржу поверх полных круговых издержек.
+        scalp_quick_tp_margin_pct=_env_float("SCALP_QUICK_TP_MARGIN_PCT", 0.0,
                                              low=0.0, high=1.0),
         # v1.13.0: настраиваемый порог risk-off и пороги локального
         # микро-детектора (см. scalp_microstructure.py). Порог 30% вместо

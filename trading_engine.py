@@ -161,6 +161,9 @@ class TradingEngine:
         self._ai_batch_candidates: Dict[str, Dict[str, Any]] = {}
         self._ai_batch_shortlist: set[str] = set()
         self._position_guard_last: Dict[str, float] = {}
+        # Диагностика сопровождения: не чаще одного INFO на интервал проверки
+        # по каждой бумаге, чтобы владелец видел фактическую работу монитора.
+        self._scalp_monitor_log_last: Dict[str, float] = {}
         # Скальп: потоковые сигналы и очередь AI batch. Ключи не пишутся в state:
         # после рестарта они должны заново подтверждаться свежими котировками.
         self._scalp_price_seq: Dict[str, int] = {}
@@ -2287,24 +2290,33 @@ class TradingEngine:
                              profit_pct, "принудительное закрытие перед окончанием торгов")
             return
 
-        # v1.14.0: БЫСТРЫЙ ТЕЙК «КАК У ВЛАДЕЛЬЦА». Его интуиция: часто пинговать
-        # цену и продавать, как только цена поднялась так, что позиция в плюсе
-        # и плюс покрывает комиссию за продажу (и все остальные расходы круга).
-        # Цель = ожидаемые круговые издержки (комиссия x2 + спред + проскальзывание)
-        # + маржа SCALP_QUICK_TP_MARGIN_PCT. Продаём ВСЮ позицию немедленно,
-        # без подтверждающих циклов и без LLM. Проверка стоит до 1R/TP1:
-        # для скальпа издержки + маржа всегда ближе, чем полный рис.
+        # Быстрый тейк: продаём всю позицию на первой проверке, когда
+        # движение цены покрывает расходы ИМЕННО НА ВЫХОД (половина
+        # оценочных круговых издержек). Это буквально правило владельца:
+        # не ждать возврата покупочной комиссии, а закрывать при первом
+        # небольшом плюсе после расходов продажи. Полный P&L ниже по коду
+        # всё равно учитывает весь круг, включая комиссию покупки.
+        # Legacy SCALP_QUICK_TP_MARGIN_PCT полностью игнорируется.
+        quick_target = max(0.0, expected_cost_pct / 2.0)
+        monitor_now = time.monotonic()
+        monitor_every = max(5.0, float(getattr(self._cfg, "scalp_exit_poll_sec", 10)))
+        if monitor_now - self._scalp_monitor_log_last.get(ticker, 0.0) >= monitor_every:
+            self._scalp_monitor_log_last[ticker] = monitor_now
+            status = ("ПОРОГ ДОСТИГНУТ — отправляю продажу"
+                      if self._cfg.scalp_quick_tp_enabled and profit_pct >= quick_target
+                      else f"жду ещё {max(0.0, quick_target - profit_pct):.3f} п.п.")
+            log.info(
+                "Скальп-мониторинг %s: цена %.4f ₽, вход %.4f ₽, брутто %+.3f%%, "
+                "издержки выхода %.3f%% (оценка круга %.3f%%), порог быстрой продажи %.3f%%; %s",
+                ticker, price, entry, profit_pct, expected_cost_pct / 2.0,
+                expected_cost_pct, quick_target, status)
         if self._cfg.scalp_quick_tp_enabled:
-            quick_target = expected_cost_pct + float(
-                self._cfg.scalp_quick_tp_margin_pct)
-            if quick_target > 0 and profit_pct >= quick_target:
-                await self._sell(ticker, price, update, "скальп: быстрый плюс",
-                                 profit_pct,
-                                 f"+{profit_pct:.2f}% покрывает издержки "
-                                 f"{expected_cost_pct:.2f}% + маржу "
-                                 f"{self._cfg.scalp_quick_tp_margin_pct:.2f}%; "
-                                 f"позиция закрыта целиком (опрос цены каждые "
-                                 f"{max(5, int(self._cfg.scalp_exit_poll_sec))} сек)")
+            if profit_pct >= quick_target:
+                await self._sell(
+                    ticker, price, update, "скальп: быстрый плюс", profit_pct,
+                    f"+{profit_pct:.3f}% покрывает оценочные расходы выхода "
+                    f"{quick_target:.3f}% (половина круговых издержек); "
+                    f"позиция закрыта целиком без дополнительной маржи")
                 return
 
         entry_epoch = float(position.get("entry_epoch", 0) or 0)
@@ -2756,17 +2768,15 @@ class TradingEngine:
             # В скальпе у позиции свои стоп/издержки (см. pos_data выше).
             scalp_stop = float(pos_data.get("stop_price") or
                                price * (1.0 - self._cfg.scalp_stop_loss_pct / 100.0))
-            quick_target = (float(pos_data.get("scalp_expected_round_trip_cost_pct")
-                                  or self._cfg.scalp_round_trip_cost_pct)
-                            + float(self._cfg.scalp_quick_tp_margin_pct))
+            quick_target = float(pos_data.get("scalp_expected_round_trip_cost_pct")
+                                 or self._cfg.scalp_round_trip_cost_pct) / 2.0
             return (f"✅ РУЧНАЯ ПОКУПКА {ticker}: {lots} лот(а) = {shares} шт "
                     f"по ~{price:.2f} ₽ (≈{_fmt_rub(cost)} ₽).\n"
                     f"Сопровождаю как свою скальп-сделку: цена пингуется каждые "
                     f"{max(5, int(self._cfg.scalp_exit_poll_sec))} сек (или на каждом "
                     f"тике потока).\n"
                     f"• Быстрый тейк: продам ВСЁ при +{quick_target:.2f}% "
-                    f"(издержки круга + маржа) - как только плюс покроет "
-                    f"комиссию за продажу.\n"
+                    f"(расходы продажи, без дополнительной маржи).\n"
                     f"• Жёсткий стоп: {scalp_stop:.2f} ₽ "
                     f"(−{float(pos_data.get('scalp_risk_pct') or 0):.2f}%).\n"
                     f"• Тайм-стоп {self._cfg.scalp_time_stop_min} мин и "

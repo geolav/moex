@@ -1122,8 +1122,7 @@ def create_router(ctx: AppContext) -> Router:
         # дополнительно ограничен 70% equity и 15% номинала на бумагу.
         cap_note = (f"• Лимит вложенности {min(ctx.state.max_invested_pct(), 70)}% equity; "
                     "автоматически не повышается.\n")
-        quick_target = (float(ctx.config.scalp_round_trip_cost_pct)
-                        + float(ctx.config.scalp_quick_tp_margin_pct))
+        quick_target = float(ctx.config.scalp_round_trip_cost_pct) / 2.0
         await message.answer(
             "⚡ СКАЛЬП-РЕЖИМ ВКЛЮЧЁН — правила входа и выхода:\n"
             f"• максимум {ctx.config.scalp_max_positions} позиции одновременно, "
@@ -1135,8 +1134,8 @@ def create_router(ctx: AppContext) -> Router:
             f"{ctx.config.scalp_min_stop_pct:.1f}–{ctx.config.scalp_max_stop_pct:.1f}%), "
             f"TP1=1R с частичной фиксацией, остаток — 2R/ATR-трейлинг;\n"
             f"• БЫСТРЫЙ ТЕЙК: продаю позицию ЦЕЛИКОМ при "
-            f"+{quick_target:.2f}% (издержки круга + маржа) — как только плюс "
-            f"покрыл комиссию за продажу; цена пингуется каждые "
+            f"+{quick_target:.2f}% (расходы продажи, без дополнительной маржи) — "
+            f"при первом достижении порога продаю всю позицию; цена пингуется каждые "
             f"{max(5, int(ctx.config.scalp_exit_poll_sec))} сек;\n"
             f"• ВХОДЫ: два локальных детектора — микро-импульс потока и "
             f"остановившаяся «локальная яма» (dip_reversal); Groq подтверждает "
@@ -1596,11 +1595,8 @@ async def _position_pnl_line(ctx: AppContext, ticker: str, pos: dict) -> str:
 
     v1.15.0: раньше строка показывала ГРУБЫЙ процент (цена/покупка - 1),
     и было непонятно, можно ли продавать в плюс после комиссии за продажу.
-    Теперь рядом: брутто-результат, результат ЧИСТЫМИ после оценки
-    издержек продажи (половина круговых издержек позиции: комиссия +
-    спред/проскальзывание на выход) и вердикт с порогом бота - тем же,
-    по которому скальп-режим продаёт сам (быстрый тейк = издержки круга +
-    маржа). Так владелец сразу видит: продажа уже в плюсе или рано.
+    Теперь рядом: брутто-результат, оценка после расходов выхода, полная
+    оценка после двух сторон сделки и вердикт с порогом быстрой продажи.
     """
     try:
         price = None
@@ -1620,9 +1616,8 @@ async def _position_pnl_line(ctx: AppContext, ticker: str, pos: dict) -> str:
         shares = lots * lot_size
         pnl_pct = (price / entry - 1.0) * 100.0
         pnl_rub = (price - entry) * shares
-        # Издержки продажи: половина оценочных круговых издержек позиции
-        # (вторая половина - покупка). Для legacy-позиций без поля -
-        # дефолт конфига.
+        # Полная оценка издержек круга; быстрая продажа использует только
+        # оценку расходов выхода (половина круга), как просил владелец.
         round_trip = float(
             pos.get("scalp_expected_round_trip_cost_pct")
             or pos.get("scalp_round_trip_cost_pct")
@@ -1632,27 +1627,29 @@ async def _position_pnl_line(ctx: AppContext, ticker: str, pos: dict) -> str:
         sell_cost_pct = round_trip / 2.0
         net_pct = pnl_pct - sell_cost_pct
         net_rub = pnl_rub - (entry * shares * sell_cost_pct / 100.0)
+        all_in_pct = pnl_pct - round_trip
+        all_in_rub = pnl_rub - (entry * shares * round_trip / 100.0)
         pnl_str = f"{abs(pnl_rub):,.0f}".replace(",", " ")
         net_str = f"{abs(net_rub):,.0f}".replace(",", " ")
-        margin = float(getattr(ctx.config, "scalp_quick_tp_margin_pct", 0.05) or 0.0)
-        bot_target = round_trip + margin
+        all_in_str = f"{abs(all_in_rub):,.0f}".replace(",", " ")
+        # Порог автопродажи = расходы выхода (половина круга), без legacy-маржи.
+        bot_target = sell_cost_pct
         target_price = entry * (1.0 + bot_target / 100.0)
         if pnl_pct >= bot_target:
-            verdict = (f"✅ продавать можно: чистыми ~{net_pct:+.2f}% "
-                       f"({('+' if net_rub >= 0 else '−')}{net_str} ₽) после "
-                       f"комиссии за продажу; бот продал бы и сам "
-                       f"(его порог +{bot_target:.2f}% ≈ {target_price:.2f} ₽)")
-        elif net_pct > 0:
-            verdict = (f"🟡 продажа уже покрывает комиссию (чистыми ~"
-                       f"{net_pct:+.2f}%), но бот ждёт свой порог "
-                       f"+{bot_target:.2f}% ≈ {target_price:.2f} ₽")
+            verdict = (f"✅ расходы продажи покрыты: результат после расходов выхода "
+                       f"~{net_pct:+.2f}% "
+                       f"({('+' if net_rub >= 0 else '−')}{net_str} ₽); бот должен "
+                       f"отправлять продажу автоматически. Оценка после полного "
+                       f"круга (включая покупку): {all_in_pct:+.2f}% "
+                       f"({('+' if all_in_rub >= 0 else '−')}{all_in_str} ₽); "
+                       f"порог +{bot_target:.2f}% ≈ {target_price:.2f} ₽")
         else:
             gap = bot_target - pnl_pct
-            verdict = (f"⏳ продавать рано: после комиссии за продажу "
-                       f"пока {net_pct:+.2f}% "
+            verdict = (f"⏳ расходы выхода ещё не покрыты: после них "
+                       f"~{net_pct:+.2f}% "
                        f"({('+' if net_rub >= 0 else '−')}{net_str} ₽); до "
-                       f"порога бота +{bot_target:.2f}% не хватает "
-                       f"{gap:.2f} п.п. (цена ≥ {target_price:.2f} ₽)")
+                       f"порога автопродажи +{bot_target:.2f}% не хватает "
+                       f"{gap:.3f} п.п. (цена ≥ {target_price:.2f} ₽)")
         return (f", сейчас {price:.2f} ₽ → брутто {pnl_pct:+.2f}% "
                 f"({'+' if pnl_rub >= 0 else '−'}{pnl_str} ₽). {verdict}")
     except Exception:  # noqa: BLE001 - статус не должен падать из-за цены

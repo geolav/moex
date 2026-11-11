@@ -585,8 +585,8 @@ async def main() -> int:
     check("ИИ не опрашивался для разрешения стопа", stop_analyst.market_calls == 0)
 
     # --- Тест 13: скальп TP1/2R и P&L всей позиции ------------------------------
-    # v1.14.0: при включённом по умолчанию быстром тейке (SCALP_QUICK_TP=true)
-    # позиция продаётся целиком уже при издержки+маржа (+0.15%), поэтому сам
+    # v1.16.1: быстрый тейк срабатывает при покрытии полных издержек без
+    # дополнительной маржи, поэтому сам
     # TP1/2R-лестницу проверяем на конфиге с выключенным быстрым тейком
     # (SCALP_QUICK_TP=false) - это сохраняет оба сценария.
     print("\n[13] Скальп: TP1 половиной, перенос стопа, остаток закрывается на 2R")
@@ -1329,7 +1329,7 @@ async def main() -> int:
           f"stop_price={after_norm.get('stop_price')}")
 
     # --- Test 38 (v1.14.0): быстрый тейк «как у владельца» ---------------------
-    print("\n[38] v1.14.0: быстрый тейк продаёт ВСЮ позицию при издержки+маржа")
+    print("\n[38] v1.16.1: быстрый тейк продаёт ВСЮ позицию при покрытии расходов выхода")
     quick_state = StateStore(os.path.join(tmp, "quick_tp_state.json"),
                              initial_overrides={"trading_enabled": True})
     quick_state.set_scalp_mode(True)
@@ -1347,13 +1347,14 @@ async def main() -> int:
                  "llm_confidence": 0.75,
                  "scalp_session_key": sessions.scalp_session_key(time.time()) or "unknown"}
     quick_state.set_position("SBER", dict(quick_pos))
-    # Плюс +0.10% < издержки 0.15% + маржа 0.05% - позиция продолжает жить.
-    await quick_engine._check_scalp_exit("SBER", 100.10, dict(quick_pos))
-    check("плюс ниже издержек+маржи (+0.10% < +0.15%) - позиция не продаётся",
+    # Legacy margin=0.05% намеренно задана: порог равен расходам выхода,
+    # то есть половине круговой оценки (0.075%), без доп. запаса.
+    await quick_engine._check_scalp_exit("SBER", 100.07, dict(quick_pos))
+    check("плюс ниже расходов выхода (+0.07% < +0.075%) - позиция не продаётся",
           "SBER" in quick_state.positions and not quick_client.sells)
-    # Плюс +0.25% >= 0.20% - продаётся ВСЯ позиция целиком, без 1R-лестницы.
-    await quick_engine._check_scalp_exit("SBER", 100.25, dict(quick_pos))
-    check("плюс покрыл издержки+маржу (+0.25% >= +0.20%) - продано всё (4 лота)",
+    # +0.08% уже покрывает расходы выхода; старый margin=0.05 игнорируется.
+    await quick_engine._check_scalp_exit("SBER", 100.08, dict(quick_pos))
+    check("первый плюс выше расходов выхода (+0.08%) продаёт всё без маржи",
           "SBER" not in quick_state.positions
           and quick_client.sells == [("SBER", 4)],
           f"sells={quick_client.sells}")
@@ -1461,11 +1462,10 @@ async def main() -> int:
     check("у позиции есть ожидаемые издержки и стоп-цена",
           float(manual_pos.get("scalp_expected_round_trip_cost_pct") or 0) > 0
           and 0 < float(manual_pos.get("stop_price") or 0) < 100.0)
-    # Цена выросла на +0.30%: быстрый тейк продаёт ручную позицию так же.
-    # (издержки ручной позиции = 0.1% комиссия + 0.05% slippage + 0.05% спред
-    # = 0.20%, плюс маржа 0.05% -> цель +0.25%)
-    await manual_engine._check_scalp_exit("SBER", 100.30, dict(manual_pos))
-    check("рост до издержки+маржа закрывает и ручную позицию целиком",
+    # Цена +0.11% выше расходов выхода +0.10%, но ниже старой цели +0.25%.
+    # Старый SCALP_QUICK_TP_MARGIN_PCT=0.05 не должен задерживать продажу.
+    await manual_engine._check_scalp_exit("SBER", 100.11, dict(manual_pos))
+    check("первый рост выше расходов выхода закрывает ручную позицию без маржи",
           "SBER" not in manual_state.positions
           and manual_client.sells == [("SBER", 1)],
           f"sells={manual_client.sells}")
