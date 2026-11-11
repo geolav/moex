@@ -22,7 +22,9 @@ v1.14.0: добавлен второй детектор - разворот по�
     минимума, а доходность хвоста не хуже -dip_max_fall15_pct;
   - цена ещё не отыграла яму (не выше половины провала вверх);
   - покупатели у дна: bid-дисбаланс стакана >= dip_min_imbalance;
-  - потенциальный отскок к VWAP окна покрывает трение сделки.
+  - потенциальный отскок к средней цены окна покрывает трение сделки.
+
+Средняя цена окна не называется VWAP: у потока нет объёма для каждого тика.
 Свежесть цены/стакана, согласованность стакана и лимит спреда - те же
 fail-closed проверки, что и у импульсного детектора.
 """
@@ -77,7 +79,8 @@ def detect_microstructure_trigger(
             or spread_pct <= 0 or spread_pct > max_spread_pct):
         return None
 
-    latest_ts = float(ticks[-1].get("ts", 0)) if ticks else 0.0
+    latest_ts = max((float(item.get("ts", 0) or 0) for item in ticks
+                     if isinstance(item, dict)), default=0.0)
     recent = []
     for item in ticks:
         try:
@@ -86,6 +89,7 @@ def detect_microstructure_trigger(
             continue
         if value > 0 and latest_ts - window_sec <= ts <= latest_ts:
             recent.append((ts, value))
+    recent.sort(key=lambda item: item[0])
     if len(recent) < min_ticks or recent[-1][0] - recent[0][0] < min_span_sec:
         return None
 
@@ -188,7 +192,8 @@ def detect_dip_reversal_trigger(
             or spread_pct <= 0 or spread_pct > max_spread_pct):
         return None
 
-    latest_ts = float(ticks[-1].get("ts", 0)) if ticks else 0.0
+    latest_ts = max((float(item.get("ts", 0) or 0) for item in ticks
+                     if isinstance(item, dict)), default=0.0)
     recent = []
     for item in ticks:
         try:
@@ -197,6 +202,7 @@ def detect_dip_reversal_trigger(
             continue
         if value > 0 and latest_ts - dip_window_sec <= ts <= latest_ts:
             recent.append((ts, value))
+    recent.sort(key=lambda item: item[0])
     if len(recent) < min_ticks or recent[-1][0] - recent[0][0] < 30.0:
         return None
 
@@ -213,14 +219,33 @@ def detect_dip_reversal_trigger(
 
     # Падение остановилось: за последние stabilize секунд минимума не обновляли.
     cutoff = latest_ts - dip_stabilize_sec
-    if any(p <= window_min + 1e-12 for ts, p in recent if ts >= cutoff):
+    stable_points = [(ts, p) for ts, p in recent if ts >= cutoff]
+    if not stable_points or any(p <= window_min + 1e-12 for ts, p in stable_points):
         return None
-    # Хвост не продолжает падать: доходность последних ~15 сек не хуже порога.
+    # Дополнительное подтверждение именно разворота, а не просто паузы в падении:
+    # минимум последнего отрезка не ниже минимума предыдущего отрезка.
+    half_cutoff = latest_ts - dip_stabilize_sec * 2.0
+    prior_points = [(ts, p) for ts, p in recent if half_cutoff <= ts < cutoff]
+    if not prior_points:
+        return None
+    prior_low = min(p for _, p in prior_points)
+    stable_low = min(p for _, p in stable_points)
+    higher_low_confirmed = stable_low >= prior_low - 1e-12
+    if not higher_low_confirmed:
+        return None
+
+    # Хвост не продолжает падать: последние ~15 сек должны уже дать небольшой
+    # положительный наклон, иначе детектор не пытается угадывать самое дно.
     tail_cutoff = latest_ts - 15.0
-    tail_prices = [p for ts, p in recent if ts <= tail_cutoff]
-    ret_tail = ((prices[-1] / tail_prices[-1] - 1.0) * 100.0
-                if tail_prices else 0.0)
-    if ret_tail < -dip_max_fall15_pct:
+    tail_points = [(ts, p) for ts, p in recent if ts >= tail_cutoff]
+    earlier_points = [(ts, p) for ts, p in recent if ts <= tail_cutoff]
+    ret_tail = ((prices[-1] / earlier_points[-1][1] - 1.0) * 100.0
+                if earlier_points else 0.0)
+    tail_changes = [b[1] - a[1] for a, b in zip(tail_points, tail_points[1:])]
+    tail_nonzero = [delta for delta in tail_changes if abs(delta) > 1e-12]
+    tail_up_ratio = (sum(delta > 0 for delta in tail_nonzero) / len(tail_nonzero)
+                     if tail_nonzero else 0.0)
+    if ret_tail < max(0.0, -dip_max_fall15_pct) or tail_up_ratio < 0.50:
         return None
 
     # Цена ещё не отыграла половину провала вверх - иначе это уже не вход
@@ -234,21 +259,36 @@ def detect_dip_reversal_trigger(
     if imbalance < dip_min_imbalance:
         return None
 
-    # Отскок имеет смысл, только если до VWAP окна хватает дистанции,
-    # чтобы покрыть трение сделки (комиссия+спред+проскальзывание).
-    vwap = (sum(p for _, p in recent) / len(recent))
-    rebound_potential_pct = (vwap / price - 1.0) * 100.0 if price > 0 else 0.0
+    # Прогнозируемый отскок к среднему уровню последних цен. Это обычное
+    # арифметическое среднее, НЕ volume-weighted VWAP (объёмов по тикам нет).
+    window_mean = sum(p for _, p in recent) / len(recent)
+    rebound_potential_pct = (window_mean / price - 1.0) * 100.0 if price > 0 else 0.0
     min_rebound = max(0.05, round_trip_cost_pct * rebound_cost_multiple)
     if rebound_potential_pct < min_rebound:
         return None
+
+    # Интерпретируемый локальный score 0..100: глубина ямы, higher-low,
+    # короткий отскок, стакан и запас потенциала к среднему. Это эвристика,
+    # а не обученная модель вероятности будущей цены.
+    depth_score = min(25.0, 25.0 * drop_pct / max(2.0 * dip_min_drop_pct, 1e-9))
+    stability_score = 25.0 if higher_low_confirmed else 0.0
+    tail_score = min(20.0, max(0.0, ret_tail) / 0.08 * 20.0) * min(1.0, tail_up_ratio / 0.75)
+    book_score = min(15.0, max(0.0, (imbalance - 1.0) / 0.5) * 15.0)
+    potential_score = min(15.0, max(0.0, rebound_potential_pct) / max(2.0 * min_rebound, 0.05) * 15.0)
+    bottom_score = max(0.0, min(100.0, depth_score + stability_score + tail_score
+                                 + book_score + potential_score))
 
     return {
         "dip_drop_pct": round(drop_pct, 5),
         "off_low_pct": round(rebounded_pct, 5),
         "tail_15s_pct": round(ret_tail, 5),
+        "tail_up_ratio": round(tail_up_ratio, 4),
+        "higher_low_confirmed": 1.0 if higher_low_confirmed else 0.0,
         "stabilize_sec": round(dip_stabilize_sec, 1),
         "bid_ask_imbalance": round(imbalance, 4),
-        "rebound_to_vwap_pct": round(rebound_potential_pct, 5),
+        "rebound_to_mean_pct": round(rebound_potential_pct, 5),
+        "rebound_to_vwap_pct": round(rebound_potential_pct, 5),  # legacy field name
+        "bottom_score": round(bottom_score, 1),
         "min_rebound_pct": round(min_rebound, 5),
         "spread_pct": round(spread_pct, 5),
         "price_age_sec": round(price_age, 3),

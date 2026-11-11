@@ -16,9 +16,10 @@ scanner.py - сканер рынка Мосбиржи: раз в SCAN_INTERVAL_M
      pullback / breakout / reversal-сетапы.
      Отдельная техническая формула ранжирует кандидатов; падающий тренд,
      ухудшающийся MACD и перекупленность получают штрафы.
-  5. В Groq уходит максимум 3 лучших бумаги, уже прошедших локальные фильтры,
-     одним компактным JSON-запросом на скан. Остальной рейтинг/отчёт/графики
-     формируются локально; отказ ИИ блокирует автопокупку.
+  5. В Groq уходит максимум 3 лучших бумаги. Если строгий shortlist пуст,
+     включается safety-fallback: только ликвидные бумаги с допустимым спредом
+     и ATR отправляются ИИ с соответствующей пометкой. Остальной рейтинг,
+     отчёт и графики формируются локально; отказ ИИ не разрешает покупку.
 
 СКАЛЬП-РЕЖИМ (v1.7.0): если он включён (/scalp), сканер сам обновляет список
 бумаг под управлением движка: тикеры с открытыми позициями остаются, свободные
@@ -300,8 +301,8 @@ class MarketScanner:
             require_spread=require_spread,
             max_spread_pct=max_spread_pct,
         )
-        # Диагностика пустого shortlist: показывает, какой именно локальный
-        # gate отсеял бумаги. Groq не вызывается, если кандидатов нет.
+        # Диагностика пустого shortlist: показывает мягкие фильтры; fallback
+        # ниже отправит безопасные бумаги ИИ, чтобы пустой shortlist не означал ноль AI-оценок.
         if not ai_candidates:
             rank_ok = [r for r in scored
                        if float(r.get("rank_score", 0.0) or 0.0) >= min_rank]
@@ -322,7 +323,7 @@ class MarketScanner:
                         and (not self._engine_scalp() or r in cost_ok)]
             log.info(
                 "Сканер: shortlist пуст; всего=%d, rank>=%g: %d, сетап: %d, "
-                "спред<=%g%%: %d, ATR: %d, издержки/R: %d, совместно прошло: %d; Groq не вызываю",
+                "спред<=%g%%: %d, ATR: %d, издержки/R: %d, совместно прошло: %d; включу безопасный fallback",
                 len(scored), min_rank, len(rank_ok), len(setup_ok),
                 max_spread_pct, len(spread_ok), len(atr_ok), len(cost_ok), len(eligible))
         # v1.14.0: если строгие фильтры отсеяли ВСЕХ (типичный кейс из логов:
@@ -368,27 +369,35 @@ class MarketScanner:
         # OHLCV-сетап, ATR, спред, cooldown и риск до любого ордера.
         set_batch = getattr(self._engine, "set_ai_batch_decisions", None)
         decisions: Dict[str, dict] = {}
-        if not self._engine_scalp():
-            # В обычном режиме AI batch принадлежит сканеру. В скальпе им
-            # владеет потоковая очередь движка; периодический scan не должен
-            # ни расходовать Groq, ни очищать/перезаписывать её решения.
-            if callable(set_batch):
-                set_batch({}, ai_candidates)
-            if cfg.scan_llm and ai_candidates and self._analyst is not None:
-                batch_method = getattr(self._analyst, "analyze_candidates", None)
-                if callable(batch_method):
+        wait_sec = 0.0
+        ai_sent_count = 0
+        if callable(set_batch) and not self._engine_scalp():
+            set_batch({}, ai_candidates)
+        if cfg.scan_llm and ai_candidates and self._analyst is not None:
+            batch_method = getattr(self._analyst, "analyze_candidates", None)
+            if callable(batch_method):
+                wait_getter = getattr(self._analyst, "candidate_call_wait_seconds", None)
+                wait_sec = 0.0
+                if callable(wait_getter):
                     try:
-                        decisions = await batch_method(ai_candidates, scalp_mode=False) or {}
+                        wait_sec = float(wait_getter(scalp_mode=self._engine_scalp()) or 0.0)
+                    except Exception:
+                        wait_sec = 0.0
+                if wait_sec > 0:
+                    log.info("Сканер: пакетный Groq-анализ отложен общим лимитом; повтор через %.0f сек", wait_sec)
+                else:
+                    try:
+                        ai_sent_count = len(ai_candidates)
+                        decisions = await batch_method(
+                            ai_candidates, scalp_mode=self._engine_scalp()) or {}
                     except Exception as exc:  # noqa: BLE001
                         log.warning("Сканер: пакетное решение ИИ недоступно (%s)", exc)
                         decisions = {}
-            if callable(set_batch):
-                set_batch(decisions, ai_candidates)
-        else:
-            log.info("Скальп: периодический скан обновляет watchlist/отчёт; Groq вызывается только потоковой очередью")
-        log.info("Сканер: математический рейтинг посчитал %d бумаг; ИИ получил %d кандидата(ов), ответов %d",
-                 len(scored), (len(ai_candidates) if not self._engine_scalp() else 0),
-                 len(decisions))
+        if callable(set_batch) and not self._engine_scalp():
+            set_batch(decisions, ai_candidates)
+        log.info("Сканер: математический рейтинг посчитал %d бумаг; Groq отправлено %d кандидата(ов), валидных ответов %d%s",
+                 len(scored), ai_sent_count, len(decisions),
+                 " (scalp: BUY только повод для приоритета watchlist, не ордер)" if self._engine_scalp() else "")
 
         # Скальп-режим: лучшие кандидаты автоматически занимают свободные
         # слоты под управлением движка (позиции остаются под охраной).
@@ -398,8 +407,15 @@ class MarketScanner:
             keep = [t for t in self._engine.watchlist()
                     if t in self._state.positions]
             free = max(0, cap - len(keep))
-            picks = [r["ticker"] for r in scored
-                     if r["ticker"] not in keep][:free]
+            # Положительный пакетный AI-вердикт повышает приоритет в watchlist,
+            # но не покупает: для ордера всё равно нужен свежий stream-trigger.
+            ai_buy = [str(t).upper() for t, d in decisions.items()
+                      if str((d or {}).get("action", "")).lower() == "buy"]
+            score_by_ticker = {r["ticker"]: r for r in scored}
+            ordered = sorted(ai_buy, key=lambda t: float(
+                score_by_ticker.get(t, {}).get("rank_score", 0.0)), reverse=True)
+            ordered += [r["ticker"] for r in scored if r["ticker"] not in ordered]
+            picks = [t for t in ordered if t not in keep][:free]
             new_list = await self._engine.auto_set_watchlist(keep + picks)
             scalp_note = (f"⚡ Скальп-режим: обновил список бумаг по итогам "
                           f"скана ({len(new_list)}/{cap}): "
@@ -565,7 +581,7 @@ class MarketScanner:
                         decisions: Dict[str, dict],
                         ai_candidates: List[Dict[str, Any]]) -> Tuple[Dict[str, str], str]:
         """Локальные пояснения для отчёта; отдельный LLM-вызов не нужен."""
-        ai_tickers = {row["ticker"] for row in ai_candidates}
+        ai_tickers = set(decisions)
         verdicts: Dict[str, str] = {}
         buy_tickers: List[str] = []
         for row in top:
@@ -598,8 +614,12 @@ class MarketScanner:
         elif ai_tickers:
             advice = (f"ИИ пакетно проверил {len(ai_tickers)} лучших кандидата(ов); "
                       "положительного подтверждения для покупки нет.")
+        elif ai_candidates:
+            advice = (f"ИИ-кандидаты подготовлены: {len(ai_candidates)}; "
+                      "валидных ответов в этом цикле нет (лимит/ошибка/невалидный JSON). "
+                      "Автопокупки без BUY-вердикта не будет.")
         else:
-            advice = ("Кандидатов, прошедших математический порог, нет; "
+            advice = ("Безопасных кандидатов для AI-проверки нет; "
                       "ИИ-запрос не выполнялся.")
         return verdicts, advice
 

@@ -632,8 +632,13 @@ async def main() -> int:
                    "stop_price": 99.4, "tp1_done": False}
     cooldown_state.set_position("SBER", stopped_pos)
     await cooldown_engine._check_exit("SBER", 99.3, stopped_pos)
-    check("после скальп-стопа установлен запрет повторного входа",
-          cooldown_state.stop_cooldown_until("SBER") > time.time())
+    check("после скальп-стопа не устанавливается loss-based stop-cooldown",
+          cooldown_state.stop_cooldown_until("SBER") <= time.time())
+    # Даже оставшийся в старом state.json исторический cooldown не должен
+    # блокировать scalp-повторный вход; остаётся только обычный интервал.
+    cooldown_state.set_stop_cooldown_until("SBER", time.time() + 7200)
+    check("устаревший stop-cooldown из state.json игнорируется в скальпе",
+          not cooldown_engine._cooldown_active("SBER"))
     timed_state = StateStore(os.path.join(tmp, "scalp_time_stop_state.json"),
                              initial_overrides={"trading_enabled": True})
     timed_state.set_scalp_mode(True)
@@ -739,6 +744,25 @@ async def main() -> int:
               '{"decisions":{"SBER":{"action":"buy","confidence":0.9,"setup":"reversal","reason":"x"}}}',
               {"SBER": {"breakout"}}
           )["SBER"]["action"] == "hold")
+    parsed_scalp_impulse = AIAnalyst._parse_candidate_batch(
+        '{"decisions":{"SBER":{"action":"buy","confidence":0.8,"setup":"micro_impulse","reason":"рост и стакан"}}}',
+        {"SBER": {"micro_impulse"}})
+    parsed_scalp_dip = AIAnalyst._parse_candidate_batch(
+        '{"decisions":{"SBER":{"action":"buy","confidence":0.8,"setup":"dip_reversal","reason":"яма остановилась"}}}',
+        {"SBER": {"dip_reversal"}})
+    check("парсер ИИ принимает подтверждённый scalp micro_impulse",
+          parsed_scalp_impulse.get("SBER", {}).get("action") == "buy")
+    check("парсер ИИ принимает подтверждённый scalp dip_reversal",
+          parsed_scalp_dip.get("SBER", {}).get("action") == "buy")
+    fallback_ok = AIAnalyst._parse_candidate_batch(
+        '{"decisions":{"SBER":{"action":"buy","confidence":0.70,"setup":"reversal","reason":"fallback подтверждён числами"}}}',
+        {"SBER": {"reversal"}}, {"SBER": True})
+    fallback_low = AIAnalyst._parse_candidate_batch(
+        '{"decisions":{"SBER":{"action":"buy","confidence":0.69,"setup":"reversal","reason":"слабая уверенность"}}}',
+        {"SBER": {"reversal"}}, {"SBER": True})
+    check("fallback-кандидат разрешается только при уверенности ИИ не ниже 70%",
+          fallback_ok.get("SBER", {}).get("action") == "buy"
+          and fallback_low.get("SBER", {}).get("action") == "hold")
     check("математический отбор ограничен тремя кандидатами",
           len(selected) == 3 and selected[0]["ticker"] == "A")
     snapshot_good = rank_market_snapshot({"price": 100, "turnover": 2e9,

@@ -164,12 +164,15 @@ class TradingEngine:
         # Скальп: потоковые сигналы и очередь AI batch. Ключи не пишутся в state:
         # после рестарта они должны заново подтверждаться свежими котировками.
         self._scalp_price_seq: Dict[str, int] = {}
+        self._scalp_last_history_record: Dict[str, float] = {}
         self._scalp_last_local_eval: Dict[str, float] = {}
         self._scalp_trigger_cache: Dict[str, Dict[str, float]] = {}
         self._scalp_ai_queue: Dict[str, Dict[str, Any]] = {}
         self._scalp_last_ai_batch_attempt = 0.0
         self._scalp_last_feed_sync = 0.0
         self._scalp_last_rest_guard = 0.0
+        self._scalp_last_portfolio_sync = 0.0
+        self._scalp_external_missing: Dict[str, int] = {}
         self._scalp_ai_disabled_logged = False
         # v1.13.0: троттлинг сообщений risk-off по тикерам (не чаще 1/60 сек).
         self._riskoff_log_last: Dict[str, float] = {}
@@ -458,6 +461,9 @@ class TradingEngine:
         уже открытые позиции продолжают охраняться резервным REST-циклом.
         """
         now = time.monotonic()
+        # Подхватываем акции, купленные напрямую в приложении брокера. Синхронизация
+        # портфеля редкая (по умолчанию 30 сек), а цены уже сопровождаются потоком.
+        await self._sync_external_scalp_positions(now)
         tickers = sorted(set(self.watchlist()) | set(self._state.positions))
         starter = getattr(self._client, "start_scalp_feed", None)
         # При отсутствующем SDK не перезапускаем заведомо неготовый stream
@@ -473,7 +479,7 @@ class TradingEngine:
         getter = getattr(self._client, "get_scalp_quote", None)
         if not ready or not callable(getter):
             if now - self._scalp_last_rest_guard >= max(
-                    15.0, float(getattr(self._cfg, "scalp_exit_poll_sec", 30))):
+                    5.0, float(getattr(self._cfg, "scalp_exit_poll_sec", 10))):
                 self._scalp_last_rest_guard = now
                 await self.exit_cycle()
             return
@@ -496,7 +502,13 @@ class TradingEngine:
                     # Проверяем выход на каждом новом тике цены, без обращения к ИИ.
                     if seq > self._scalp_price_seq.get(ticker, -1) and price_age <= 3.0:
                         self._scalp_price_seq[ticker] = seq
-                        self._state.record_price(ticker, price)
+                        # Выход проверяем на каждом тике, но график/JSON не
+                        # засоряем каждой биржевой микропоставкой: сохраняем
+                        # отдельную измеренную точку не чаще раза в 5 секунд.
+                        last_sample = self._scalp_last_history_record.get(ticker, 0.0)
+                        if now - last_sample >= 5.0:
+                            self._state.record_price(ticker, price)
+                            self._scalp_last_history_record[ticker] = now
                         await self._check_exit(ticker, price, position)
                     continue
 
@@ -527,9 +539,150 @@ class TradingEngine:
         await self._flush_scalp_ai_queue()
         # Резервная проверка позиций периодически защищает от потери tick stream.
         if now - self._scalp_last_rest_guard >= max(
-                15.0, float(getattr(self._cfg, "scalp_exit_poll_sec", 30))):
+                5.0, float(getattr(self._cfg, "scalp_exit_poll_sec", 10))):
             self._scalp_last_rest_guard = now
             await self.exit_cycle()
+
+    async def _sync_external_scalp_positions(self, now_mono: Optional[float] = None) -> None:
+        """Подхватывает и сверяет позиции, купленные вне бота, только в скальпе.
+
+        Portfolio API опрашивается редко; сами цены после обнаружения идут через
+        stream и проверяются на каждом новом тике. Исчезновение позиции требует
+        двух последовательных успешных снимков, чтобы единичный сбой API не
+        удалил живую позицию из сопровождения.
+        """
+        if not self.scalp_mode():
+            return
+        getter = getattr(self._client, "get_portfolio_summary", None)
+        if not callable(getter):
+            return
+        now_mono = time.monotonic() if now_mono is None else float(now_mono)
+        interval = max(15.0, float(getattr(self._cfg, "scalp_portfolio_sync_sec", 30) or 30))
+        if self._scalp_last_portfolio_sync and now_mono - self._scalp_last_portfolio_sync < interval:
+            return
+        self._scalp_last_portfolio_sync = now_mono
+        try:
+            portfolio = await getter()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - ошибка снимка не должна останавливать stream
+            log.warning("Скальп: не удалось сверить портфель брокера: %s", exc)
+            return
+        if not isinstance(portfolio, dict) or not isinstance(portfolio.get("positions"), list):
+            log.warning("Скальп: портфель брокера вернул неожиданный формат; синхронизацию пропускаю")
+            return
+
+        broker: Dict[str, Dict[str, Any]] = {}
+        for raw in portfolio["positions"]:
+            if not isinstance(raw, dict):
+                continue
+            ticker = str(raw.get("ticker") or "").strip().upper()
+            try:
+                lots = int(raw.get("lots") or 0)
+                avg_price = float(raw.get("avg_price") or 0.0)
+                current_price = float(raw.get("price") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if ticker and lots > 0:
+                broker[ticker] = {"lots": lots, "avg_price": avg_price,
+                                  "price": current_price}
+
+        changed_notes: List[str] = []
+        async with self._trade_lock:
+            # Добавляем внешние позиции и приводим имеющиеся к broker-of-record.
+            for ticker, item in broker.items():
+                lots = int(item["lots"])
+                avg_price = float(item["avg_price"])
+                current_price = float(item["price"])
+                if not callable(getattr(self._client, "ensure_instrument", None)) or not self._client.ensure_instrument(ticker):
+                    log.warning("Скальп: внешняя позиция %s не подключена к инструментам; пропуск", ticker)
+                    continue
+                if avg_price <= 0:
+                    log.warning("Скальп: у внешней позиции %s нет корректной средней цены; сопровождение не включено", ticker)
+                    continue
+
+                existing = self._state.positions.get(ticker)
+                # Синхронизатор предназначен для покупок вне бота. Не переписываем
+                # broker-of-record для собственных сделок: иначе задержка портфеля
+                # брокера могла бы обнулить историю частичных выходов/среднюю цену.
+                if existing is not None and not existing.get("scalp_external_position"):
+                    continue
+                if existing is None:
+                    default_stop = float(getattr(self._cfg, "scalp_stop_loss_pct",
+                                                 self._cfg.scalp_max_stop_pct))
+                    risk_pct = min(float(self._cfg.scalp_max_stop_pct),
+                                   max(float(self._cfg.scalp_min_stop_pct), default_stop))
+                    spread_getter = getattr(self._client, "get_spread_pct", None)
+                    try:
+                        spread = float(spread_getter(ticker) or 0.0) if callable(spread_getter) else 0.0
+                    except Exception:
+                        spread = 0.0
+                    expected_cost = (float(self._cfg.scalp_round_trip_cost_pct)
+                                     + max(0.0, float(getattr(self._cfg, "slippage_pct", 0.0) or 0.0))
+                                     + max(0.0, spread))
+                    position = {
+                        "lots": lots, "initial_lots": lots, "entry_price": avg_price,
+                        "entry_ts": datetime.now(sessions.MSK).strftime("%Y-%m-%d %H:%M:%S"),
+                        "entry_epoch": time.time(), "max_price": max(avg_price, current_price),
+                        "max_profit_pct": 0.0, "stop_price": avg_price * (1.0 - risk_pct / 100.0),
+                        "scalp_managed": True, "scalp_external_position": True,
+                        "scalp_entry_source": "broker_app", "scalp_risk_pct": risk_pct,
+                        "scalp_round_trip_cost_pct": float(self._cfg.scalp_round_trip_cost_pct),
+                        "scalp_expected_round_trip_cost_pct": round(expected_cost, 4),
+                        "estimated_round_trip_cost_pct": round(expected_cost, 4),
+                        "scalp_session_key": sessions.scalp_session_key(),
+                        "tp1_done": False, "realized_lots": 0, "realized_exit_value": 0.0,
+                    }
+                    self._state.set_position(ticker, position)
+                    changed_notes.append(f"{ticker}: {lots} лот. по средней {avg_price:.2f} ₽")
+                    log.info("Скальп: обнаружена внешняя позиция %s (%d лот., средняя %.2f ₽); включено сопровождение",
+                             ticker, lots, avg_price)
+                else:
+                    old_lots = int(existing.get("lots", 0) or 0)
+                    old_entry = float(existing.get("entry_price", 0) or 0.0)
+                    basis_changed = (old_lots != lots or old_entry <= 0
+                                     or abs(avg_price / old_entry - 1.0) > 0.002)
+                    if basis_changed:
+                        default_stop = float(getattr(self._cfg, "scalp_stop_loss_pct",
+                                                     self._cfg.scalp_max_stop_pct))
+                        risk_pct = min(float(self._cfg.scalp_max_stop_pct),
+                                       max(float(self._cfg.scalp_min_stop_pct), default_stop))
+                        updated = dict(existing)
+                        updated.update({
+                            "lots": lots, "initial_lots": lots, "entry_price": avg_price,
+                            "entry_ts": datetime.now(sessions.MSK).strftime("%Y-%m-%d %H:%M:%S"),
+                            "entry_epoch": time.time(), "max_price": max(avg_price, current_price),
+                            "max_profit_pct": 0.0, "stop_price": avg_price * (1.0 - risk_pct / 100.0),
+                            "scalp_managed": True, "scalp_external_position": True,
+                            "scalp_entry_source": "broker_app", "scalp_risk_pct": risk_pct,
+                            "realized_lots": 0, "realized_exit_value": 0.0,
+                            "tp1_done": False,
+                        })
+                        self._state.set_position(ticker, updated)
+                        changed_notes.append(f"{ticker}: обновлено до {lots} лот., средняя {avg_price:.2f} ₽")
+                    self._scalp_external_missing.pop(ticker, None)
+
+            # Удаляем исчезнувшую позицию только после двух успешных портфельных снимков.
+            for ticker, position in list(self._state.positions.items()):
+                if not position.get("scalp_external_position"):
+                    continue  # собственные позиции движка синхронизация не удаляет
+                if ticker in broker:
+                    self._scalp_external_missing.pop(ticker, None)
+                    continue
+                missing = self._scalp_external_missing.get(ticker, 0) + 1
+                self._scalp_external_missing[ticker] = missing
+                if missing >= 2:
+                    self._state.drop_position(ticker)
+                    self._scalp_external_missing.pop(ticker, None)
+                    changed_notes.append(f"{ticker}: позиция отсутствует у брокера, сопровождение снято")
+                    log.info("Скальп: позиция %s исчезла из брокерского портфеля; удалена из state", ticker)
+
+        if changed_notes:
+            try:
+                await self._safe_notify("🔄 Синхронизация внешних позиций:\n" + "\n".join(changed_notes)
+                                        + "\nПозиции теперь сопровождаются скальп-правилами.")
+            except Exception:
+                log.debug("Не удалось отправить уведомление о синхронизации позиций")
 
     async def _flush_scalp_ai_queue(self) -> None:
         """Отправляет до трёх свежих локальных кандидатов одним запросом Groq."""
@@ -546,6 +699,13 @@ class TradingEngine:
         now = time.monotonic()
         if self._scalp_last_ai_batch_attempt and now - self._scalp_last_ai_batch_attempt < interval:
             return
+        wait_getter = getattr(self._analyst, "candidate_call_wait_seconds", None)
+        if callable(wait_getter):
+            try:
+                if float(wait_getter(scalp_mode=True) or 0.0) > 0.0:
+                    return  # Сканер/другой пакетный запрос уже использовал общий лимит.
+            except Exception:
+                pass
         # Перед отправкой отбрасываем устаревшие записи: за время ожидания
         # Groq рынок мог измениться, и анализировать уже нечего.
         getter = getattr(self._client, "get_scalp_quote", None)
@@ -582,9 +742,23 @@ class TradingEngine:
         except Exception as exc:  # noqa: BLE001 - fail closed
             log.warning("Scalp AI batch недоступен: %s", exc)
             decisions = {}
-        self.set_ai_batch_decisions(decisions, rows)
-        log.info("Scalp AI batch: отправлено %d кандидата(ов), валидных решений %d",
-                 len(rows), len(decisions))
+        # Если модель не вернула валидный ответ (ошибка/лимит/битый JSON),
+        # не теряем всё ещё свежие ситуации. Реальный HOLD, напротив, не повторяем.
+        if not decisions:
+            for row in rows:
+                ticker = str(row.get("ticker", "")).upper()
+                if ticker and ticker not in self._scalp_ai_queue:
+                    self._scalp_ai_queue[ticker] = dict(row)
+        else:
+            for row in rows:
+                ticker = str(row.get("ticker", "")).upper()
+                if ticker and ticker not in decisions and ticker not in self._scalp_ai_queue:
+                    self._scalp_ai_queue[ticker] = dict(row)
+            decided_rows = [row for row in rows
+                            if str(row.get("ticker", "")).upper() in decisions]
+            self.set_ai_batch_decisions(decisions, decided_rows)
+        log.info("Scalp AI batch: отправлено %d кандидата(ов), валидных решений %d; без ответа оставлено в очереди %d",
+                 len(rows), len(decisions), sum(1 for r in rows if str(r.get("ticker", "")).upper() in self._scalp_ai_queue))
 
         # ИИ только подтверждает кандидата. Перед заявкой заново требуем свежий
         # импульс, стакан и почти неизменившуюся цену.
@@ -890,12 +1064,6 @@ class TradingEngine:
 
     def _cooldown_active(self, ticker: str) -> bool:
         now = time.time()
-        if self.scalp_mode():
-            stop_until = getattr(self._state, "stop_cooldown_until", lambda _t: 0)(ticker)
-            if stop_until > now:
-                log.info("%s: запрет повторного входа после стопа ещё %.0f мин",
-                         ticker, (stop_until - now) / 60.0)
-                return True
         elapsed = now - self._state.last_buy_ts(ticker)
         return elapsed < self._cooldown_sec()
 
@@ -1247,11 +1415,6 @@ class TradingEngine:
                 log.info("%s: достигнут лимит скальп-позиций (%d)",
                          ticker, self._cfg.scalp_max_positions)
                 return
-            pause_until = float(getattr(self._state, "scalp_pause_until", 0) or 0)
-            if pause_until > time.time():
-                log.info("%s: глобальная пауза скальпа ещё %.0f мин",
-                         ticker, (pause_until - time.time()) / 60.0)
-                return
             sector = self._sector(ticker)
             sector_count = sum(1 for t in self._state.positions
                                if self._sector(t) == sector)
@@ -1261,8 +1424,12 @@ class TradingEngine:
                 return
             quote_getter = getattr(self._client, "get_scalp_quote", None)
             quote = quote_getter(ticker) if callable(quote_getter) else None
-            # v1.14.0: триггером может быть и импульс, и остановившаяся яма.
-            trigger = self._any_micro_trigger(quote)
+            # Сохраняем точный вид сигнала, который породил AI-вердикт.
+            # Иначе при повторной проверке импульс мог подменить dip_reversal (или наоборот).
+            cached_trigger = self._scalp_trigger_cache.get(ticker) or {}
+            expected_kind = str(cached_trigger.get("kind") or "")
+            trigger = (self._trigger_by_kind(quote, expected_kind)
+                       if expected_kind else self._any_micro_trigger(quote))
             if trigger is None:
                 log.debug("%s: локальный микроструктурный триггер уже неактуален - HOLD", ticker)
                 return
@@ -1281,8 +1448,8 @@ class TradingEngine:
         # часы входа, повышенный порог после неудач (см. trade_memory.py).
         # v1.14.0: правило «после убытков бумаге не доверяем» отключено
         # (MEMORY_LOSS_STREAK_GUARD=false) и даже при включённом флаге НЕ
-        # действует в скальпе: после стопа бумага снова доступна сразу
-        # после обычного кулдауна SCALP_COOLDOWN_MIN/SCALP_STOP_COOLDOWN_MIN.
+        # действует в скальпе: после стопа бумага снова доступна после
+        # обычного короткого интервала SCALP_COOLDOWN_MIN.
         needed = self._score_threshold()
         conf_req = self._required_confidence()
         # Пользовательские регуляторы агрессивности не могут опустить
@@ -2313,10 +2480,13 @@ class TradingEngine:
         avg_exit = realized_value / max(1, initial_lots)
         shares_total = initial_lots * lot_size
         gross_pnl = (avg_exit - entry) * shares_total if entry > 0 else 0.0
-        cost_pct = float(position.get(
-            "estimated_round_trip_cost_pct",
-            position.get("scalp_round_trip_cost_pct",
-                        self._cfg.estimated_round_trip_cost_pct)) or 0.0)
+        if bool(position.get("scalp_managed")):
+            cost_pct = float(position.get("scalp_expected_round_trip_cost_pct")
+                             or position.get("scalp_round_trip_cost_pct")
+                             or self._cfg.scalp_round_trip_cost_pct)
+        else:
+            cost_pct = float(position.get("estimated_round_trip_cost_pct",
+                                          self._cfg.estimated_round_trip_cost_pct) or 0.0)
         estimated_cost_rub = (entry * shares_total * max(0.0, cost_pct) / 100.0
                               if entry > 0 else 0.0)
         pnl = gross_pnl - estimated_cost_rub
@@ -2339,12 +2509,9 @@ class TradingEngine:
         log.info("%s, ордер %s исполнено лотов: %s",
                  short, result.get("order_id"), result.get("lots_executed"))
 
-        is_stop = "стоп" in reason.lower()
         was_scalp = bool(position.get("scalp_managed"))
-        if was_scalp and is_stop:
-            setter = getattr(self._state, "set_stop_cooldown_until", None)
-            if callable(setter):
-                setter(ticker, time.time() + self._cfg.scalp_stop_cooldown_min * 60.0)
+        # В скальпе не записываем «недоверие после убытка»/stop-cooldown:
+        # повторный вход разрешён после обычного SCALP_COOLDOWN_MIN.
 
         lesson = ""
         if self._cfg.learning_enabled and self._memory is not None:
@@ -2360,24 +2527,8 @@ class TradingEngine:
                     entry_tf_min=int(position.get("entry_tf_min", 0) or 0),
                     signal_score=position.get("signal_score"),
                     llm_confidence=position.get("llm_confidence"))
-                streak = self._memory.loss_streak(ticker)
-                if pnl < 0 and was_scalp:
-                    # v1.14.0: глобальная пауза скальпа после 2 убытков подряд
-                    # теперь тоже часть пакета «недоверие после убытков»:
-                    # включается только MEMORY_LOSS_STREAK_GUARD=true
-                    # (по умолчанию выключена). Владелец скальпит вручную и
-                    # хочет, чтобы бот продолжал заходить после убытков.
-                    if bool(getattr(self._cfg, "memory_loss_streak_guard", False)):
-                        recent = self._memory.trades()[-2:]
-                        if len(recent) == 2 and all(float(t.get("pnl", 0) or 0) < 0 for t in recent):
-                            pause_setter = getattr(self._state, "set_scalp_pause_until", None)
-                            if callable(pause_setter):
-                                pause_setter(time.time() + self._cfg.scalp_loss_pause_minutes * 60.0)
-                            lesson += (f"\n\n🛑 Две убыточные скальп-сделки подряд: "
-                                       f"пауза новых входов на {self._cfg.scalp_loss_pause_minutes} мин.")
-                if pnl < 0 and streak >= 2:
-                    lesson += (f"\n\n🧠 Урок: {streak}-й убыток подряд по {ticker}; "
-                               "повторный вход требует более сильного сигнала.")
+                # Сделки записываются для статистики; результат предыдущих
+                # скальп-сделок не создаёт пауз, запретов или повышенных порогов.
             except Exception as exc:  # noqa: BLE001
                 log.warning("%s: не удалось записать сделку в память: %s", ticker, exc)
 
@@ -2710,10 +2861,13 @@ class TradingEngine:
                     total_profit_pct = ((avg_exit / entry) - 1.0) * 100.0 if entry > 0 else 0.0
                     total_shares = initial_lots * lot_size
                     gross_pnl = ((avg_exit - entry) * total_shares if entry > 0 else 0.0)
-                    cost_pct = float(position.get(
-                        "estimated_round_trip_cost_pct",
-                        position.get("scalp_round_trip_cost_pct",
-                                    self._cfg.estimated_round_trip_cost_pct)) or 0.0)
+                    if bool(position.get("scalp_managed")):
+                        cost_pct = float(position.get("scalp_expected_round_trip_cost_pct")
+                                         or position.get("scalp_round_trip_cost_pct")
+                                         or self._cfg.scalp_round_trip_cost_pct)
+                    else:
+                        cost_pct = float(position.get("estimated_round_trip_cost_pct",
+                                                      self._cfg.estimated_round_trip_cost_pct) or 0.0)
                     estimated_cost_rub = (entry * total_shares * max(0.0, cost_pct) / 100.0
                                           if entry > 0 else 0.0)
                     total_pnl = gross_pnl - estimated_cost_rub

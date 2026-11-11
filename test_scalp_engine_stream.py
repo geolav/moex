@@ -129,6 +129,41 @@ class ScalpEngineStreamTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(engine._check_exit.await_count, 2)
             self.assertTrue(client.started)
 
+    async def test_exit_checks_every_tick_but_graph_history_samples_each_five_seconds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = StateStore(str(Path(tmp) / "state.json"),
+                               initial_overrides={"trading_enabled": False})
+            state.set_scalp_mode(True)
+            state.set_watchlist(["SBER"])
+            state.set_position("SBER", {
+                "lots": 1, "entry_price": 100.0, "entry_epoch": time.time(),
+                "entry_ts": "2026-11-10 13:00:00", "scalp_managed": True,
+                "scalp_risk_pct": 0.8, "scalp_atr_pct": 0.3,
+                "scalp_round_trip_cost_pct": 0.1,
+                "scalp_expected_round_trip_cost_pct": 0.15,
+                "stop_price": 99.2, "tp1_done": False,
+                "scalp_session_key": "unknown",
+            })
+            client = FakeStreamClient({"SBER": make_quote(seq=20)})
+            engine = TradingEngine(make_config(tmp), state, client,
+                                   FakeBatchAnalyst(), notify)
+            engine._check_exit = AsyncMock()  # type: ignore[method-assign]
+            engine._scalp_last_rest_guard = time.monotonic()
+
+            await engine.scalp_stream_cycle()
+            first_count = len(state.price_history("SBER", 1))
+            client.quotes["SBER"] = make_quote(seq=21)
+            await engine.scalp_stream_cycle()
+            self.assertEqual(len(state.price_history("SBER", 1)), first_count,
+                             "быстрые тики не должны писать state чаще 5 секунд")
+            self.assertEqual(engine._check_exit.await_count, 2,
+                             "проверка выхода всё равно выполняется на каждом тике")
+
+            engine._scalp_last_history_record["SBER"] = time.monotonic() - 6.0
+            client.quotes["SBER"] = make_quote(seq=22)
+            await engine.scalp_stream_cycle()
+            self.assertEqual(len(state.price_history("SBER", 1)), first_count + 1)
+
     async def test_ai_queue_sends_top_three_and_consumes_buy_once(self):
         with tempfile.TemporaryDirectory() as tmp:
             state = StateStore(str(Path(tmp) / "state.json"),
@@ -244,6 +279,76 @@ class ScalpEngineStreamTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(attempted, [])
             self.assertFalse(engine._ai_batch_candidates)
+
+
+    async def test_external_broker_position_is_adopted_and_removed_after_two_snapshots(self):
+        class PortfolioClient(FakeStreamClient):
+            def __init__(self):
+                super().__init__({})
+                self.portfolio = [{"ticker": "SBER", "lots": 2,
+                                   "avg_price": 100.0, "price": 100.2}]
+
+            async def get_portfolio_summary(self):
+                return {"positions": list(self.portfolio)}
+
+            def ensure_instrument(self, ticker: str) -> bool:
+                return ticker == "SBER"
+
+            def get_spread_pct(self, ticker: str) -> float:
+                return 0.03
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state = StateStore(str(Path(tmp) / "state.json"),
+                               initial_overrides={"trading_enabled": False})
+            state.set_scalp_mode(True)
+            # Внутренние позиции движка не должны исчезать из state из-за
+            # задержки/неполного снимка брокерского портфеля.
+            state.set_position("GAZP", {
+                "lots": 1, "entry_price": 150.0, "scalp_managed": True,
+                "scalp_external_position": False, "initial_lots": 2,
+                "realized_lots": 1, "realized_exit_value": 151.0,
+            })
+            client = PortfolioClient()
+            engine = TradingEngine(make_config(tmp), state, client,
+                                   FakeBatchAnalyst(), notify)
+
+            await engine._sync_external_scalp_positions(now_mono=100.0)
+            position = state.positions.get("SBER", {})
+            self.assertEqual(position.get("lots"), 2)
+            self.assertEqual(position.get("entry_price"), 100.0)
+            self.assertTrue(position.get("scalp_managed"))
+            self.assertTrue(position.get("scalp_external_position"))
+            self.assertEqual(position.get("scalp_entry_source"), "broker_app")
+            self.assertGreater(float(position.get("scalp_expected_round_trip_cost_pct", 0)), 0.1)
+
+            client.portfolio = []
+            await engine._sync_external_scalp_positions(now_mono=131.0)
+            self.assertIn("SBER", state.positions,
+                          "одного пустого снимка недостаточно для снятия сопровождения")
+            await engine._sync_external_scalp_positions(now_mono=162.0)
+            self.assertNotIn("SBER", state.positions,
+                             "после двух успешных пустых снимков внешняя позиция снимается")
+            self.assertIn("GAZP", state.positions,
+                          "позиция, открытая движком, не должна удаляться синхронизатором")
+            self.assertEqual(state.positions["GAZP"].get("realized_lots"), 1,
+                             "журнал частичного выхода не должен сбрасываться")
+
+    async def test_rest_fallback_uses_configured_ten_second_poll(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_config(tmp)
+            cfg.scalp_exit_poll_sec = 10
+            state = StateStore(str(Path(tmp) / "state.json"),
+                               initial_overrides={"trading_enabled": False})
+            state.set_scalp_mode(True)
+            client = FakeStreamClient()
+            client.scalp_feed_ready = False
+            engine = TradingEngine(cfg, state, client, FakeBatchAnalyst(), notify)
+            engine.exit_cycle = AsyncMock()  # type: ignore[method-assign]
+            engine._scalp_last_rest_guard = time.monotonic() - 11.0
+
+            await engine.scalp_stream_cycle()
+
+            engine.exit_cycle.assert_awaited_once()
 
     async def test_disabled_llm_does_not_spend_groq_or_keep_scalp_candidates(self):
         with tempfile.TemporaryDirectory() as tmp:

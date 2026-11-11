@@ -52,6 +52,31 @@ def sma_series(points: Sequence[Tuple[float, float]], period: int
     return out
 
 
+def time_sma_series(points: Sequence[Tuple[float, float]],
+                    window_sec: float = 3600.0) -> List[Tuple[float, float]]:
+    """Временная SMA: окно задаётся секундами, а не количеством точек.
+
+    Нужна для смешанной истории: биржевые 5m-свечи плюс собственные
+    5-секундные замеры. Обычная SMA(12) на таком неравномерном ряде ошибочно
+    меняла бы горизонт среднего с часа до минуты.
+    """
+    clean = sorted(_clean_points(points), key=lambda item: item[0])
+    if len(clean) < 2 or window_sec <= 0:
+        return []
+    result: List[Tuple[float, float]] = []
+    left = 0
+    total = 0.0
+    for right, (ts, price) in enumerate(clean):
+        total += price
+        cutoff = ts - float(window_sec)
+        while left < right and clean[left][0] < cutoff:
+            total -= clean[left][1]
+            left += 1
+        if right > left:
+            result.append((ts, total / (right - left + 1)))
+    return result
+
+
 def render_group_pngs(series: List[Dict[str, Any]], *,
                       per_photo: int = DEFAULT_PER_PHOTO,
                       suptitle: str = "",

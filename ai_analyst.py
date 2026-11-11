@@ -693,6 +693,16 @@ class AIAnalyst:
             "size_mult": 0.5 if decision.get("size_mult") == 0.5 else 1.0,
         }
 
+    def candidate_call_wait_seconds(self, scalp_mode: bool = False) -> float:
+        """Сколько осталось до следующего разрешённого пакетного вызова Groq."""
+        if scalp_mode:
+            minimum = int(getattr(self._cfg, "scalp_ai_min_request_interval_sec", 240) or 240)
+            last = self._last_scalp_candidate_call_monotonic
+        else:
+            minimum = int(getattr(self._cfg, "ai_min_request_interval_sec", 600) or 600)
+            last = self._last_candidate_call_monotonic
+        return max(0.0, float(minimum) - (time.monotonic() - float(last or 0.0))) if last else 0.0
+
     async def analyze_candidates(self, rows: List[Dict[str, Any]],
                                  scalp_mode: bool = False) -> Dict[str, dict]:
         """Оценивает до трёх уже отфильтрованных кандидатов одним Groq-запросом."""
@@ -791,11 +801,22 @@ class AIAnalyst:
             except AnalystError as exc:
                 log.warning("Пакетный ИИ-анализ кандидатов пропущен: %s", exc)
                 return {}
-        allowed_by_ticker = {
-            str(row.get("ticker", "")).upper(): set(row.get("allowed_setups") or [])
-            for row in rows[:3]
-        }
-        parsed = self._parse_candidate_batch(raw, allowed_by_ticker)
+        allowed_by_ticker: Dict[str, set] = {}
+        fallback_by_ticker: Dict[str, bool] = {}
+        for row in rows[:3]:
+            ticker = str(row.get("ticker", "")).upper()
+            confirmed = set(row.get("allowed_setups") or [])
+            trigger = str(row.get("trigger_kind") or "").lower()
+            if scalp_mode and trigger in {"micro_impulse", "dip_reversal"}:
+                confirmed.add(trigger)
+            # В fallback локальный OHLCV-сетап мог не пройти мягкие фильтры;
+            # ИИ может назвать reversal, но подтверждение требует повышенной уверенности.
+            fallback = bool(row.get("fallback_candidate"))
+            if fallback:
+                confirmed.add("reversal")
+            allowed_by_ticker[ticker] = confirmed
+            fallback_by_ticker[ticker] = fallback
+        parsed = self._parse_candidate_batch(raw, allowed_by_ticker, fallback_by_ticker)
         log.info("Пакетный ИИ-анализ: обработано %d кандидатов, валидных решений %d",
                  len(compact), len(parsed))
         return parsed
@@ -807,7 +828,8 @@ class AIAnalyst:
         return round(float(values[0]), 1) if values else None
 
     @staticmethod
-    def _parse_candidate_batch(raw: str, allowed_by_ticker: Dict[str, set]) -> Dict[str, dict]:
+    def _parse_candidate_batch(raw: str, allowed_by_ticker: Dict[str, set],
+                               fallback_by_ticker: Optional[Dict[str, bool]] = None) -> Dict[str, dict]:
         text = (raw or "").strip()
         start, end = text.find("{"), text.rfind("}")
         if start < 0 or end <= start:
@@ -820,7 +842,9 @@ class AIAnalyst:
         if not isinstance(decisions, dict):
             return {}
         result: Dict[str, dict] = {}
-        allowed_setups = {"pullback", "breakout", "reversal", "none"}
+        allowed_setups = {"pullback", "breakout", "reversal", "micro_impulse",
+                          "dip_reversal", "none"}
+        fallback_by_ticker = fallback_by_ticker or {}
         for ticker, confirmed_setups in allowed_by_ticker.items():
             item = decisions.get(ticker)
             if not isinstance(item, dict):
@@ -837,7 +861,8 @@ class AIAnalyst:
             if setup not in allowed_setups:
                 setup = "none"
             # ИИ не может одобрить buy без сетапа и достаточной уверенности.
-            if action == "buy" and (setup == "none" or confidence < 0.60
+            min_confidence = 0.70 if fallback_by_ticker.get(ticker, False) else 0.60
+            if action == "buy" and (setup == "none" or confidence < min_confidence
                                     or setup not in confirmed_setups):
                 action = "hold"
             result[ticker] = {

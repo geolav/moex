@@ -145,9 +145,9 @@ HELP_TEXT = (
     "сильный сигнал нужен для покупки.\n"
     "• Сентимент - «настроение» новостей, оценка от −1 (плохие новости) "
     "до +1 (хорошие). Бот покупает, только если новостей нет плохих.\n"
-    "• Память сделок - бот запоминает каждую закрытую сделку и делает "
-    "выводы: после серии убытков по бумаге берёт паузу, поднимает к ней "
-    "требования, не покупает в «плохие» часы дня и при достижении дневного "
+    "• Память сделок - бот запоминает каждую закрытую сделку. В обычном "
+    "режиме при включённой защите может учитывать серии убытков; в скальпе "
+    "повторный вход после убытка не блокируется. При достижении дневного "
     "лимита убытка останавливает новые покупки до завтра. Посмотреть: /memory.\n"
     "• Трейлинг-стоп - защита прибыли: если цена выросла больше +2%, а потом "
     "поехала обратно, бот продаёт, как только откат съест 1.5% - так рост "
@@ -842,18 +842,33 @@ def create_router(ctx: AppContext) -> Router:
                    else list(ctx.config.trading_tickers))
         wait = await message.answer(
             f"🖼 Строю графики ({', '.join(tickers)}) за {hours:.0f} ч...")
+        step_h = (1.0 / 12.0) if hours <= 30.0 else 0.25
+        step_min = int(round(step_h * 60.0))
+        history_getter = getattr(ctx.client, "get_candles_history", None)
         histories: Dict[str, list] = {}
         subtitles: Dict[str, str] = {}
         for ticker in tickers:
             try:
-                hist = await ctx.client.get_hourly_history(ticker, hours)
+                hist = (await history_getter(ticker, hours, step_h=step_h)
+                        if callable(history_getter)
+                        else await ctx.client.get_hourly_history(ticker, hours))
                 live = await ctx.client.get_price(ticker)
             except Exception as exc:  # noqa: BLE001 - бумага без данных не решает
                 log.info("%s: график недоступен (%s)", ticker, exc)
                 hist, live = [], None
+            # Добавляем собственные частые замеры (в скальпе до одного каждые
+            # 5 секунд), чтобы линия отражала фактическое сопровождение позиции.
+            # Старые/редкие интервалы остаются заполнены биржевыми свечами.
+            own = ctx.state.price_history(ticker, hours)
+            if own:
+                tolerance = step_h * 3600.0 * 0.5
+                extra = [(ts, px) for ts, px in hist
+                         if all(abs(ts - own_ts) > tolerance
+                                for own_ts, _ in own)]
+                hist = sorted(own + extra)
             # Живая точка "сейчас", чтобы график доходил до текущей цены.
-            if live and (not hist or time.time() - hist[-1][0] > 900):
-                hist = hist + [(time.time(), float(live))]
+            if live and (not hist or time.time() - hist[-1][0] > step_h * 3600.0 * 0.6):
+                hist = sorted(hist + [(time.time(), float(live))])
             if len(hist) >= 2:
                 prices = [p for _, p in hist]
                 chg = (prices[-1] / prices[0] - 1.0) * 100.0 if prices[0] else 0.0
@@ -864,13 +879,16 @@ def create_router(ctx: AppContext) -> Router:
                 "Данных для графиков пока нет (биржа не отдала свечи). "
                 "Попробуйте позже или посмотрите цифры: /stats")
             return
-        items = charts.build_chart_items(histories, sma_period=6,
+        items = charts.build_chart_items(histories, sma_period=0,
                                          subtitles=subtitles)
+        # Смешанная история имеет неравномерную частоту (5m свечи + 5s замеры),
+        # поэтому среднюю считаем по часовому окну времени, а не по 12 точкам.
+        for item in items:
+            item["sma"] = charts.time_sma_series(item["points"], window_sec=3600.0)
         pngs = charts.render_group_pngs(
             items, per_photo=3,
-            suptitle=(f"Бумаги под управлением, {hours:.0f} ч "
-                      "(оранжевый пунктир - средняя 6 ч, "
-                      "красный - цена покупки)"),
+            suptitle=(f"Бумаги под управлением, {hours:.0f} ч; свечи {step_min} мин "
+                      "(оранжевый пунктир - средняя ≈1 ч, красный - цена покупки)"),
             positions=dict(ctx.state.positions))
         if not pngs:
             await wait.edit_text(
@@ -1126,8 +1144,8 @@ def create_router(ctx: AppContext) -> Router:
             f"{ctx.config.scalp_ai_min_request_interval_sec // 60} мин;\n"
             f"• тайм-стоп {ctx.config.scalp_time_stop_min} мин; входы только "
             "10:15–18:20 МСК; спред ≤0.10%;\n"
-            f"• правило «после убытков бумаге не доверяем» ВЫКЛЮЧЕНО; после "
-            f"стопа пауза по бумаге {ctx.config.scalp_stop_cooldown_min} мин;\n"
+            "• повторный вход после убыточной сделки не блокируется памятью/стоп-кулдауном; "
+            f"остаётся обычный интервал {ctx.config.scalp_cooldown_min} мин между входами одной бумаги;\n"
             f"• ручные покупки (/buy) сопровождаю ровно так же: быстрый тейк, "
             f"стоп, опрос цены каждые "
             f"{max(5, int(ctx.config.scalp_exit_poll_sec))} сек;\n"
@@ -1292,22 +1310,25 @@ async def _stats_text(ctx: AppContext, hours: float) -> Tuple[str, list]:
 
     for ticker in tickers:
         hist = ctx.state.price_history(ticker, hours)
-        # Достраиваю историю часовыми свечами с биржи всегда: мои замеры
-        # живут максимум ~8 ч (100 точек по 5 мин) и теряются при рестарте.
-        # Сливаю оба источника (мои точки главнее) и режу строго к окну,
-        # т.к. биржа отдаёт свечи с запасом (hours * 1.5 + 3).
+        # Для короткой статистики нужны плотные замеры: 5m до 30 часов,
+        # затем 15m, чтобы не упираться в лимит 400 свечей.
+        step_h = (1.0 / 12.0) if hours <= 30.0 else 0.25
         try:
-            exch = await ctx.client.get_hourly_history(ticker, hours)
+            candle_getter = getattr(ctx.client, "get_candles_history", None)
+            exch = (await candle_getter(ticker, hours, step_h=step_h)
+                    if callable(candle_getter)
+                    else await ctx.client.get_hourly_history(ticker, hours))
         except Exception as exc:  # noqa: BLE001 - обойдёмся своими точками
             log.warning("%s: история с биржи недоступна (%s)", ticker, exc)
             exch = []
         if exch:
-            # Свечи, рядом с которыми есть своя точка (±30 мин), убираю:
-            # своя точка замеряется чаще и точнее. Свечи между ними - остаются:
-            # они и достраивают историю до полного окна.
+            # Биржевую свечу убираю только рядом со своей точкой (±половина
+            # таймфрейма), а не ±30 минут: старый допуск выкидывал почти все
+            # 5-минутные точки и делал графики визуально разреженными.
             own = sorted(hist)
+            tolerance = step_h * 3600.0 * 0.5
             extra = [(ts, p) for ts, p in exch
-                     if all(abs(ts - ots) > 1800 for ots, _ in own)]
+                     if all(abs(ts - ots) > tolerance for ots, _ in own)]
             hist = sorted(own + extra)
         hist = [(ts, p) for ts, p in hist
                 if ts >= time.time() - hours * 3600.0]

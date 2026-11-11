@@ -362,8 +362,10 @@ class TinkoffClient:
                 }
         self._universe = universe
         self._instruments = found
-        self._ticker_by_figi = {info["figi"]: t for t, info in found.items()}
-        self._ticker_by_uid = {info["uid"]: t for t, info in found.items() if info.get("uid")}
+        # Портфель может содержать бумаги, купленные вручную вне TRADING_TICKERS.
+        # Карта всех бумаг TQBR нужна для распознавания таких позиций и их сопровождения.
+        self._ticker_by_figi = {info["figi"]: t for t, info in universe.items()}
+        self._ticker_by_uid = {info["uid"]: t for t, info in universe.items() if info.get("uid")}
         missing = wanted - set(found)
         if missing:
             log.warning("Тикеры не найдены на MOEX (проверьте написание): %s",
@@ -728,8 +730,9 @@ class TinkoffClient:
         return out
 
     def get_lot_size(self, ticker: str) -> int:
-        """Размер лота бумаги из кэша инструментов (1, если тикер неизвестен)."""
-        return int(self._instruments.get(ticker, {}).get("lot", 1))
+        """Размер лота из рабочего кэша или всей вселенной TQBR."""
+        info = self._instruments.get(ticker) or self._universe.get(ticker) or {}
+        return int(info.get("lot", 1))
 
     def instrument_name(self, ticker: str) -> str:
         """Название компании из кэша инструментов (для сообщений)."""
@@ -1020,7 +1023,7 @@ class TinkoffClient:
             lots = (int(quotation_to_decimal(quantity_lots))
                     if quantity_lots is not None else 0)
             if not lots:  # quantity_lots иногда пуст - считаем из лота бумаги
-                lot_size = self._instruments.get(ticker, {}).get("lot", 1)
+                lot_size = (self._instruments.get(ticker) or self._universe.get(ticker) or {}).get("lot", 1)
                 lots = int(quantity // lot_size)
             positions.append({
                 "ticker": ticker,

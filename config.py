@@ -230,7 +230,8 @@ class BotConfig:
     scalp_time_stop_min: int
     scalp_min_progress_r: float
     scalp_loss_pause_minutes: int
-    scalp_stop_cooldown_min: int
+    scalp_stop_cooldown_min: int  # legacy, не блокирует повторный scalp-вход
+    scalp_portfolio_sync_sec: int  # как часто замечать ручные покупки в брокерском приложении
     scalp_max_sector_positions: int
     # --- Быстрый тейк «как у владельца» (v1.14.0) -----------------------------
     # Продать ВСЁ, как только цена поднялась достаточно, чтобы быть в плюсе
@@ -447,8 +448,11 @@ def load_config() -> BotConfig:
                                         low=0.0, high=2.0),
         scalp_loss_pause_minutes=_env_int("SCALP_LOSS_PAUSE_MIN", 60,
                                           low=5, high=360),
-        scalp_stop_cooldown_min=_env_int("SCALP_STOP_COOLDOWN_MIN", 45,
-                                         low=30, high=1440),
+        # Legacy-переменная оставлена для совместимости; в скальпе стоп-кулдауна нет.
+        scalp_stop_cooldown_min=_env_int("SCALP_STOP_COOLDOWN_MIN", 0,
+                                         low=0, high=1440),
+        scalp_portfolio_sync_sec=_env_int("SCALP_PORTFOLIO_SYNC_SEC", 30,
+                                          low=15, high=300),
         scalp_max_sector_positions=_env_int("SCALP_MAX_SECTOR_POSITIONS", 2,
                                             low=1, high=4),
         # v1.14.0: быстрый тейк «как у владельца». Цель = круговые издержки
@@ -779,10 +783,10 @@ class StateStore:
 
     # --- история цен для /stats -------------------------------------------------
     #: 2 точки/час * 50 часов - файл state.json останется крошечным (< 40 КБ).
-    PRICE_HISTORY_MAX_POINTS = 100
+    PRICE_HISTORY_MAX_POINTS = 2000
 
     def record_price(self, ticker: str, price: float) -> None:
-        """Точка истории цен: движок вызывает её раз в цикл опроса (5 мин)."""
+        """Сохраняет замер цены для /stats и /charts; историю ограничиваем точками."""
         hist: List[List[float]] = (
             self._data.setdefault("price_history", {}).setdefault(ticker, []))
         hist.append([round(time.time(), 1), round(price, 4)])
