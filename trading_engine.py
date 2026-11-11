@@ -396,6 +396,74 @@ class TradingEngine:
         slippage = max(0.0, float(getattr(self._cfg, "slippage_pct", 0.0) or 0.0))
         return spread + commission + slippage
 
+    @staticmethod
+    def _trigger_expected_move_pct(trigger: Optional[Dict[str, Any]]) -> float:
+        """v1.17.3: ожидаемое благоприятное движение триггера в % (0 - без прогноза).
+
+        У ямы это потенциал отскока к средней окна (rebound_to_mean_pct),
+        у импульса - прогноз на 30 секунд (projected_30s_pct). Именно эта
+        величина - честная "награда" скальпа: позиция закрывается, как только
+        брутто-рост покрывает издержки круга.
+        """
+        if not trigger:
+            return 0.0
+        best = 0.0
+        for key in ("rebound_to_mean_pct", "rebound_to_vwap_pct",
+                    "projected_30s_pct"):
+            try:
+                value = float(trigger.get(key) or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if value > best:
+                best = value
+        return best
+
+    def _scalp_fasttrack_decision(self, micro: Dict[str, Any],
+                                  round_trip_cost: float,
+                                  breakeven_confidence: float) -> Optional[Dict[str, Any]]:
+        """v1.17.3: быстрый локальный вход для очень сильных ям.
+
+        Groq batch отвечает не чаще раза в 4 минуты (лимит токенов), а жизнь
+        микроямы - десятки секунд: к моменту ответа ИИ сигнал успевал
+        протухать, и покупок не было вовсе. Поэтому ямы с высоким score и
+        потенциалом, заметно покрывающим издержки, покупаются сразу, без
+        ожидания ИИ. ИИ продолжает управлять вселенной бумаг (сканер),
+        подтверждать средние сигналы пакетами и разбирать сделки аудитором.
+        Отключается SCALP_FASTTRACK_ENABLED=false.
+        """
+        if not bool(getattr(self._cfg, "scalp_fasttrack_enabled", True)):
+            return None
+        kind = str(micro.get("kind") or "")
+        if not (bool(micro.get("micro_dip")) or kind == "dip_reversal"):
+            return None  # быстрый трек - только для ям; импульсы ждут ИИ
+        try:
+            bottom_score = float(micro.get("bottom_score") or 0.0)
+        except (TypeError, ValueError):
+            bottom_score = 0.0
+        min_score = max(0.0, float(getattr(
+            self._cfg, "scalp_fasttrack_min_score", 75.0) or 75.0))
+        if bottom_score < min_score:
+            return None
+        expected = self._trigger_expected_move_pct(micro)
+        cost = max(0.0, float(round_trip_cost or 0.0))
+        mult = max(1.0, float(getattr(
+            self._cfg, "scalp_fasttrack_cost_multiple", 1.25) or 1.25))
+        if cost <= 0 or expected < mult * cost:
+            return None
+        # Уверенность не выдумывается: она обязана перекрывать безубыточную
+        # вероятность сделки (та же планка, что для вердикта ИИ).
+        base = 0.72 + 0.10 * min(1.0, max(0.0, bottom_score - min_score) / 20.0)
+        confidence = max(base, float(breakeven_confidence or 0.0) + 0.06)
+        confidence = min(0.92, confidence)
+        return {
+            "action": "buy",
+            "confidence": round(confidence, 3),
+            "setup": kind or "dip_reversal",
+            "reason": (f"сильная яма: score {bottom_score:.0f}/100, потенциал "
+                       f"{expected:.2f}% = {expected / cost:.2f}x издержек "
+                       f"{cost:.2f}%"),
+        }
+
     def _price_only_kwargs(self) -> Dict[str, Any]:
         """Общие kwargs деградации без стакана (v1.17.2) для всех детекторов.
 
@@ -680,17 +748,22 @@ class TradingEngine:
                 if now - last_signal_log >= 45.0:
                     self._scalp_local_signal_log_last[ticker] = now
                     if signal.get("micro_dip"):
+                        # v1.17.3: честная формулировка. Здесь сигнал только
+                        # распознан; фильтры входа (ATR/спред/издержки/брэдс/
+                        # анти-погоня/новости) прогоняет _process_ticker, и
+                        # только после них кандидат попадает в очередь Groq.
                         log.info(
                             "Микрояма %s: масштаб %.0fс, глубина %.4f%%, отскок %.4f%%, "
                             "потенциал %.4f%%, стакан %.2fx, score %.1f/100; "
-                            "кандидат передан в ограниченную AI-очередь",
+                            "сигнал распознан, прогоняю фильтры входа",
                             ticker, signal.get("dip_scale_sec", 0.0),
                             signal.get("dip_drop_pct", 0.0), signal.get("off_low_pct", 0.0),
                             signal.get("rebound_to_mean_pct", 0.0),
                             signal.get("bid_ask_imbalance", 0.0),
                             signal.get("bottom_score", 0.0))
                     else:
-                        log.info("Микроструктурный сигнал %s: %s; кандидат передан в AI-очередь",
+                        log.info("Микроструктурный сигнал %s: %s; сигнал распознан, "
+                                 "прогоняю фильтры входа",
                                  ticker, signal.get("kind", "micro_impulse"))
                 # _process_ticker запишет эту цену в историю один раз.
                 await self._process_ticker(ticker, current_price=price)
@@ -1796,9 +1869,32 @@ class TradingEngine:
                 log.info("%s: спред %.3f%% выше лимита %.3f%%",
                          ticker, float(spread_pct), self._cfg.scalp_max_spread_pct)
                 return
-            if stop_pct < self._cfg.scalp_min_reward_cost_multiple * round_trip_cost:
-                log.info("%s: ход до TP1 %.3f%% не покрывает издержки %.3fx",
-                         ticker, stop_pct, stop_pct / max(round_trip_cost, 1e-9))
+            # v1.17.3: экономику входа считаем от ОЖИДАЕМОГО движения триггера
+            # (потенциал отскока ямы / прогноз импульса), а не от стопа. Раньше
+            # "наградой" в этой проверке была плановая стоп-дистанция: при
+            # SCALP_MIN_REWARD_COST_MULTIPLE=4.0 и стопе 0.6% порог требовал
+            # ход >= 0.667% и был невыполним - фильтр гасил ВСЕ кандидаты
+            # (в логах: "ход до TP1 0.600% не покрывает издержки 3.4-3.8x").
+            expected_move = self._trigger_expected_move_pct(trigger)
+            reward_multiple = max(1.0, float(getattr(
+                self._cfg, "scalp_min_reward_cost_multiple", 1.10) or 1.10))
+            if expected_move > 0:
+                needed_move = reward_multiple * round_trip_cost
+                if expected_move < needed_move:
+                    log.info("%s: потенциал %.3f%% = %.2fx издержек %.3f%% "
+                             "(нужно >= %.2fx) - вход отменён",
+                             ticker, expected_move,
+                             expected_move / max(round_trip_cost, 1e-9),
+                             round_trip_cost, reward_multiple)
+                    return
+            elif stop_pct < reward_multiple * round_trip_cost:
+                # Триггер без прогноза (не должен случаться в скальпе):
+                # консервативный fallback на старую проверку по стопу.
+                log.info("%s: ход до цели %.3f%% = %.2fx издержек %.3f%% "
+                         "(нужно >= %.2fx) - вход отменён",
+                         ticker, stop_pct,
+                         stop_pct / max(round_trip_cost, 1e-9),
+                         round_trip_cost, reward_multiple)
                 return
             summary["atr_pct"] = float(atr_pct)
             summary["spread_pct"] = float(spread_pct)
@@ -1931,6 +2027,7 @@ class TradingEngine:
                 and batch_price > 0
                 and abs(price / batch_price - 1.0) <= 0.0015
             )
+            decision: Optional[Dict[str, Any]] = None
             if not has_fresh_verdict:
                 micro = dict(self._scalp_trigger_cache.get(ticker) or {})
                 be_stop = float(summary.get("planned_stop_pct") or 0.0)
@@ -1941,39 +2038,48 @@ class TradingEngine:
                 # v1.14.0: у ямы нет projected_30s_pct - берём её потенциал
                 # отскока к VWAP окна; у импульса - прогноз на 30 сек.
                 trigger_kind = str(micro.get("kind") or "micro_impulse")
-                projected = float(micro.get("projected_30s_pct")
-                                  or micro.get("rebound_to_vwap_pct") or 0.0)
-                rank_score = 50.0 + max(-1.0, min(1.0, score)) * 20.0
-                rank_score += min(10.0, max(0.0, projected) * 100.0)
-                # Качество именно локального дна влияет на приоритет в batch:
-                # сильные свежие микроямы не теряются среди обычных импульсов.
-                rank_score += min(15.0, max(0.0, float(
-                    micro.get("bottom_score", 0.0) or 0.0)) * 0.15)
-                self._scalp_ai_queue[ticker] = {
-                    "ticker": ticker,
-                    "price": price,
-                    "rank_score": rank_score,
-                    "score": score,
-                    "summary": summary,
-                    "allowed_setups": list(allowed_setups),
-                    "trigger_kind": trigger_kind,
-                    "atr_pct": summary.get("atr_pct"),
-                    "planned_stop_pct": summary.get("planned_stop_pct"),
-                    "round_trip_cost_pct": summary.get("round_trip_cost_pct"),
-                    "breakeven_probability": be_conf,
-                    "spread_pct": summary.get("spread_pct"),
-                    "entry_context": entry_context or {},
-                    "market_breadth_pct": ((self._market_context or {}).get("breadth_pct")),
-                    "microstructure": micro,
-                    "day_chg_pct": summary.get("chg_1h"),
-                    "turnover": 0.0,
-                }
-                log.info("%s: локальные фильтры пройдены (%s); кандидат добавлен в очередь Groq batch",
-                         ticker, trigger_kind)
-                return
-            decision = await self._get_llm_decision(ticker, price, summary, score,
-                                                    sentiment, history,
-                                                    morning_ctx=morning_ctx)
+                # v1.17.3: быстрый трек сильных ям - вход без ожидания Groq.
+                fasttrack = self._scalp_fasttrack_decision(micro, be_cost, be_conf)
+                if fasttrack is not None:
+                    self._scalp_ai_queue.pop(ticker, None)
+                    decision = fasttrack
+                    log.info("%s: БЫСТРЫЙ ТРЕК ямы: %s - вхожу без ожидания "
+                             "Groq batch", ticker, decision.get("reason"))
+                else:
+                    projected = float(micro.get("projected_30s_pct")
+                                      or micro.get("rebound_to_vwap_pct") or 0.0)
+                    rank_score = 50.0 + max(-1.0, min(1.0, score)) * 20.0
+                    rank_score += min(10.0, max(0.0, projected) * 100.0)
+                    # Качество именно локального дна влияет на приоритет в batch:
+                    # сильные свежие микроямы не теряются среди обычных импульсов.
+                    rank_score += min(15.0, max(0.0, float(
+                        micro.get("bottom_score", 0.0) or 0.0)) * 0.15)
+                    self._scalp_ai_queue[ticker] = {
+                        "ticker": ticker,
+                        "price": price,
+                        "rank_score": rank_score,
+                        "score": score,
+                        "summary": summary,
+                        "allowed_setups": list(allowed_setups),
+                        "trigger_kind": trigger_kind,
+                        "atr_pct": summary.get("atr_pct"),
+                        "planned_stop_pct": summary.get("planned_stop_pct"),
+                        "round_trip_cost_pct": summary.get("round_trip_cost_pct"),
+                        "breakeven_probability": be_conf,
+                        "spread_pct": summary.get("spread_pct"),
+                        "entry_context": entry_context or {},
+                        "market_breadth_pct": ((self._market_context or {}).get("breadth_pct")),
+                        "microstructure": micro,
+                        "day_chg_pct": summary.get("chg_1h"),
+                        "turnover": 0.0,
+                    }
+                    log.info("%s: локальные фильтры пройдены (%s); кандидат добавлен в очередь Groq batch",
+                             ticker, trigger_kind)
+                    return
+            if decision is None:
+                decision = await self._get_llm_decision(ticker, price, summary, score,
+                                                        sentiment, history,
+                                                        morning_ctx=morning_ctx)
         else:
             decision = await self._get_llm_decision(ticker, price, summary, score,
                                                     sentiment, history,

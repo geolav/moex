@@ -227,6 +227,10 @@ class BotConfig:
     scalp_max_spread_pct: float
     scalp_round_trip_cost_pct: float
     scalp_min_reward_cost_multiple: float
+    # v1.17.3: быстрый трек сильных ям - вход без ожидания Groq batch.
+    scalp_fasttrack_enabled: bool
+    scalp_fasttrack_min_score: float
+    scalp_fasttrack_cost_multiple: float
     scalp_time_stop_min: int
     scalp_min_progress_r: float
     scalp_loss_pause_minutes: int
@@ -448,11 +452,21 @@ def load_config() -> BotConfig:
                                         low=0.01, high=0.1),
         scalp_round_trip_cost_pct=_env_float("SCALP_ROUND_TRIP_COST_PCT", 0.1,
                                              low=0.0, high=1.0),
-        # v1.9.0: минимум 4.0 по правилу «издержки не съедают больше ~25-30%
-        # цели» (fortraders scalp-trading-ai): при цели 1R и издержках c
-        # безубыточная вероятность = (R+c)/(2R); при R>=4c она <= 62.5%.
-        scalp_min_reward_cost_multiple=_env_float("SCALP_MIN_REWARD_COST_MULTIPLE", 4.0,
+        # v1.17.3: множитель применяется к ОЖИДАЕМОМУ движению триггера
+        # (потенциал отскока ямы / прогноз импульса) против полного круга
+        # издержек. Раньше сравнивался плановый стоп (0.6%) с 4x издержек -
+        # порог требовал ход >=0.667% и был невыполним, отменяя все
+        # скальп-входы. 1.10 = запас 10% поверх безубыточности.
+        scalp_min_reward_cost_multiple=_env_float("SCALP_MIN_REWARD_COST_MULTIPLE", 1.10,
                                                   low=1.0, high=10.0),
+        # v1.17.3: быстрый трек очень сильных ям (score >= 75, потенциал
+        # >= 1.25x издержек): вход сразу, без ожидания Groq batch, который
+        # отвечает раз в 4 минуты и не успевал за микроямами.
+        scalp_fasttrack_enabled=_env_bool("SCALP_FASTTRACK_ENABLED", True),
+        scalp_fasttrack_min_score=_env_float("SCALP_FASTTRACK_MIN_SCORE", 75.0,
+                                             low=0.0, high=100.0),
+        scalp_fasttrack_cost_multiple=_env_float("SCALP_FASTTRACK_COST_MULTIPLE", 1.25,
+                                                 low=1.0, high=10.0),
         scalp_time_stop_min=_env_int("SCALP_TIME_STOP_MIN", 30, low=5, high=240),
         scalp_min_progress_r=_env_float("SCALP_MIN_PROGRESS_R", 0.3,
                                         low=0.0, high=2.0),

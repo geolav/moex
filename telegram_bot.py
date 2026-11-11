@@ -76,7 +76,7 @@ from trade_costs import estimate_round_trip_pnl, position_round_trip_cost_pct, f
 
 log = logging.getLogger("telegram")
 
-VERSION = "1.17.2"
+VERSION = "1.17.3"
 
 HELP_TEXT = (
     "Команды (можно не печатать - жмите кнопки на клавиатуре ниже чата):\n"
