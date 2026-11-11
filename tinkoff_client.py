@@ -191,6 +191,11 @@ class TinkoffClient:
         self._scalp_book_rest_last: Dict[str, float] = {}
         self._scalp_book_rest_cursor = 0
         self._scalp_book_rest_lock = asyncio.Lock()
+        # Цена last-price не всегда приходит по всем подпискам одинаково часто.
+        # Один пакетный REST-запрос подстраховывает устаревшие цены без N запросов.
+        self._scalp_price_rest_last = 0.0
+        self._scalp_price_rest_log_last = 0.0
+        self._scalp_price_rest_lock = asyncio.Lock()
         self._ohlc_cache: Dict[str, List[Dict[str, float]]] = {}
         self._spread_cache: Dict[str, Tuple[float, float]] = {}
         # Полная вселенная акций основного режима торгов TQBR (~250 бумаг):
@@ -262,6 +267,8 @@ class TinkoffClient:
         self._scalp_quotes.clear()
         self._scalp_book_rest_last.clear()
         self._scalp_book_rest_cursor = 0
+        self._scalp_price_rest_last = 0.0
+        self._scalp_price_rest_log_last = 0.0
         self._ohlc_cache.clear()
         self._spread_cache.clear()
 
@@ -630,6 +637,7 @@ class TinkoffClient:
                     quote["price"] = price
                     quote["price_updated_mono"] = now_mono
                     quote["price_age_sec"] = 0.0
+                    quote["price_source"] = "stream"
                     ticks = quote.setdefault("ticks", deque(maxlen=120))
                     if not ticks or abs(float(ticks[-1]["price"]) - price) > 1e-12:
                         ticks.append({"ts": now_mono, "price": price})
@@ -657,6 +665,109 @@ class TinkoffClient:
                               "book_updated_mono": now_mono, "book_age_sec": 0.0})
                 mid = (bid + ask) / 2.0 if bid > 0 and ask > bid else 0.0
                 quote["spread_pct"] = ((ask - bid) / mid * 100.0 if mid > 0 else 0.0)
+
+    async def refresh_stale_prices(self, tickers: List[str], *,
+                                   refresh_sec: float = 5.0,
+                                   max_age_sec: float = 3.0) -> int:
+        """Пакетно обновляет цены бумаг, по которым last-price stream устарел.
+
+        Это резерв именно ДЛЯ ЦЕНЫ (не стакана). Все stale FIGI запрашиваются
+        одним GetLastPrices; свежий stream никогда не перезаписывается REST.
+        REST-снимки добавляются в ограниченный буфер как временные точки, но
+        источник явно маркируется, чтобы Supervisor мог разделять stream/REST.
+        """
+        if self._api is None:
+            return 0
+        async with self._scalp_price_rest_lock:
+            now = time.monotonic()
+            if now - self._scalp_price_rest_last < max(1.0, float(refresh_sec)):
+                return 0
+            symbols = list(dict.fromkeys(str(t).strip().upper() for t in tickers if t))
+            stale: List[str] = []
+            figis: List[str] = []
+            for ticker in symbols:
+                info = self._instruments.get(ticker) or {}
+                figi = str(info.get("figi") or "")
+                if not figi:
+                    continue
+                quote = self._scalp_quotes.get(ticker) or {}
+                price_ts = float(quote.get("price_updated_mono", 0.0) or 0.0)
+                source = str(quote.get("price_source") or "")
+                if source == "stream" and price_ts and now - price_ts <= max_age_sec:
+                    continue
+                stale.append(ticker)
+                figis.append(figi)
+            if not figis:
+                return 0
+            self._scalp_price_rest_last = now
+            try:
+                response = await self._call(
+                    "get_last_prices(scalp_rest_batch)",
+                    lambda: self._api.market_data.get_last_prices(figi=list(figis)),
+                    tries=1,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - fallback is optional
+                log.warning("Scalp REST price fallback: пакет GetLastPrices не удался: %s", exc)
+                return 0
+
+            by_figi = {str((self._instruments.get(t) or {}).get("figi") or ""): t
+                       for t in stale}
+            by_uid = {str((self._instruments.get(t) or {}).get("uid") or ""): t
+                      for t in stale}
+            updated = 0
+            returned = list(getattr(response, "last_prices", []) or [])
+            for index, item in enumerate(returned):
+                figi = str(getattr(item, "figi", "") or "")
+                uid = str(getattr(item, "instrument_uid", "") or "")
+                ticker = by_figi.get(figi) or by_uid.get(uid)
+                # Только если SDK вообще не вернул идентификатор, сохраняем
+                # порядок FIGI. Не приписываем чужую цену незнакомого FIGI.
+                if not ticker and not (figi or uid) and index < len(stale):
+                    ticker = stale[index]
+                if not ticker:
+                    continue
+                price = self._stream_number(getattr(item, "price", None))
+                if price <= 0:
+                    continue
+                current = self._scalp_quotes.setdefault(
+                    ticker, {"ticks": deque(maxlen=120)})
+                # Если stream обновился во время REST-запроса, оставляем stream.
+                current_ts = float(current.get("price_updated_mono", 0.0) or 0.0)
+                if (str(current.get("price_source") or "") == "stream"
+                        and current_ts > now - max_age_sec):
+                    continue
+                sample_ts = time.monotonic()
+                old_price = self._stream_number(current.get("price", 0.0))
+                changed = old_price <= 0 or abs(price - old_price) > 1e-12
+                ticks = current.setdefault("ticks", deque(maxlen=120))
+                # Снимок раз в несколько секунд полезен как временной контекст,
+                # даже если последняя сделка не сменила цену. Но detector sequence
+                # растёт только на изменении цены: одинаковые REST-ответы не
+                # запускают повторный анализ и не изображают биржевые сделки.
+                ticks.append({"ts": sample_ts, "price": price, "source": "rest_snapshot"})
+                current.update({
+                    "price": price,
+                    # Last price был только что проверен через API. Это время
+                    # свежести снимка, а не время последней сделки на бирже.
+                    "price_updated_mono": sample_ts,
+                    "price_source": "rest",
+                    "price_age_sec": 0.0,
+                    "price_seq": int(current.get("price_seq", 0) or 0) + (1 if changed else 0),
+                })
+                updated += 1
+            log_now = time.monotonic()
+            if log_now - float(getattr(self, "_scalp_price_rest_log_last", 0.0)) >= 60.0:
+                self._scalp_price_rest_log_last = log_now
+                if updated:
+                    log.info("Scalp REST price fallback: проверено цен %d/%d stale-бумаг "
+                             "одним пакетным GetLastPrices; seq растёт только при изменении цены",
+                             updated, len(stale))
+                else:
+                    log.warning("Scalp REST price fallback: для %d stale-бумаг API не вернул цен",
+                                len(stale))
+            return updated
 
     def get_scalp_quote(self, ticker: str) -> Optional[Dict[str, Any]]:
         """Копия текущей потоковой цены, стакана и последних тиков."""

@@ -56,6 +56,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import os
 import time
 from datetime import datetime
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
@@ -135,6 +136,7 @@ class TradingEngine:
         # TradeMemory - долговременная память о завершённых сделках
         # (винрейт, серии убытков, плохие часы). None = обучение выключено.
         self._memory = memory
+        self._supervisor = None  # независимый модуль телеметрии/самообучения
         self._stop_event = asyncio.Event()
         # Кэш сентимента: ticker -> (monotonic-время, оценка). Держит Groq-лимиты.
         self._sentiment_cache: Dict[str, tuple[float, float]] = {}
@@ -341,6 +343,10 @@ class TradingEngine:
             log.info("Нормализация scalp-позиций: %d шт.; проверены стопы, "
                      "время входа и идентификаторы торговой сессии", changed)
 
+    def attach_supervisor(self, supervisor) -> None:
+        """Подключает необязательный Supervisor без связи с торговыми решениями."""
+        self._supervisor = supervisor
+
     # -------------------------------------------------------------- жизненный цикл
     def request_stop(self) -> None:
         self._stop_event.set()
@@ -483,14 +489,20 @@ class TradingEngine:
             legacy["kind"] = "dip_reversal"
             signals.append(legacy)
         diagnostics: Dict[str, Any] = {}
+        supervisor = getattr(self, "_supervisor", None)
+        policy = supervisor.current_policy() if supervisor is not None else {}
+        min_drop = float(policy.get(
+            "dip_min_drop_pct",
+            getattr(self._cfg, "scalp_micro_dip_min_drop_pct", None) or 0.02))
+        min_score = float(policy.get(
+            "dip_min_score",
+            getattr(self._cfg, "scalp_micro_dip_min_score", None) or 48.0))
         micro = detect_multiscale_dip_trigger(
             quote,
             max_spread_pct=float(self._cfg.scalp_max_spread_pct),
             round_trip_cost_pct=cost_pct,
-            min_local_drop_pct=float(
-                getattr(self._cfg, "scalp_micro_dip_min_drop_pct", None) or 0.02),
-            min_score=float(
-                getattr(self._cfg, "scalp_micro_dip_min_score", None) or 48.0),
+            min_local_drop_pct=min_drop,
+            min_score=min_score,
             allow_price_only=bool(getattr(self._cfg, "scalp_micro_price_only", True)),
             default_spread_pct=float(getattr(self._cfg, "scalp_default_spread_pct", 0.05)),
             diagnostics=diagnostics,
@@ -505,6 +517,37 @@ class TradingEngine:
             )
             signals.append(micro)
         return max(signals, key=lambda item: float(item.get("bottom_score", 0.0))) if signals else None
+
+    def _shadow_dip_trigger(self, quote: Optional[Dict[str, Any]]) -> Optional[Dict[str, float]]:
+        """Более мягкий теневой детектор: только измеряет пропущенные сетапы.
+
+        Результат НИКОГДА не отправляет ордер. После lookahead Supervisor
+        проверяет, достигла ли цель раньше стопа, и учится на этих метках.
+        """
+        if not quote or not bool(getattr(self._cfg, "scalp_dip_enabled", True)):
+            return None
+        supervisor = getattr(self, "_supervisor", None)
+        policy = supervisor.current_policy() if supervisor is not None else {}
+        base_drop = float(policy.get(
+            "dip_min_drop_pct",
+            getattr(self._cfg, "scalp_micro_dip_min_drop_pct", 0.02)))
+        base_score = float(policy.get(
+            "dip_min_score",
+            getattr(self._cfg, "scalp_micro_dip_min_score", 48.0)))
+        diagnostics: Dict[str, Any] = {}
+        signal = detect_multiscale_dip_trigger(
+            quote,
+            max_spread_pct=float(self._cfg.scalp_max_spread_pct),
+            round_trip_cost_pct=self._scalp_micro_cost_pct(quote),
+            min_local_drop_pct=max(0.005, base_drop * 0.5),
+            min_score=max(30.0, base_score - 18.0),
+            allow_price_only=bool(getattr(self._cfg, "scalp_micro_price_only", True)),
+            default_spread_pct=float(getattr(self._cfg, "scalp_default_spread_pct", 0.05)),
+            diagnostics=diagnostics,
+        )
+        if signal is not None:
+            signal["kind"] = "shadow_dip_reversal"
+        return signal
 
     def _trigger_by_kind(self, quote: Optional[Dict[str, Any]],
                          kind: str) -> Optional[Dict[str, float]]:
@@ -548,8 +591,9 @@ class TradingEngine:
         """Обрабатывает свежие T-Invest ticks: локально ищет импульс,
         пакетирует максимум три ситуации для ИИ и сопровождает позиции без LLM.
 
-        Если market-data stream недоступен/устарел, новые сделки запрещены;
-        уже открытые позиции продолжают охраняться резервным REST-циклом.
+        Приоритет у market-data stream. Если он молчит, пакетный GetLastPrices
+        поддерживает резервные ценовые снимки; источник и частота явно маркируются.
+        REST-снимки реже потока, поэтому не считаются полноценной лентой тиков.
         """
         now = time.monotonic()
         # Подхватываем акции, купленные напрямую в приложении брокера. Синхронизация
@@ -568,30 +612,46 @@ class TradingEngine:
 
         ready = bool(getattr(self._client, "scalp_feed_ready", False))
         getter = getattr(self._client, "get_scalp_quote", None)
-        if ready:
-            refresh_books = getattr(self._client, "refresh_stale_books", None)
-            if callable(refresh_books):
-                try:
-                    await refresh_books(tickers, refresh_sec=30.0,
-                                        max_age_sec=5.0, max_requests=6, depth=5)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:  # noqa: BLE001 - optional fallback
-                    log.debug("Scalp REST book fallback недоступен: %s", exc)
-        if not ready or not callable(getter):
+        # Раньше резервный GetLastPrices вызывался ТОЛЬКО при ready=True,
+        # а при ready=False функция сразу выходила. Поэтому ровно в ситуации,
+        # когда stream не доставлял last-price (как в логах владельца: 1-4/15),
+        # REST-fallback вообще не запускался. Теперь он работает независимо.
+        refresh_prices = getattr(self._client, "refresh_stale_prices", None)
+        if callable(refresh_prices):
+            try:
+                await refresh_prices(
+                    tickers,
+                    refresh_sec=max(2.0, float(os.getenv("SCALP_PRICE_REST_REFRESH_SEC", "2.5"))),
+                    max_age_sec=max(2.0, float(os.getenv("SCALP_PRICE_STALE_SEC", "2.5"))),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - price fallback is optional
+                log.warning("Scalp REST price fallback недоступен: %s", exc)
+        refresh_books = getattr(self._client, "refresh_stale_books", None)
+        if callable(refresh_books):
+            try:
+                await refresh_books(tickers, refresh_sec=30.0,
+                                    max_age_sec=5.0, max_requests=6, depth=5)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - optional fallback
+                log.debug("Scalp REST book fallback недоступен: %s", exc)
+        if not callable(getter):
             if now - self._scalp_stream_health_log_last >= 60.0:
                 self._scalp_stream_health_log_last = now
-                log.warning(
-                    "Scalp stream НЕ ГОТОВ: поиск новых микродон приостановлен "
-                    "(ready=%s, quote_api=%s); открытые позиции продолжают "
-                    "защищаться резервным REST-опросом каждые %.0f сек",
-                    ready, callable(getter),
-                    max(5.0, float(getattr(self._cfg, "scalp_exit_poll_sec", 10))))
+                log.error("Scalp feed: отсутствует get_scalp_quote; локальный поиск невозможен")
             if now - self._scalp_last_rest_guard >= max(
                     5.0, float(getattr(self._cfg, "scalp_exit_poll_sec", 10))):
                 self._scalp_last_rest_guard = now
                 await self.exit_cycle()
             return
+        if not ready and now - self._scalp_stream_health_log_last >= 60.0:
+            self._scalp_stream_health_log_last = now
+            log.warning(
+                "Scalp stream НЕ ГОТОВ: продолжаю локальный поиск по пакетному REST GetLastPrices; "
+                "частота ниже stream (refresh=%.1fs); открытые позиции защищаются отдельно",
+                max(2.0, float(os.getenv("SCALP_PRICE_REST_REFRESH_SEC", "2.5"))))
 
         for ticker in tickers:
             if self._stop_event.is_set():
@@ -599,6 +659,10 @@ class TradingEngine:
             try:
                 quote = getter(ticker)
                 if not quote:
+                    supervisor = getattr(self, "_supervisor", None)
+                    if supervisor is not None:
+                        supervisor.record_event_throttled("quote_missing", ticker, 60.0,
+                                                          source="get_scalp_quote returned None")
                     continue
                 price = float(quote.get("price") or 0.0)
                 if (float(quote.get("spread_pct") or 0.0) <= 0
@@ -612,6 +676,16 @@ class TradingEngine:
                     continue
 
                 position = self._state.positions.get(ticker)
+                if position and getattr(self, "_supervisor", None) is not None:
+                    try:
+                        self._supervisor.record_market_sample(
+                            ticker, quote, signal=None, shadow=None,
+                            reason="позиция уже открыта; проверяется сопровождение",
+                            has_position=True, cost_pct=self._scalp_micro_cost_pct(quote),
+                            stop_pct=float(position.get("scalp_risk_pct") or
+                                           getattr(self._cfg, "scalp_min_stop_pct", 0.6)))
+                    except Exception as exc:
+                        log.debug("Supervisor sample %s: %s", ticker, exc)
                 if position:
                     # Проверяем выход на каждом новом тике цены, без обращения к ИИ.
                     if seq > self._scalp_price_seq.get(ticker, -1) and price_age <= 3.0:
@@ -626,11 +700,27 @@ class TradingEngine:
                         await self._check_exit(ticker, price, position)
                     continue
 
-                if seq <= self._scalp_price_seq.get(ticker, -1) or price_age > 3.0:
+                if price_age > 3.0:
+                    supervisor = getattr(self, "_supervisor", None)
+                    if supervisor is not None:
+                        supervisor.record_event_throttled(
+                            "price_stale", ticker, 60.0, price_age_sec=round(price_age, 3),
+                            price_source=str(quote.get("price_source") or "unknown"))
+                    continue
+                if seq <= self._scalp_price_seq.get(ticker, -1):
                     continue
                 self._scalp_price_seq[ticker] = seq
-                if not self._state.trading_enabled or not sessions.can_open_scalp_entry(
-                        self._cfg.scalp_time_stop_min):
+                if not self._state.trading_enabled:
+                    supervisor = getattr(self, "_supervisor", None)
+                    if supervisor is not None:
+                        supervisor.record_event_throttled(
+                            "entry_blocked", ticker, 300.0, reason="trading_enabled=false")
+                    continue
+                if not sessions.can_open_scalp_entry(self._cfg.scalp_time_stop_min):
+                    supervisor = getattr(self, "_supervisor", None)
+                    if supervisor is not None:
+                        supervisor.record_event_throttled(
+                            "entry_blocked", ticker, 300.0, reason="scalp session/time window closed")
                     continue
                 last_eval = self._scalp_last_local_eval.get(ticker, 0.0)
                 # Локальный анализ максимум раз в 2 сек на бумагу: это дешёвые
@@ -640,7 +730,27 @@ class TradingEngine:
                 self._scalp_last_local_eval[ticker] = now
                 # Проверяем и импульс, и локальную микродон.
                 signal = self._any_micro_trigger(quote)
+                shadow_signal = (self._shadow_dip_trigger(quote)
+                                 if signal is None and getattr(self, "_supervisor", None) is not None else None)
+                if getattr(self, "_supervisor", None) is not None:
+                    try:
+                        self._supervisor.record_market_sample(
+                            ticker, quote, signal=signal, shadow=shadow_signal,
+                            reason=str((self._last_dip_diagnostics or {}).get(
+                                "reason", "сигнал не найден")),
+                            has_position=False,
+                            cost_pct=self._scalp_micro_cost_pct(quote),
+                            stop_pct=float(getattr(self._cfg, "scalp_min_stop_pct", 0.6)))
+                    except Exception as exc:
+                        log.debug("Supervisor sample %s: %s", ticker, exc)
                 if signal is None:
+                    if shadow_signal is not None:
+                        log.info("Supervisor shadow %s: найден потенциальный пропуск "
+                                 "score=%.1f, потенциал=%.4f%%; ордер НЕ отправляется, "
+                                 "жду контрфактическую оценку %.0f сек",
+                                 ticker, float(shadow_signal.get("bottom_score", 0.0)),
+                                 float(shadow_signal.get("rebound_to_mean_pct", 0.0)),
+                                 float(getattr(getattr(self, "_supervisor", None), "_lookahead_sec", 300)))
                     # Раньше отрицательный результат детектора был полностью
                     # невидим в логах. Теперь раз в минуту на тикер показываем,
                     # что проверялось и почему локальная яма не подтвердилась.
@@ -680,7 +790,18 @@ class TradingEngine:
                         log.info("Микроструктурный сигнал %s: %s; запускаю локальные фильтры входа",
                                  ticker, signal.get("kind", "micro_impulse"))
                 # _process_ticker запишет эту цену в историю один раз.
+                had_position = ticker in self._state.positions
                 await self._process_ticker(ticker, current_price=price)
+                supervisor = getattr(self, "_supervisor", None)
+                if supervisor is not None and not had_position:
+                    if ticker in self._state.positions:
+                        supervisor.record_entry_outcome(ticker, "bought", "позиция открыта")
+                    elif ticker in self._scalp_ai_queue:
+                        supervisor.record_entry_outcome(ticker, "queued_ai", "ожидает Groq batch")
+                    else:
+                        supervisor.record_entry_outcome(
+                            ticker, "signal_not_bought",
+                            "сигнал найден, но позиция не открыта; причина в логе движка")
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 - один тикер не ломает поток
@@ -690,6 +811,8 @@ class TradingEngine:
         # по тикерам реально приходят свежие цены и стаканы. Один INFO/минуту.
         if now - self._scalp_stream_health_log_last >= 60.0:
             fresh_prices = []
+            stream_prices = []
+            rest_prices = []
             stream_books = []
             rest_books = []
             stale_prices = []
@@ -700,8 +823,12 @@ class TradingEngine:
                     price_age_now = float(q.get("price_age_sec", float("inf")))
                     book_age_now = float(q.get("book_age_sec", float("inf")))
                     source_now = str(q.get("book_source") or "")
-                    if price_age_now <= 3.0:
+                    if price_age_now <= 8.0:
                         fresh_prices.append(symbol)
+                        if str(q.get("price_source") or "stream") == "rest":
+                            rest_prices.append(symbol)
+                        else:
+                            stream_prices.append(symbol)
                         ticks_now = len(q.get("ticks") or [])
                         if ticks_now:
                             buffer_sizes.append(f"{symbol}:{ticks_now}")
@@ -720,11 +847,11 @@ class TradingEngine:
                 if reason and symbol not in stale_prices:
                     reason_items.append(f"{symbol}: {reason}")
             log.info(
-                "Scalp stream ЗДОРОВ: цена свежая %d/%d; стакан (стрим) %d/%d; "
-                "стакан по REST: %s; буферы тиков [%s]; без свежей цены [%s]; "
-                "последние причины без сигнала [%s]. Groq не вызывается на каждом тике.",
-                len(fresh_prices), len(tickers), len(stream_books), len(tickers),
-                ", ".join(rest_books[:12]) or "нет",
+                "Scalp stream: цена свежая %d/%d (stream=%d, REST=%d); "
+                "стакан (стрим) %d/%d; стакан по REST: %s; буферы тиков [%s]; "
+                "без свежей цены [%s]; последние причины без сигнала [%s].",
+                len(fresh_prices), len(tickers), len(stream_prices), len(rest_prices),
+                len(stream_books), len(tickers), ", ".join(rest_books[:12]) or "нет",
                 ", ".join(buffer_sizes[:12]) or "нет",
                 ", ".join(stale_prices[:12]) or "нет",
                 "; ".join(reason_items[:5]) or "анализ ещё не запускался")
@@ -937,6 +1064,11 @@ class TradingEngine:
             self._scalp_trigger_cache[ticker] = signal
             fresh_rows.append(row)
         if expired_rows:
+            supervisor = getattr(self, "_supervisor", None)
+            if supervisor is not None:
+                for expired_ticker in expired_rows:
+                    supervisor.record_entry_outcome(
+                        expired_ticker, "ai_expired", "триггер/цена/котировка устарели до Groq")
             log.info("Scalp AI batch: %d кандидат(ов) сняты до отправки - "
                      "триггер протух, цена ушла или котировка отсутствует: %s",
                      len(expired_rows), ", ".join(expired_rows[:10]))
@@ -979,12 +1111,19 @@ class TradingEngine:
             ticker = str(row.get("ticker", "")).upper()
             verdict = decisions.get(ticker) or {}
             if verdict.get("action") != "buy":
+                supervisor = getattr(self, "_supervisor", None)
+                if supervisor is not None:
+                    supervisor.record_entry_outcome(
+                        ticker, "ai_hold", str(verdict.get("reason") or verdict.get("action") or "HOLD"))
                 self._ai_batch_candidates.pop(ticker, None)
                 self._ai_batch_shortlist.discard(ticker)
                 continue
             getter = getattr(self._client, "get_scalp_quote", None)
             quote = getter(ticker) if callable(getter) else None
             if not quote or float(quote.get("price_age_sec", 999)) > 3.0:
+                supervisor = getattr(self, "_supervisor", None)
+                if supervisor is not None:
+                    supervisor.record_entry_outcome(ticker, "ai_buy_cancelled", "цена устарела")
                 log.info("%s: AI BUY отменён: цена потока устарела", ticker)
                 self._ai_batch_candidates.pop(ticker, None)
                 self._ai_batch_shortlist.discard(ticker)
@@ -993,6 +1132,9 @@ class TradingEngine:
             original_price = float(row.get("price") or 0.0)
             if (current_price <= 0 or original_price <= 0
                     or abs(current_price / original_price - 1.0) > 0.0015):
+                supervisor = getattr(self, "_supervisor", None)
+                if supervisor is not None:
+                    supervisor.record_entry_outcome(ticker, "ai_buy_cancelled", "цена ушла от сигнала >0.15%")
                 log.info("%s: AI BUY отменён: цена ушла от сигнала более чем на 0.15%%",
                          ticker)
                 self._ai_batch_candidates.pop(ticker, None)
@@ -1001,6 +1143,9 @@ class TradingEngine:
             signal = self._trigger_by_kind(
                 quote, str(row.get("trigger_kind") or "micro_impulse"))
             if signal is None:
+                supervisor = getattr(self, "_supervisor", None)
+                if supervisor is not None:
+                    supervisor.record_entry_outcome(ticker, "ai_buy_cancelled", "локальный триггер протух")
                 log.info("%s: AI BUY отменён: локальный триггер (%s) больше не подтверждает вход",
                          ticker, str(row.get("trigger_kind") or "micro_impulse"))
                 self._ai_batch_candidates.pop(ticker, None)
@@ -1009,7 +1154,16 @@ class TradingEngine:
             self._scalp_trigger_cache[ticker] = signal
             try:
                 await self._process_ticker(ticker, current_price=current_price)
+                supervisor = getattr(self, "_supervisor", None)
+                if supervisor is not None:
+                    if ticker in self._state.positions:
+                        supervisor.record_entry_outcome(ticker, "bought", "Groq BUY и финальные проверки пройдены")
+                    else:
+                        supervisor.record_entry_outcome(ticker, "buy_attempt_failed", "Groq BUY, но финальные проверки не открыли позицию")
             except Exception:  # noqa: BLE001
+                supervisor = getattr(self, "_supervisor", None)
+                if supervisor is not None:
+                    supervisor.record_entry_outcome(ticker, "buy_attempt_failed", "исключение при повторной проверке BUY")
                 log.exception("Scalp: повторная проверка BUY-кандидата %s завершилась ошибкой",
                               ticker)
             finally:
@@ -1598,7 +1752,12 @@ class TradingEngine:
             potential = float(trigger.get("rebound_to_vwap_pct")
                               or trigger.get("rebound_to_mean_pct") or 0.0)
             multiple = float(getattr(self._cfg, "scalp_fasttrack_cost_multiple", 1.10))
-            if score < float(getattr(self._cfg, "scalp_fasttrack_min_score", 75.0)):
+            supervisor = getattr(self, "_supervisor", None)
+            policy = supervisor.current_policy() if supervisor is not None else {}
+            fasttrack_min_score = float(policy.get(
+                "fasttrack_min_score",
+                getattr(self._cfg, "scalp_fasttrack_min_score", 75.0)))
+            if score < fasttrack_min_score:
                 return None
             if potential < cost * multiple:
                 return None
@@ -2421,6 +2580,10 @@ class TradingEngine:
         self._state.record_action(short)
         log.info("%s, ордер %s исполнено лотов: %s",
                  short, result.get("order_id"), result.get("lots_executed"))
+        if getattr(self, "_supervisor", None) is not None:
+            self._supervisor.record_trade(
+                ticker, "buy", price, lots,
+                reason=str(decision.get("reason") or decision.get("action") or "entry"))
 
         if self.scalp_mode():
             stop_price = price * (1.0 - float(scalp_stop_pct) / 100.0)
@@ -2798,6 +2961,10 @@ class TradingEngine:
         estimated_cost_rub = pnl_calc["estimated_cost_rub"]
         pnl = pnl_calc["net_pnl_rub"]
         actual_profit_pct = pnl_calc["net_pnl_pct"] if entry > 0 and shares_total > 0 else profit_pct
+        if getattr(self, "_supervisor", None) is not None:
+            self._supervisor.record_trade(
+                ticker, "sell", avg_exit, initial_lots,
+                pnl_rub=pnl, pnl_pct=actual_profit_pct, reason=reason)
         pnl_adder = getattr(self._state, "add_realized_pnl_today", None)
         if callable(pnl_adder):
             pnl_adder(pnl)

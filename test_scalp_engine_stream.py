@@ -57,6 +57,13 @@ class FakeStreamClient:
     def get_scalp_quote(self, ticker: str):
         return self.quotes.get(ticker)
 
+    async def refresh_stale_prices(self, tickers, **kwargs):
+        self.refresh_price_calls = getattr(self, "refresh_price_calls", 0) + 1
+        return 0
+
+    async def refresh_stale_books(self, tickers, **kwargs):
+        return 0
+
     async def is_tradable(self, ticker: str) -> bool:
         return True
 
@@ -266,13 +273,38 @@ class ScalpEngineStreamTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(verdict["action"], "buy")
             self.assertEqual(analyst.calls, [], "individual analyze_market must not be used")
 
-    async def test_missing_stream_never_opens_a_new_position(self):
+    async def test_fresh_rest_quote_is_processed_when_stream_is_not_ready(self):
+        from unittest.mock import patch
         with tempfile.TemporaryDirectory() as tmp:
             state = StateStore(str(Path(tmp) / "state.json"),
                                initial_overrides={"trading_enabled": True})
             state.set_scalp_mode(True)
             state.set_watchlist(["SBER"])
-            client = FakeStreamClient({"SBER": make_quote()})
+            quote = make_quote()
+            quote["price_source"] = "rest"
+            client = FakeStreamClient({"SBER": quote})
+            client.scalp_feed_ready = False
+            engine = TradingEngine(make_config(tmp), state, client,
+                                   FakeBatchAnalyst(), notify)
+            engine._any_micro_trigger = lambda _quote: {
+                "kind": "dip_reversal", "micro_dip": True,
+                "bottom_score": 80.0, "rebound_to_mean_pct": 0.3,
+            }
+            engine._process_ticker = AsyncMock()  # type: ignore[method-assign]
+            engine._scalp_last_rest_guard = time.monotonic()
+
+            with patch("trading_engine.sessions.can_open_scalp_entry", return_value=True):
+                await engine.scalp_stream_cycle()
+
+            engine._process_ticker.assert_awaited_once_with("SBER", current_price=quote["price"])
+
+    async def test_rest_price_fallback_is_attempted_even_when_stream_is_down(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = StateStore(str(Path(tmp) / "state.json"),
+                               initial_overrides={"trading_enabled": True})
+            state.set_scalp_mode(True)
+            state.set_watchlist(["SBER"])
+            client = FakeStreamClient({})
             client.scalp_feed_ready = False
             engine = TradingEngine(make_config(tmp), state, client,
                                    FakeBatchAnalyst(), notify)
@@ -281,6 +313,7 @@ class ScalpEngineStreamTests(unittest.IsolatedAsyncioTestCase):
 
             await engine.scalp_stream_cycle()
 
+            self.assertEqual(client.refresh_price_calls, 1)
             engine._process_ticker.assert_not_awaited()
 
     async def test_ai_buy_is_cancelled_if_price_moves_during_groq_call(self):

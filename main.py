@@ -40,6 +40,7 @@ from telegram_bot import (AppContext, BOT_COMMANDS, VERSION, build_dispatcher,
 from tinkoff_client import TinkoffClient
 from trade_memory import TradeMemory
 from trading_engine import TradingEngine
+from supervisor import LearningSupervisor
 
 log = logging.getLogger("main")
 
@@ -211,6 +212,11 @@ async def async_main() -> int:
 
     engine = TradingEngine(config, state, client, analyst, notify_admin,
                            memory=memory)
+    supervisor = LearningSupervisor(
+        config, state, analyst, notify_admin, client,
+        get_tickers=lambda: sorted(set(engine.watchlist()) | set(state.positions)),
+    )
+    engine.attach_supervisor(supervisor)
     auditor = AIAuditor(config, state, analyst, notify_admin)
 
     async def send_admin_photos(caption: str, pngs: list,
@@ -280,6 +286,7 @@ async def async_main() -> int:
         stop_event.set()
         engine.request_stop()
         auditor.request_stop()
+        supervisor.request_stop()
         scanner.request_stop()
 
     loop = asyncio.get_running_loop()
@@ -315,6 +322,7 @@ async def async_main() -> int:
         # create_task, а НЕ gather: задачи живут в общем цикле последовательно.
         background_tasks.append(asyncio.create_task(engine.run(), name="engine"))
         background_tasks.append(asyncio.create_task(auditor.run(), name="auditor"))
+        background_tasks.append(asyncio.create_task(supervisor.run(), name="learning-supervisor"))
         background_tasks.append(
             asyncio.create_task(scanner.run(), name="scanner"))
         background_tasks.append(
@@ -383,6 +391,7 @@ async def async_main() -> int:
         stop_event.set()
         engine.request_stop()
         auditor.request_stop()
+        supervisor.request_stop()
         scanner.request_stop()
 
         async def _limited(label: str, coro, timeout: float = 8.0) -> None:
@@ -410,7 +419,12 @@ async def async_main() -> int:
             task.cancel()
         for task in background_tasks:  # отменяем/ждём строго по одной
             await _limited("Фоновая задача", task)
-        # 2) сетевые ресурсы (каждое - с таймаутом, чтобы Ctrl+C всегда срабатывал)
+        # 2) локальная БД Supervisor закрывается до закрытия event loop.
+        try:
+            supervisor.close()
+        except Exception as exc:
+            log.warning("Supervisor DB close: %s", exc)
+        # 3) сетевые ресурсы (каждое - с таймаутом, чтобы Ctrl+C всегда срабатывал)
         await _limited("Telegram-сессия", bot.session.close())
         await _limited("Groq-клиент", analyst.close())
         await _limited("T-Invest gRPC-канал", client.close())

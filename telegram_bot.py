@@ -76,7 +76,7 @@ from trade_costs import estimate_round_trip_pnl, position_round_trip_cost_pct, f
 
 log = logging.getLogger("telegram")
 
-VERSION = "1.17.5"
+VERSION = "1.18.0"
 
 HELP_TEXT = (
     "Команды (можно не печатать - жмите кнопки на клавиатуре ниже чата):\n"
@@ -84,6 +84,7 @@ HELP_TEXT = (
     "/positions - открытые позиции + кнопка «Продать» у каждой\n"
     "/charts - графики всех моих бумаг (2 фото, по 3 графика)\n"
     "/stats - статистика и график по акциям за 6 часов\n"
+    "/supervisor - диагностика цен, сигналов, пропущенных входов и P&L\n"
     "/stats 12 - то же за 12 часов (можно 1-48)\n"
     "/scan - сканер рынка прямо сейчас: топ-4 кандидата с графиками\n"
     "/predict SBER 6 - прогноз цены на 6 ч: график + текст (можно 1-24 ч)\n"
@@ -192,6 +193,7 @@ BOT_COMMANDS = [
     ("positions", "открытые позиции с кнопками продажи"),
     ("charts", "графики всех бумаг под управлением"),
     ("stats", "статистика и график за часы"),
+    ("supervisor", "самонаблюдение: цены, сигналы, пропуски и P&L"),
     ("predict", "прогноз цены: /predict SBER 6"),
     ("scan", "сканер рынка: топ кандидатов"),
     ("autobuy", "автопокупка кандидатов сканера: вкл/выкл"),
@@ -391,6 +393,17 @@ def create_router(ctx: AppContext) -> Router:
         # v1.7.1: через резку длинных текстов - /status с большим числом
         # позиций тоже мог упереться в лимит Telegram.
         await _answer_long(message, "\n".join(parts))
+
+    # ---------------------------------------------------------- /supervisor
+    @router.message(Command("supervisor"))
+    async def cmd_supervisor(message: Message) -> None:
+        if not is_admin(message):
+            return
+        supervisor = getattr(ctx.engine, "_supervisor", None)
+        if supervisor is None:
+            await message.answer("Supervisor не подключён к торговому движку.")
+            return
+        await _answer_long(message, supervisor.report_text())
 
     # ---------------------------------------------------------------- /stats
     @router.message(Command("stats"))
