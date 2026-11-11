@@ -110,6 +110,10 @@ def _print_banner(config: BotConfig, state: StateStore) -> None:
              "вкл" if state.trading_enabled else "выкл",
              "вкл" if state.auditor_enabled else "выкл",
              "ВКЛ (/scalp)" if state.scalp_mode else "выкл")
+    if not state.trading_enabled:
+        log.warning("АВТОТОРГОВЛЯ ВЫКЛЮЧЕНА: бот НЕ будет отправлять новые автоматические покупки. "
+                    "В песочнице включить явно командой Telegram /trading_on; "
+                    "наблюдение и выходы по уже открытым позициям продолжаются.")
     log.info("Тикеры (до %d, скальп: до %d): %s | опрос %d сек | "
              "сканер рынка: %s (каждые %d мин)",
              config.max_tickers, config.scalp_max_positions, ", ".join(tickers),

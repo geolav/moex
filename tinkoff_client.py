@@ -28,6 +28,7 @@ import asyncio
 import html
 import importlib
 import logging
+import os
 import re
 import time
 import uuid
@@ -103,6 +104,11 @@ if SDK_AVAILABLE:
     _tt_clients.async_init_error_hub = _no_async_error_hub
 
 log = logging.getLogger("tinkoff")
+
+_SCALP_TICK_BUFFER_MAXLEN = max(600, min(10000, int(os.getenv("SCALP_TICK_BUFFER_MAXLEN", "2400"))))
+
+def _new_scalp_quote() -> Dict[str, Any]:
+    return {"ticks": deque(maxlen=_SCALP_TICK_BUFFER_MAXLEN)}
 
 # Коды gRPC, при которых повтор запроса имеет смысл.
 # 2=UNKNOWN, 4=DEADLINE_EXCEEDED, 8=RESOURCE_EXHAUSTED, 13=INTERNAL, 14=UNAVAILABLE
@@ -182,7 +188,8 @@ class TinkoffClient:
         self._ticker_by_figi: Dict[str, str] = {}
         self._ticker_by_uid: Dict[str, str] = {}
         # Потоковые котировки для скальпа: цена/стакан обновляются событиями,
-        # история сделок ограничена 120 точками на тикер.
+        # Храним историю 4-минутных микродвижений с запасом для активных бумаг.
+        # 120 точек хватало не всегда: при частых сделках окно 240с обрезалось.
         self._scalp_quotes: Dict[str, Dict[str, Any]] = {}
         self._scalp_feed_task: Optional[asyncio.Task] = None
         self._scalp_feed_stop: Optional[asyncio.Event] = None
@@ -633,15 +640,18 @@ class TinkoffClient:
             if ticker:
                 price = self._stream_number(getattr(last, "price", None))
                 if price > 0:
-                    quote = self._scalp_quotes.setdefault(ticker, {"ticks": deque(maxlen=120)})
+                    quote = self._scalp_quotes.setdefault(ticker, _new_scalp_quote())
+                    old_price = self._stream_number(quote.get("price", 0.0))
+                    changed = old_price <= 0 or abs(old_price - price) > 1e-12
                     quote["price"] = price
                     quote["price_updated_mono"] = now_mono
                     quote["price_age_sec"] = 0.0
                     quote["price_source"] = "stream"
-                    ticks = quote.setdefault("ticks", deque(maxlen=120))
-                    if not ticks or abs(float(ticks[-1]["price"]) - price) > 1e-12:
-                        ticks.append({"ts": now_mono, "price": price})
-                    quote["price_seq"] = int(quote.get("price_seq", 0)) + 1
+                    ticks = quote.setdefault("ticks", deque(maxlen=_SCALP_TICK_BUFFER_MAXLEN))
+                    if changed:
+                        ticks.append({"ts": now_mono, "price": price, "source": "stream"})
+                        quote["last_price_change_mono"] = now_mono
+                        quote["price_seq"] = int(quote.get("price_seq", 0)) + 1
 
         book = getattr(event, "orderbook", None)
         if book is not None:
@@ -658,7 +668,7 @@ class TinkoffClient:
                 ask_volume = sum(max(0.0, float(getattr(x, "quantity", 0) or 0))
                                  for x in asks[:5])
                 consistent = bool(getattr(book, "is_consistent", False))
-                quote = self._scalp_quotes.setdefault(ticker, {"ticks": deque(maxlen=120)})
+                quote = self._scalp_quotes.setdefault(ticker, _new_scalp_quote())
                 quote.update({"bid": bid, "ask": ask, "bid_volume": bid_volume,
                               "ask_volume": ask_volume, "book_consistent": consistent,
                               "book_source": "stream",
@@ -732,7 +742,7 @@ class TinkoffClient:
                 if price <= 0:
                     continue
                 current = self._scalp_quotes.setdefault(
-                    ticker, {"ticks": deque(maxlen=120)})
+                    ticker, _new_scalp_quote())
                 # Если stream обновился во время REST-запроса, оставляем stream.
                 current_ts = float(current.get("price_updated_mono", 0.0) or 0.0)
                 if (str(current.get("price_source") or "") == "stream"
@@ -741,12 +751,12 @@ class TinkoffClient:
                 sample_ts = time.monotonic()
                 old_price = self._stream_number(current.get("price", 0.0))
                 changed = old_price <= 0 or abs(price - old_price) > 1e-12
-                ticks = current.setdefault("ticks", deque(maxlen=120))
-                # Снимок раз в несколько секунд полезен как временной контекст,
-                # даже если последняя сделка не сменила цену. Но detector sequence
-                # растёт только на изменении цены: одинаковые REST-ответы не
-                # запускают повторный анализ и не изображают биржевые сделки.
-                ticks.append({"ts": sample_ts, "price": price, "source": "rest_snapshot"})
+                ticks = current.setdefault("ticks", deque(maxlen=_SCALP_TICK_BUFFER_MAXLEN))
+                # Не засоряем ленту одинаковыми REST-снимками: храним именно
+                # последовательность изменений цены, а не опросы API.
+                if changed:
+                    ticks.append({"ts": sample_ts, "price": price, "source": "rest_snapshot"})
+                    current["last_price_change_mono"] = sample_ts
                 current.update({
                     "price": price,
                     # Last price был только что проверен через API. Это время
@@ -779,6 +789,9 @@ class TinkoffClient:
         price_ts = float(quote.get("price_updated_mono", 0.0) or 0.0)
         book_ts = float(quote.get("book_updated_mono", 0.0) or 0.0)
         quote["price_age_sec"] = max(0.0, now_mono - price_ts) if price_ts else float("inf")
+        change_ts = float(quote.get("last_price_change_mono", 0.0) or 0.0)
+        quote["price_change_age_sec"] = (max(0.0, now_mono - change_ts)
+                                          if change_ts else float("inf"))
         quote["book_age_sec"] = max(0.0, now_mono - book_ts) if book_ts else float("inf")
         quote["ticks"] = list(quote.get("ticks") or [])
         return quote
@@ -844,7 +857,7 @@ class TinkoffClient:
                     # Перед применением ещё раз убеждаемся, что за время REST
                     # stream не принёс более свежий стакан.
                     current = self._scalp_quotes.setdefault(
-                        ticker, {"ticks": deque(maxlen=120)})
+                        ticker, _new_scalp_quote())
                     current_stream_ts = float(current.get("book_updated_mono", 0.0) or 0.0)
                     if (str(current.get("book_source") or "") == "stream"
                             and current_stream_ts > now - max_age_sec):

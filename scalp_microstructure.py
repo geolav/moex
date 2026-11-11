@@ -541,3 +541,136 @@ def detect_multiscale_dip_trigger(
            bid_ask_imbalance=round(imbalance, 3))
     return None
 
+
+
+def detect_shadow_dip_opportunity(
+    quote: Dict[str, Any],
+    *,
+    round_trip_cost_pct: float,
+    min_local_drop_pct: float = 0.005,
+    max_price_age_sec: float = 3.0,
+    diagnostics: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, float]]:
+    """Наблюдательный детектор почти всех коротких локальных ям.
+
+    ВАЖНО: этот результат никогда не является торговым сигналом и не может
+    отправить ордер. Его задача — записать достаточно раннюю гипотезу, чтобы
+    через lookahead измерить реальный последующий путь цены с учётом издержек.
+    В отличие от торгового детектора, не требует двух подтверждающих uptick-
+    движений, дисбаланса стакана или уже доказанного покрытия комиссии.
+    """
+    def report(reason: str, **extra: Any) -> None:
+        if diagnostics is not None:
+            diagnostics.clear()
+            diagnostics.update({"reason": reason, **extra})
+
+    try:
+        price = float(quote.get("price") or 0.0)
+        price_age = float(quote.get("price_age_sec", math.inf))
+        raw_ticks = quote.get("ticks") or []
+    except (TypeError, ValueError):
+        report("shadow: некорректная котировка")
+        return None
+    if price <= 0:
+        report("shadow: нет цены")
+        return None
+    if price_age > max_price_age_sec:
+        report("shadow: цена устарела", price_age_sec=price_age)
+        return None
+
+    parsed = []
+    for item in raw_ticks:
+        try:
+            ts, value = float(item["ts"]), float(item["price"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if ts > 0 and value > 0 and math.isfinite(ts) and math.isfinite(value):
+            # Схлопываем последовательные одинаковые цены: REST-снимки без
+            # сделки не должны создавать искусственный объём подтверждений.
+            if parsed and abs(parsed[-1][1] - value) <= 1e-12:
+                parsed[-1] = (ts, value)
+            else:
+                parsed.append((ts, value))
+    if len(parsed) < 6:
+        report("shadow: меньше 6 различных ценовых точек", ticks=len(parsed))
+        return None
+    parsed.sort(key=lambda item: item[0])
+    latest_ts = max(parsed[-1][0], float(quote.get("price_updated_mono", 0.0) or 0.0))
+    if abs(parsed[-1][1] - price) > 1e-12:
+        parsed.append((latest_ts, price))
+    else:
+        parsed[-1] = (latest_ts, price)
+
+    moves = [abs((b[1] / a[1] - 1.0) * 100.0)
+             for a, b in zip(parsed[-32:], parsed[-31:]) if a[1] > 0 and b[1] > 0]
+    moves = sorted(x for x in moves if x > 1e-9)
+    noise_pct = moves[len(moves) // 2] if moves else 0.0
+    cost_pct = max(0.0, float(round_trip_cost_pct))
+    depth_floor = max(float(min_local_drop_pct), noise_pct * 0.65, cost_pct * 0.025)
+    found = []
+    examined = []
+    rejects = {"no_low": 0, "too_shallow": 0, "no_bounce": 0, "too_old": 0}
+
+    for window_sec in (12.0, 20.0, 35.0, 60.0, 120.0, 240.0):
+        pts = [(ts, p) for ts, p in parsed if latest_ts - window_sec <= ts <= latest_ts]
+        if len(pts) < 6 or pts[-1][0] - pts[0][0] < min(4.0, window_sec * 0.25):
+            continue
+        examined.append(int(window_sec))
+        prices = [p for _, p in pts]
+        start_idx = max(2, len(pts) - 16)
+        local_found = False
+        for idx in range(start_idx, len(pts) - 2):
+            low = prices[idx]
+            left = prices[max(0, idx - 4):idx]
+            right = prices[idx + 1:idx + 3]
+            if len(left) < 2 or len(right) < 2:
+                continue
+            if low > min(left) or low > min(right):
+                continue
+            local_found = True
+            low_ts = pts[idx][0]
+            low_age = latest_ts - low_ts
+            if low_age < 0.5 or low_age > min(25.0, max(8.0, window_sec * 0.6)):
+                rejects["too_old"] += 1
+                continue
+            reference = max(left)
+            drop_pct = (reference / low - 1.0) * 100.0 if low > 0 else 0.0
+            if drop_pct < depth_floor:
+                rejects["too_shallow"] += 1
+                continue
+            bounce_pct = (price / low - 1.0) * 100.0 if low > 0 else 0.0
+            min_bounce = max(0.002, noise_pct * 0.12)
+            if bounce_pct < min_bounce or bounce_pct > drop_pct * 0.90:
+                rejects["no_bounce"] += 1
+                continue
+            post = prices[idx + 1:]
+            positive = sum(1 for a, b in zip(post, post[1:]) if b > a)
+            potential_pct = max(0.0, (reference / price - 1.0) * 100.0)
+            score = min(100.0,
+                        30.0 * min(2.0, drop_pct / max(depth_floor, 1e-9)) / 2.0
+                        + 30.0 * min(1.0, bounce_pct / max(drop_pct * 0.45, min_bounce))
+                        + 20.0 * min(1.0, positive / 2.0)
+                        + 20.0 * min(1.0, potential_pct / max(cost_pct, 0.01)))
+            found.append({
+                "kind": "shadow_dip", "trough_ts": float(low_ts),
+                "dip_scale_sec": float(window_sec),
+                "dip_drop_pct": round(drop_pct, 6),
+                "off_low_pct": round(bounce_pct, 6),
+                "rebound_to_mean_pct": round(potential_pct, 6),
+                "bottom_score": round(score, 1),
+                "price_age_sec": round(price_age, 3),
+                "ticks_used": float(len(pts)),
+                "noise_pct": round(noise_pct, 6),
+                "round_trip_cost_pct": round(cost_pct, 6),
+            })
+        if not local_found:
+            rejects["no_low"] += 1
+
+    if not found:
+        report("shadow: локальная яма не подтверждена", ticks=len(parsed),
+               windows_checked=examined, rejects=rejects)
+        return None
+    best = max(found, key=lambda item: (item["bottom_score"], item["trough_ts"]))
+    report("shadow: найден кандидат на локальную яму", ticks=len(parsed),
+           windows_checked=examined, candidate=best)
+    return best

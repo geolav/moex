@@ -531,3 +531,80 @@ class ScalpEngineStreamTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    async def test_detector_and_supervisor_run_even_when_autotrading_is_disabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = StateStore(str(Path(tmp) / "state.json"),
+                               initial_overrides={"trading_enabled": False})
+            state.set_scalp_mode(True)
+            state.set_watchlist(["SBER"])
+            quote = make_quote(seq=50)
+            client = FakeStreamClient({"SBER": quote})
+            engine = TradingEngine(make_config(tmp), state, client,
+                                   FakeBatchAnalyst(), notify)
+            calls = {"detect": 0, "samples": [], "outcomes": []}
+
+            class FakeSupervisor:
+                _lookahead_sec = 300
+                def current_policy(self):
+                    return {}
+                def record_market_sample(self, ticker, quote, **kwargs):
+                    calls["samples"].append((ticker, kwargs))
+                def record_entry_outcome(self, ticker, stage, reason=""):
+                    calls["outcomes"].append((ticker, stage, reason))
+                def record_event_throttled(self, *args, **kwargs):
+                    pass
+                def record_trade(self, *args, **kwargs):
+                    pass
+
+            engine._supervisor = FakeSupervisor()
+            def shadow(_quote):
+                calls["detect"] += 1
+                return {"kind": "shadow_dip_reversal", "bottom_score": 51.0,
+                        "dip_drop_pct": 0.04, "off_low_pct": 0.02,
+                        "rebound_to_mean_pct": 0.10, "trough_ts": time.monotonic() - 3}
+            engine._any_micro_trigger = lambda _quote: None
+            engine._shadow_dip_trigger = shadow
+            engine._process_ticker = AsyncMock()
+            engine._scalp_last_rest_guard = time.monotonic()
+
+            await engine.scalp_stream_cycle()
+
+            self.assertEqual(calls["detect"], 1)
+            self.assertEqual(len(calls["samples"]), 1)
+            self.assertEqual(calls["outcomes"][0][1], "blocked_trading_disabled")
+            engine._process_ticker.assert_not_awaited()
+
+    async def test_detector_runs_when_session_window_blocks_order(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            state = StateStore(str(Path(tmp) / "state.json"),
+                               initial_overrides={"trading_enabled": True})
+            state.set_scalp_mode(True)
+            state.set_watchlist(["SBER"])
+            quote = make_quote(seq=70)
+            client = FakeStreamClient({"SBER": quote})
+            engine = TradingEngine(make_config(tmp), state, client,
+                                   FakeBatchAnalyst(), notify)
+            outcomes = []
+            class FakeSupervisor:
+                _lookahead_sec = 300
+                def current_policy(self): return {}
+                def record_market_sample(self, *args, **kwargs): pass
+                def record_entry_outcome(self, ticker, stage, reason=""):
+                    outcomes.append(stage)
+                def record_event_throttled(self, *args, **kwargs): pass
+                def record_trade(self, *args, **kwargs): pass
+            engine._supervisor = FakeSupervisor()
+            engine._any_micro_trigger = lambda _quote: None
+            engine._shadow_dip_trigger = lambda _quote: {
+                "kind": "shadow_dip_reversal", "bottom_score": 49.0,
+                "dip_drop_pct": 0.03, "off_low_pct": 0.015,
+                "rebound_to_mean_pct": 0.08, "trough_ts": time.monotonic() - 2,
+            }
+            engine._process_ticker = AsyncMock()
+            engine._scalp_last_rest_guard = time.monotonic()
+            with patch("trading_engine.sessions.can_open_scalp_entry", return_value=False):
+                await engine.scalp_stream_cycle()
+            self.assertIn("blocked_session_time_window", outcomes)
+            engine._process_ticker.assert_not_awaited()

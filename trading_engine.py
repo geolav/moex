@@ -66,7 +66,8 @@ import predictor
 import sessions
 from scalp_microstructure import (detect_dip_reversal_trigger,  # noqa: F401
                                   detect_microstructure_trigger,
-                                  detect_multiscale_dip_trigger)
+                                  detect_multiscale_dip_trigger,
+                                  detect_shadow_dip_opportunity)
 from news_filter import classify_headlines
 from trade_costs import estimate_round_trip_pnl, position_round_trip_cost_pct
 
@@ -531,20 +532,14 @@ class TradingEngine:
         base_drop = float(policy.get(
             "dip_min_drop_pct",
             getattr(self._cfg, "scalp_micro_dip_min_drop_pct", 0.02)))
-        base_score = float(policy.get(
-            "dip_min_score",
-            getattr(self._cfg, "scalp_micro_dip_min_score", 48.0)))
         diagnostics: Dict[str, Any] = {}
-        signal = detect_multiscale_dip_trigger(
+        signal = detect_shadow_dip_opportunity(
             quote,
-            max_spread_pct=float(self._cfg.scalp_max_spread_pct),
             round_trip_cost_pct=self._scalp_micro_cost_pct(quote),
-            min_local_drop_pct=max(0.005, base_drop * 0.5),
-            min_score=max(30.0, base_score - 18.0),
-            allow_price_only=bool(getattr(self._cfg, "scalp_micro_price_only", True)),
-            default_spread_pct=float(getattr(self._cfg, "scalp_default_spread_pct", 0.05)),
+            min_local_drop_pct=max(0.004, min(base_drop * 0.30, 0.01)),
             diagnostics=diagnostics,
         )
+        self._last_shadow_diagnostics = diagnostics
         if signal is not None:
             signal["kind"] = "shadow_dip_reversal"
         return signal
@@ -710,67 +705,101 @@ class TradingEngine:
                 if seq <= self._scalp_price_seq.get(ticker, -1):
                     continue
                 self._scalp_price_seq[ticker] = seq
-                if not self._state.trading_enabled:
-                    supervisor = getattr(self, "_supervisor", None)
-                    if supervisor is not None:
-                        supervisor.record_event_throttled(
-                            "entry_blocked", ticker, 300.0, reason="trading_enabled=false")
-                    continue
-                if not sessions.can_open_scalp_entry(self._cfg.scalp_time_stop_min):
-                    supervisor = getattr(self, "_supervisor", None)
-                    if supervisor is not None:
-                        supervisor.record_event_throttled(
-                            "entry_blocked", ticker, 300.0, reason="scalp session/time window closed")
-                    continue
+
+                # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: наблюдение и поиск ям НЕ зависят
+                # от разрешения отправлять ордера и от времени до закрытия.
+                # Раньше оба gate стояли ДО детектора: при trading_enabled=false
+                # или остатке сессии < time-stop Supervisor видел ноль оценок.
                 last_eval = self._scalp_last_local_eval.get(ticker, 0.0)
-                # Локальный анализ максимум раз в 2 сек на бумагу: это дешёвые
-                # вычисления без REST и без Groq. Последние тики остаются в буфере.
                 if now - last_eval < 2.0:
                     continue
                 self._scalp_last_local_eval[ticker] = now
-                # Проверяем и импульс, и локальную микродон.
                 signal = self._any_micro_trigger(quote)
                 shadow_signal = (self._shadow_dip_trigger(quote)
                                  if signal is None and getattr(self, "_supervisor", None) is not None else None)
-                if getattr(self, "_supervisor", None) is not None:
+                supervisor = getattr(self, "_supervisor", None)
+                if supervisor is not None:
                     try:
-                        self._supervisor.record_market_sample(
+                        reason = str((self._last_dip_diagnostics or {}).get(
+                            "reason", "сигнал не найден"))
+                        if shadow_signal is None and signal is None:
+                            reason += "; " + str((getattr(self, "_last_shadow_diagnostics", {}) or {}).get(
+                                "reason", "shadow: нет кандидата"))
+                        supervisor.record_market_sample(
                             ticker, quote, signal=signal, shadow=shadow_signal,
-                            reason=str((self._last_dip_diagnostics or {}).get(
-                                "reason", "сигнал не найден")),
-                            has_position=False,
+                            reason=reason, has_position=False,
                             cost_pct=self._scalp_micro_cost_pct(quote),
                             stop_pct=float(getattr(self._cfg, "scalp_min_stop_pct", 0.6)))
                     except Exception as exc:
                         log.debug("Supervisor sample %s: %s", ticker, exc)
+
+                # Глобальный выключатель и временное окно блокируют ТОЛЬКО
+                # исполнение. Сам детектор выше продолжает собирать статистику.
+                entry_block_reason = None
+                if not self._state.trading_enabled:
+                    entry_block_reason = "trading_disabled"
+                elif not sessions.can_open_scalp_entry(self._cfg.scalp_time_stop_min):
+                    entry_block_reason = "session_time_window"
+                if entry_block_reason:
+                    if supervisor is not None:
+                        if signal is not None or shadow_signal is not None:
+                            supervisor.record_entry_outcome(
+                                ticker, "blocked_" + entry_block_reason,
+                                "детектор нашёл возможность, но отправка ордера запрещена: "
+                                + entry_block_reason)
+                        else:
+                            supervisor.record_event_throttled(
+                                "entry_blocked", ticker, 300.0, reason=entry_block_reason,
+                                detector_ran=True, shadow_candidate=False)
+                    last_block_log = self._scalp_dip_diag_log_last.get(ticker, 0.0)
+                    if (signal is not None or shadow_signal is not None) and now - last_block_log >= 60.0:
+                        self._scalp_dip_diag_log_last[ticker] = now
+                        candidate = signal or shadow_signal or {}
+                        log.info(
+                            "Supervisor: %s %s найден (score=%.1f, dip=%.4f%%), "
+                            "но вход заблокирован: %s; детектор и теневой учёт продолжаются",
+                            ticker, "торговый" if signal is not None else "shadow",
+                            float(candidate.get("bottom_score", 0.0)),
+                            float(candidate.get("dip_drop_pct", 0.0)), entry_block_reason)
+                    if signal is None:
+                        self._scalp_dip_diagnostics_by_ticker[ticker] = dict(
+                            self._last_dip_diagnostics or {})
+                        last_diag_log = self._scalp_dip_diag_log_last.get(ticker, 0.0)
+                        if now - last_diag_log >= 60.0:
+                            self._scalp_dip_diag_log_last[ticker] = now
+                            diag = dict(self._last_dip_diagnostics or {})
+                            shadow_diag = getattr(self, "_last_shadow_diagnostics", {}) or {}
+                            log.info(
+                                "Микродно %s: наблюдение выполнено при заблокированных входах; "
+                                "тиков=%s, окна=%s; торговый фильтр: %s; shadow: %s",
+                                ticker, diag.get("ticks", len(quote.get("ticks") or [])),
+                                diag.get("windows_checked", "нет"), entry_block_reason,
+                                shadow_diag.get("reason", "кандидата нет"))
+                    continue
+
                 if signal is None:
                     if shadow_signal is not None:
-                        log.info("Supervisor shadow %s: найден потенциальный пропуск "
-                                 "score=%.1f, потенциал=%.4f%%; ордер НЕ отправляется, "
-                                 "жду контрфактическую оценку %.0f сек",
+                        log.info("Supervisor shadow %s: локальная яма-кандидат; "
+                                 "score=%.1f, глубина=%.4f%%, отскок=%.4f%%; "
+                                 "проверю результат через %.0f сек",
                                  ticker, float(shadow_signal.get("bottom_score", 0.0)),
-                                 float(shadow_signal.get("rebound_to_mean_pct", 0.0)),
+                                 float(shadow_signal.get("dip_drop_pct", 0.0)),
+                                 float(shadow_signal.get("off_low_pct", 0.0)),
                                  float(getattr(getattr(self, "_supervisor", None), "_lookahead_sec", 300)))
-                    # Раньше отрицательный результат детектора был полностью
-                    # невидим в логах. Теперь раз в минуту на тикер показываем,
-                    # что проверялось и почему локальная яма не подтвердилась.
                     self._scalp_dip_diagnostics_by_ticker[ticker] = dict(
                         self._last_dip_diagnostics or {})
                     last_diag_log = self._scalp_dip_diag_log_last.get(ticker, 0.0)
                     if now - last_diag_log >= 60.0:
                         self._scalp_dip_diag_log_last[ticker] = now
                         diag = dict(self._last_dip_diagnostics or {})
-                        tick_count = diag.get("ticks", len(quote.get("ticks") or []))
-                        windows = diag.get("windows_checked", "нет")
-                        reason = diag.get("reason", "минимум/отскок/поток не подтвердили паттерн")
+                        shadow_diag = getattr(self, "_last_shadow_diagnostics", {}) or {}
                         log.info(
-                            "Микродно %s: локальный анализ выполнен; тиков=%s, "
-                            "окна=%s сек, спред=%.4f%%, цена свежая %.2f сек, "
-                            "стакан свежий %.2f сек; сигнал не подтверждён: %s",
-                            ticker, tick_count, windows,
-                            float(quote.get("spread_pct") or 0.0),
-                            float(quote.get("price_age_sec") or 0.0),
-                            float(quote.get("book_age_sec") or 0.0), reason)
+                            "Микродно %s: оценка завершена; тиков=%s, окна=%s сек; "
+                            "основной детектор: %s; теневой: %s",
+                            ticker, diag.get("ticks", len(quote.get("ticks") or [])),
+                            diag.get("windows_checked", "нет"),
+                            diag.get("reason", "нет сигнала"),
+                            shadow_diag.get("reason", "кандидата нет"))
                     continue
                 self._scalp_trigger_cache[ticker] = signal
                 last_signal_log = self._scalp_local_signal_log_last.get(ticker, 0.0)
@@ -816,13 +845,17 @@ class TradingEngine:
             stream_books = []
             rest_books = []
             stale_prices = []
+            changed_prices = []
             buffer_sizes = []
             for symbol in tickers:
                 try:
                     q = getter(symbol) or {}
                     price_age_now = float(q.get("price_age_sec", float("inf")))
+                    change_age_now = float(q.get("price_change_age_sec", float("inf")))
                     book_age_now = float(q.get("book_age_sec", float("inf")))
                     source_now = str(q.get("book_source") or "")
+                    if change_age_now <= 8.0:
+                        changed_prices.append(symbol)
                     if price_age_now <= 8.0:
                         fresh_prices.append(symbol)
                         if str(q.get("price_source") or "stream") == "rest":
@@ -847,14 +880,17 @@ class TradingEngine:
                 if reason and symbol not in stale_prices:
                     reason_items.append(f"{symbol}: {reason}")
             log.info(
-                "Scalp stream: цена свежая %d/%d (stream=%d, REST=%d); "
-                "стакан (стрим) %d/%d; стакан по REST: %s; буферы тиков [%s]; "
+                "Scalp stream: снимки свежие %d/%d (stream=%d, REST=%d); "
+                "реальные изменения цены за 8с %d/%d; стакан (стрим) %d/%d; "
+                "стакан по REST: %s; буферы уникальных тиков [%s]; "
                 "без свежей цены [%s]; последние причины без сигнала [%s].",
                 len(fresh_prices), len(tickers), len(stream_prices), len(rest_prices),
-                len(stream_books), len(tickers), ", ".join(rest_books[:12]) or "нет",
+                len(changed_prices), len(tickers), len(stream_books), len(tickers),
+                ", ".join(rest_books[:12]) or "нет",
                 ", ".join(buffer_sizes[:12]) or "нет",
                 ", ".join(stale_prices[:12]) or "нет",
-                "; ".join(reason_items[:5]) or "анализ ещё не запускался")
+                "; ".join(reason_items[:5]) or
+                "нет новых изменений цены — детектор ждёт следующий price_seq")
             self._scalp_stream_health_log_last = now
 
         await self._flush_scalp_ai_queue()

@@ -215,11 +215,19 @@ class LearningSupervisor:
                 return
             self._last_signal[ticker] = now
         elif is_shadow:
-            if now - self._last_shadow.get(ticker, 0.0) < 30.0:
+            # Один теневой эпизод на локальный минимум; одинаковый минимум не
+            # записываем на каждом тике, но новые ямы не теряем 30-секундным throttle.
+            trough_ts = _number(shadow.get("trough_ts"), 0.0) if shadow else 0.0
+            shadow_key = round(trough_ts, 1) if trough_ts else int(now // 3)
+            key = f"{ticker}:{shadow_key}"
+            if getattr(self, "_last_shadow_episode", {}).get(ticker) == key:
                 return
+            if not hasattr(self, "_last_shadow_episode"):
+                self._last_shadow_episode = {}
+            self._last_shadow_episode[ticker] = key
             self._last_shadow[ticker] = now
         else:
-            if now - self._last_sample.get(ticker, 0.0) < 5.0:
+            if now - self._last_sample.get(ticker, 0.0) < 10.0:
                 return
             self._last_sample[ticker] = now
         price = _number(quote.get("price"))
@@ -247,13 +255,16 @@ class LearningSupervisor:
         ticker = str(ticker).upper()
         try:
             self._db.execute("""UPDATE samples SET stage=? WHERE id=(
-                SELECT id FROM samples WHERE ticker=? AND signal_json IS NOT NULL
+                SELECT id FROM samples WHERE ticker=?
+                AND (signal_json IS NOT NULL OR shadow_json IS NOT NULL)
                 AND ts>=? ORDER BY ts DESC LIMIT 1)""",
                 (stage[:40], ticker, now - 90.0))
             self._db.commit()
         except sqlite3.Error as exc:
             log.warning("Supervisor: не удалось обновить исход сигнала %s: %s", ticker, exc)
         self.record_event("entry_pipeline", ticker, stage=stage, reason=(reason or "")[:500])
+        if stage.startswith("blocked_"):
+            self.record_event("entry_blocked", ticker, reason=stage, detail=(reason or "")[:500])
 
     def record_trade(self, ticker: str, side: str, price: float, lots: int,
                      pnl_rub: Optional[float] = None,
@@ -296,6 +307,7 @@ class LearningSupervisor:
                 candidate_not_bought = row["stage"] in {
                     "shadow", "signal_not_bought", "queued_ai", "ai_hold",
                     "ai_expired", "ai_buy_cancelled", "buy_attempt_failed",
+                    "blocked_trading_disabled", "blocked_session_time_window",
                 }
                 missed = int(was_candidate and candidate_not_bought and label == "target")
             self._db.execute(
@@ -313,7 +325,8 @@ class LearningSupervisor:
         since = now - 7 * 86400
         raw_rows = self._db.execute("""SELECT id,ticker,ts,label,label_net_pct FROM samples
             WHERE ts>=? AND (shadow_json IS NOT NULL OR stage IN
-            ('signal_not_bought','queued_ai','ai_hold','ai_expired','ai_buy_cancelled','buy_attempt_failed'))
+            ('signal_not_bought','queued_ai','ai_hold','ai_expired','ai_buy_cancelled','buy_attempt_failed',
+             'blocked_trading_disabled','blocked_session_time_window'))
             AND missed IN (0,1) AND label IN ('target','stop')
             ORDER BY ts DESC LIMIT 1000""", (since,)).fetchall()
         # Не переобучаем политику каждую минуту на одном и том же наборе.
@@ -406,11 +419,20 @@ class LearningSupervisor:
         win_text = f"{win_rate:.0%}" if isinstance(win_rate, (float, int)) else "н/д"
         lines = [
             "🧠 SUPERVISOR — состояние наблюдения",
-            (f"Цены свежие: stream {m['price_stream_fresh']}, REST {m['price_rest_fresh']}, "
+            ("Автоторговля: ВКЛ" if m["trading_enabled"] else
+             "⛔ Автоторговля ВЫКЛ — новые ордера запрещены; включить /trading_on"),
+            (f"Снимки свежие: stream {m['price_stream_fresh']}, REST {m['price_rest_fresh']}, "
              f"устарели {m['price_stale']} / отсутствуют {len(m['price_missing'])} "
-             f"из {m['tickers_total']} бумаг"),
+             f"из {m['tickers_total']} бумаг; реальные изменения цены за 8с: "
+             f"{m['price_changed_recent']}/{m['tickers_total']}"),
             (f"За час: измерений {m['samples_1h']}, реальных триггеров {m['signals_1h']}, "
              f"теневых кандидатов {m['shadow_candidates_1h']}"),
+            ("Причины отказов детектора: " + "; ".join(
+                f"{reason[:90]} ({count})" for reason, count in m["no_signal_reasons_1h"])
+             if m["no_signal_reasons_1h"] else "Причины отказов: пока нет измерений"),
+            ("Заблокировано входов: " + ", ".join(
+                f"{reason}={count}" for reason, count in m["blocked_reasons_24h"].items())
+             if m["blocked_reasons_24h"] else "Блокировок входа за 24 ч: нет"),
             (f"За 24 ч: потенциально пропущенных прибыльных входов {m['missed_profitable_24h']}; "
              f"покупок {buy_count}, закрытий {sell_count}, win-rate закрытий {win_text}"),
             (f"Net P&L закрытий за 24 ч: {m['net_pnl_24h_rub']:+.2f} ₽; "
@@ -430,13 +452,16 @@ class LearningSupervisor:
 
     def _metrics(self, tickers: List[str]) -> Dict[str, Any]:
         getter = getattr(self._client, "get_scalp_quote", None)
-        stream_fresh, rest_fresh, stale, missing = [], [], [], []
+        stream_fresh, rest_fresh, stale, missing, changed_recent = [], [], [], [], []
         for ticker in tickers:
             quote = getter(ticker) if callable(getter) else None
             if not quote:
                 missing.append(ticker)
                 continue
             age = _number(quote.get("price_age_sec"), 9999.0)
+            change_age = _number(quote.get("price_change_age_sec"), 9999.0)
+            if change_age <= 8.0:
+                changed_recent.append(ticker)
             if age <= 8.0:
                 if str(quote.get("price_source") or "stream") == "rest":
                     rest_fresh.append(ticker)
@@ -459,11 +484,26 @@ class LearningSupervisor:
         losses = sum(1 for r in sells if float(r["pnl_rub"]) < 0)
         entry_events = self._db.execute("SELECT COUNT(*) FROM events WHERE ts>=? AND kind='entry_pipeline'",
                                         (since_day,)).fetchone()[0]
-        blocked_events = self._db.execute("SELECT COUNT(*) FROM events WHERE ts>=? AND kind='entry_blocked'",
-                                          (since_day,)).fetchone()[0]
+        blocked_rows = self._db.execute("SELECT details FROM events WHERE ts>=? AND kind='entry_blocked'",
+                                        (since_day,)).fetchall()
+        blocked_events = len(blocked_rows)
+        blocked_reasons: Dict[str, int] = {}
+        for item in blocked_rows:
+            try:
+                reason = str(json.loads(item[0]).get("reason", "unknown"))
+            except (TypeError, json.JSONDecodeError):
+                reason = "unknown"
+            blocked_reasons[reason] = blocked_reasons.get(reason, 0) + 1
+        no_signal_rows = self._db.execute(
+            "SELECT reason,COUNT(*) n FROM samples WHERE ts>=? AND signal_json IS NULL "
+            "AND shadow_json IS NULL GROUP BY reason ORDER BY n DESC LIMIT 3",
+            (now - 3600,)).fetchall()
+        no_signal_reasons = [(str(r["reason"] or "не указана"), int(r["n"]))
+                             for r in no_signal_rows]
         return {
             "tickers_total": len(tickers), "price_stream_fresh": len(stream_fresh),
             "price_rest_fresh": len(rest_fresh), "price_stale": len(stale),
+            "price_changed_recent": len(changed_recent),
             "price_missing": missing[:20], "stream_tickers": stream_fresh[:20],
             "rest_tickers": rest_fresh[:20], "samples_1h": sample_count,
             "signals_1h": trigger_count, "shadow_candidates_1h": shadow_count,
@@ -472,6 +512,8 @@ class LearningSupervisor:
             "sells_24h": len(sells), "wins_24h": wins, "losses_24h": losses,
             "win_rate_24h": (wins / len(sells)) if sells else None,
             "entry_events_24h": int(entry_events), "blocked_events_24h": int(blocked_events),
+            "blocked_reasons_24h": blocked_reasons, "no_signal_reasons_1h": no_signal_reasons,
+            "trading_enabled": bool(getattr(self._state, "trading_enabled", False)),
             "net_pnl_24h_rub": round(sum(float(r["pnl_rub"]) for r in sells), 2),
             "open_positions": len(getattr(self._state, "positions", {}) or {}),
         }
@@ -481,7 +523,8 @@ class LearningSupervisor:
                     (m["price_stream_fresh"] + m["price_rest_fresh"]) / m["tickers_total"] < 0.60)
         missed = int(m["missed_profitable_24h"]) >= 3
         losses = int(m["closed_trades_24h"]) >= 4 and float(m["net_pnl_24h_rub"]) < 0
-        starvation = int(m["samples_1h"]) > 100 and int(m["signals_1h"]) == 0
+        starvation = (int(m["samples_1h"]) > 100 and
+                      int(m["signals_1h"]) + int(m["shadow_candidates_1h"]) == 0)
         return bad_feed or missed or losses or starvation
 
     async def _ask_groq(self, metrics: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -661,15 +704,26 @@ class LearningSupervisor:
         metrics = self._metrics(tickers)
         labels = self._label_pending(time.time())
         policy_update = self._auto_tune(time.time())
-        if self._cycle_count % 5 == 0:
-            log.info("Supervisor: цены stream=%d REST=%d stale=%d/%d; "
-                     "оценок/ч=%d, сигналов/ч=%d, shadow-кандидатов/ч=%d; "
-                     "пропущенных прибыльных возможностей/24ч=%d; P&L/24ч=%+.2f ₽",
-                     metrics["price_stream_fresh"], metrics["price_rest_fresh"],
-                     metrics["price_stale"], metrics["tickers_total"],
-                     metrics["samples_1h"], metrics["signals_1h"],
-                     metrics["shadow_candidates_1h"], metrics["missed_profitable_24h"],
-                     metrics["net_pnl_24h_rub"])
+        log.info("Supervisor: снимки stream=%d REST=%d stale=%d/%d; "
+                 "реальные изменения цены за 8с=%d/%d; "
+                 "оценок детектора/ч=%d, триггеров=%d, теневых ям=%d; "
+                 "прибыльных пропусков/24ч=%d; блокировки/24ч=%d; "
+                 "автоторговля=%s; net P&L/24ч=%+.2f ₽",
+                 metrics["price_stream_fresh"], metrics["price_rest_fresh"],
+                 metrics["price_stale"], metrics["tickers_total"],
+                 metrics["price_changed_recent"], metrics["tickers_total"],
+                 metrics["samples_1h"], metrics["signals_1h"],
+                 metrics["shadow_candidates_1h"], metrics["missed_profitable_24h"],
+                 metrics["blocked_events_24h"],
+                 "ВКЛ" if metrics["trading_enabled"] else "ВЫКЛ",
+                 metrics["net_pnl_24h_rub"])
+        if metrics["samples_1h"] == 0:
+            if metrics["price_changed_recent"] == 0:
+                log.info("Supervisor: новых изменений цены сейчас нет; свежие REST-снимки "
+                         "не считаются новыми тиками. Детектор ждёт реального движения.")
+            else:
+                log.warning("Supervisor: есть изменения цены, но за последний час не зафиксировано "
+                            "ни одной оценки детектора. Проверь price_seq/scalp_stream_cycle.")
         if policy_update:
             await self._safe_notify(
                 "🧠 Supervisor обучил локальные пороги на размеченных контрфактических "

@@ -39,6 +39,7 @@ v1.7.2:
   /unwatch ТИКЕР   - убрать бумагу из управления;
   /scalp [on|off]  - СКАЛЬП-РЕЖИМ: до 8 позиций, риск 0.05% equity,
                      ATR-стоп 0.6-1.0%, TP1=1R, частичный выход и time-stop;
+  /trading_on      - явно разрешить автоматическую торговлю;
   /toggle_trading  - включить/выключить автоматическую торговлю;
   /toggle_sandbox  - переключить песочница <-> реальный счёт
                      (переход в реал требует подтверждения "/toggle_sandbox confirm");
@@ -76,7 +77,7 @@ from trade_costs import estimate_round_trip_pnl, position_round_trip_cost_pct, f
 
 log = logging.getLogger("telegram")
 
-VERSION = "1.18.0"
+VERSION = "1.18.1"
 
 HELP_TEXT = (
     "Команды (можно не печатать - жмите кнопки на клавиатуре ниже чата):\n"
@@ -96,6 +97,7 @@ HELP_TEXT = (
     "/scalp - СКАЛЬП-РЕЖИМ: до 8 бумаг, риск 0.05% на сделку, общий риск 0.40%, стоп по ATR\n"
     "/memory - что бот выучил из своих сделок (винрейт, уроки, плохие часы)\n"
     "/reset_memory - забыть всю память сделок (начать учиться заново)\n"
+    "/trading_on - явно разрешить автоторговлю\n"
     "/toggle_trading - вкл/выкл автоматическую торговлю\n"
     "/toggle_sandbox - переключить песочница/реальный счёт\n"
     "/toggle_auditor - вкл/выкл локальную проверку логов (без Groq по умолчанию)\n"
@@ -202,6 +204,7 @@ BOT_COMMANDS = [
     ("watchlist", "список бумаг под автоторговлей"),
     ("scalp", "скальп-режим: до 8 позиций, риск 0.05%, общий риск 0.40%, ATR-стоп"),
     ("memory", "что бот выучил из сделок"),
+    ("trading_on", "явно разрешить автоторговлю"),
     ("toggle_trading", "вкл/выкл автоторговлю"),
     ("toggle_sandbox", "песочница ↔ реальный счёт"),
     ("ask", "вопрос ИИ-трейдеру"),
@@ -626,6 +629,22 @@ def create_router(ctx: AppContext) -> Router:
             f"На одну сделку по-прежнему не больше "
             f"{ctx.config.max_position_pct:.0f}% свободных средств. "
             f"Посмотреть текущую вложенность: /status.")
+
+    # ------------------------------------------------------------ /trading_on
+    @router.message(Command("trading_on"))
+    async def cmd_trading_on(message: Message) -> None:
+        if not is_admin(message):
+            return
+        if ctx.state.trading_enabled:
+            await message.answer("✅ Автоторговля уже включена. Проверить режим и счёт: /status")
+            return
+        ctx.state.set_trading_enabled(True)
+        warning = ("\n⚠️ Сейчас выбран РЕАЛЬНЫЙ счёт: следующие автоматические заявки "
+                   "будут отправляться на реальные деньги." if not ctx.state.use_sandbox else "")
+        await message.answer(
+            "✅ Автоторговля включена. Теперь движок может отправлять автоматические "
+            "покупки после прохождения всех фильтров, ограничений риска и проверки сессии."
+            + warning + "\nВыключить: /toggle_trading")
 
     # -------------------------------------------------------- /toggle_trading
     @router.message(Command("toggle_trading"))
