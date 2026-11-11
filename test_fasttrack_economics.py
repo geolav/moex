@@ -1,8 +1,11 @@
-"""v1.17.3: экономика скальп-входа и быстрый трек сильных ям.
+"""Экономика скальп-входа и быстрый трек сильных ям/импульсов.
 
-Регрессии после того, как фильтр "ход до TP1 не покрывает издержки"
+v1.17.3: регрессии после того, как фильтр "ход до TP1 не покрывает издержки"
 (невыполнимый при стопе 0.6% и multiple 4.0) блокировал ВСЕ покупки, а
 очередь Groq (1 запрос в 4 минуты) не успевала за микроямами.
+v1.17.4: порог экономики ямы 1.25x -> 1.10x (живые кандидаты вроде PLZL
+1.22x и VKCO 1.16x больше не протухают в очереди) и добавлен быстрый трек
+свежих импульсов с более строгим порогом (>= 1.25x издержек).
 """
 from __future__ import annotations
 
@@ -23,7 +26,9 @@ def make_config(tmp: str) -> SimpleNamespace:
         scalp_min_reward_cost_multiple=1.10,
         scalp_fasttrack_enabled=True,
         scalp_fasttrack_min_score=75.0,
-        scalp_fasttrack_cost_multiple=1.25,
+        scalp_fasttrack_cost_multiple=1.10,
+        scalp_fasttrack_impulse_enabled=True,
+        scalp_fasttrack_impulse_cost_multiple=1.25,
         scalp_exit_poll_sec=10, scalp_ai_min_request_interval_sec=240,
         scalp_time_stop_min=45, ai_batch_decision_ttl_sec=900,
         llm_decisions_enabled=True, ai_batch_required=True,
@@ -105,7 +110,7 @@ class FastTrackTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(decision)
 
     def test_thin_potential_not_fasttracked(self):
-        # Потенциал 0.10% < 1.25 x 0.1668% - сделка не окупает издержки.
+        # Потенциал 0.10% < 1.10 x 0.1668% - сделка не окупает издержки.
         with tempfile.TemporaryDirectory() as tmp:
             engine = make_engine(tmp)
             decision = engine._scalp_fasttrack_decision(
@@ -113,13 +118,38 @@ class FastTrackTests(unittest.IsolatedAsyncioTestCase):
                 breakeven_confidence=0.639)
             self.assertIsNone(decision)
 
-    def test_impulse_not_fasttracked(self):
-        # Импульсы по-прежнему ждут подтверждения ИИ.
+    def test_impulse_weak_goes_to_ai_queue(self):
+        # v1.17.4: слабый импульс (прогноз 0.13% < 1.25 x 0.1668%) не входит
+        # по быстрому треку - ждёт подтверждения ИИ в очереди Groq.
         with tempfile.TemporaryDirectory() as tmp:
             engine = make_engine(tmp)
             decision = engine._scalp_fasttrack_decision(
                 {"kind": "micro_impulse", "bottom_score": 90.0,
-                 "projected_30s_pct": 0.40}, 0.1668, 0.639)
+                 "projected_30s_pct": 0.13, "bid_ask_imbalance": 1.4,
+                 "book_mode": "stream"}, 0.1668, 0.639)
+            self.assertIsNone(decision)
+
+    def test_impulse_strong_is_fasttracked(self):
+        # v1.17.4: сильный импульс (прогноз 0.40% = 2.40x издержек) входит
+        # сразу: импульс живёт секунды, очередь Groq его не переживает.
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = make_engine(tmp)
+            decision = engine._scalp_fasttrack_decision(
+                {"kind": "micro_impulse", "bottom_score": 90.0,
+                 "projected_30s_pct": 0.40, "bid_ask_imbalance": 1.4,
+                 "book_mode": "stream"}, 0.1668, 0.639)
+            self.assertIsNotNone(decision)
+            self.assertEqual(decision["action"], "buy")
+            self.assertGreaterEqual(decision["confidence"], 0.65)
+
+    def test_impulse_without_book_support_not_fasttracked(self):
+        # Импульс в price-only режиме (стакан молчал) быстрый трек не берёт.
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = make_engine(tmp)
+            decision = engine._scalp_fasttrack_decision(
+                {"kind": "micro_impulse", "projected_30s_pct": 0.40,
+                 "bid_ask_imbalance": 0.0, "book_mode": "price_only"},
+                0.1668, 0.639)
             self.assertIsNone(decision)
 
     def test_disabled_by_config(self):
@@ -142,7 +172,7 @@ class FastTrackTests(unittest.IsolatedAsyncioTestCase):
             self.assertGreaterEqual(decision["confidence"], be_conf + 0.05)
 
     def test_thin_potential_vs_wide_spread_not_fasttracked(self):
-        # Потенциал 0.2165% при издержках 0.25% (1.25x порог = 0.3125%):
+        # Потенциал 0.2165% при издержках 0.25% (1.10x порог = 0.275%):
         # сделка не окупает широкий спред - входим только через ИИ.
         with tempfile.TemporaryDirectory() as tmp:
             engine = make_engine(tmp)

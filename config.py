@@ -228,9 +228,13 @@ class BotConfig:
     scalp_round_trip_cost_pct: float
     scalp_min_reward_cost_multiple: float
     # v1.17.3: быстрый трек сильных ям - вход без ожидания Groq batch.
+    # v1.17.4: + быстрый трек свежих микро-импульсов (жизнь импульса ещё
+    # короче ямы, очередь Groq с интервалом 4 мин он не переживает).
     scalp_fasttrack_enabled: bool
     scalp_fasttrack_min_score: float
     scalp_fasttrack_cost_multiple: float
+    scalp_fasttrack_impulse_enabled: bool
+    scalp_fasttrack_impulse_cost_multiple: float
     scalp_time_stop_min: int
     scalp_min_progress_r: float
     scalp_loss_pause_minutes: int
@@ -459,14 +463,21 @@ def load_config() -> BotConfig:
         # скальп-входы. 1.10 = запас 10% поверх безубыточности.
         scalp_min_reward_cost_multiple=_env_float("SCALP_MIN_REWARD_COST_MULTIPLE", 1.10,
                                                   low=1.0, high=10.0),
-        # v1.17.3: быстрый трек очень сильных ям (score >= 75, потенциал
-        # >= 1.25x издержек): вход сразу, без ожидания Groq batch, который
-        # отвечает раз в 4 минуты и не успевал за микроямами.
+        # v1.17.3: быстрый трек очень сильных ям (score >= 75): вход сразу,
+        # без ожидания Groq batch, который отвечает раз в 4 минуты и не
+        # успевал за микроямами. v1.17.4: порог экономики ямы 1.25x -> 1.10x
+        # издержек (тот же множитель, что в общем фильтре входа; при 1.25x
+        # живые кандидаты вроде PLZL 1.22x и VKCO 1.16x молча протухали в
+        # очереди Groq) и добавлен быстрый трек импульсов (строже: >= 1.25x).
         scalp_fasttrack_enabled=_env_bool("SCALP_FASTTRACK_ENABLED", True),
         scalp_fasttrack_min_score=_env_float("SCALP_FASTTRACK_MIN_SCORE", 75.0,
                                              low=0.0, high=100.0),
-        scalp_fasttrack_cost_multiple=_env_float("SCALP_FASTTRACK_COST_MULTIPLE", 1.25,
+        scalp_fasttrack_cost_multiple=_env_float("SCALP_FASTTRACK_COST_MULTIPLE", 1.10,
                                                  low=1.0, high=10.0),
+        scalp_fasttrack_impulse_enabled=_env_bool(
+            "SCALP_FASTTRACK_IMPULSE_ENABLED", True),
+        scalp_fasttrack_impulse_cost_multiple=_env_float(
+            "SCALP_FASTTRACK_IMPULSE_COST_MULTIPLE", 1.25, low=1.0, high=10.0),
         scalp_time_stop_min=_env_int("SCALP_TIME_STOP_MIN", 30, low=5, high=240),
         scalp_min_progress_r=_env_float("SCALP_MIN_PROGRESS_R", 0.3,
                                         low=0.0, high=2.0),

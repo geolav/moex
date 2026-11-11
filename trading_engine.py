@@ -183,6 +183,8 @@ class TradingEngine:
         self._scalp_last_portfolio_sync = 0.0
         self._scalp_external_missing: Dict[str, int] = {}
         self._scalp_ai_disabled_logged = False
+        # v1.17.4: не спамим в лог, когда scalp batch ждёт общего лимита Groq.
+        self._scalp_ai_defer_log_last = 0.0
         # v1.13.0: троттлинг сообщений risk-off по тикерам (не чаще 1/60 сек).
         self._riskoff_log_last: Dict[str, float] = {}
         # v1.14.0: раздельные таймеры полного цикла и охраны позиций в обычном
@@ -338,9 +340,19 @@ class TradingEngine:
         входы fail-closed, а открытые позиции получают резервную REST-охрану.
         """
         info = self.activity_info()
+        # v1.17.4: в баннере видно, что анти-погоня по 2ч-свечам не действует
+        # на свежие скальп-триггеры и что сильные сигналы покупаются сразу.
+        ft_txt = ""
+        if self.scalp_mode() and bool(getattr(self._cfg, "scalp_fasttrack_enabled", True)):
+            ft_txt = (f"; быстрый трек: ямы score>={float(getattr(self._cfg, 'scalp_fasttrack_min_score', 75.0)):.0f} "
+                      f"с потенциалом >={float(getattr(self._cfg, 'scalp_fasttrack_cost_multiple', 1.10)):.2f}x издержек")
+            if bool(getattr(self._cfg, "scalp_fasttrack_impulse_enabled", True)):
+                ft_txt += (f", импульсы >={float(getattr(self._cfg, 'scalp_fasttrack_impulse_cost_multiple', 1.25)):.2f}x")
+            ft_txt += " - покупка сразу, без Groq"
         scalp_txt = (f", СКАЛЬП-РЕЖИМ: поток цены+стакана, локальная проверка "
                      f"по событиям, Groq batch не чаще 1 раза в "
-                     f"{self._cfg.scalp_ai_min_request_interval_sec // 60} мин, "
+                     f"{self._cfg.scalp_ai_min_request_interval_sec // 60} мин"
+                     f"{ft_txt}, "
                      f"до {self._cfg.scalp_max_positions} позиций"
                      if self.scalp_mode() else "")
         log.info("Торговый движок v2 запущен: тикеры %s, период %d сек, "
@@ -421,48 +433,92 @@ class TradingEngine:
     def _scalp_fasttrack_decision(self, micro: Dict[str, Any],
                                   round_trip_cost: float,
                                   breakeven_confidence: float) -> Optional[Dict[str, Any]]:
-        """v1.17.3: быстрый локальный вход для очень сильных ям.
+        """Быстрый локальный вход для сильных ям (v1.17.3) и импульсов (v1.17.4).
 
         Groq batch отвечает не чаще раза в 4 минуты (лимит токенов), а жизнь
         микроямы - десятки секунд: к моменту ответа ИИ сигнал успевал
-        протухать, и покупок не было вовсе. Поэтому ямы с высоким score и
-        потенциалом, заметно покрывающим издержки, покупаются сразу, без
-        ожидания ИИ. ИИ продолжает управлять вселенной бумаг (сканер),
-        подтверждать средние сигналы пакетами и разбирать сделки аудитором.
-        Отключается SCALP_FASTTRACK_ENABLED=false.
+        протухать, и покупок не было вовсе. Поэтому сильные сигналы покупаются
+        сразу, без ожидания ИИ. ИИ продолжает управлять вселенной бумаг
+        (сканер), подтверждать средние сигналы пакетами и разбирать сделки
+        аудитором. Отключается SCALP_FASTTRACK_ENABLED=false.
+
+        v1.17.4: (1) порог экономики ямы снижен с 1.25x до 1.10x издержек -
+        тот же множитель, что в общем фильтре входа; при 1.25x в быстрый трек
+        не попадали живые кандидаты из логов (PLZL 1.22x, VKCO 1.16x) и они
+        молча протухали в очереди Groq. (2) добавлен быстрый трек свежих
+        микро-импульсов с более строгой экономикой (по умолчанию >= 1.25x
+        издержек) - импульс живёт ещё меньше ямы, в очереди Groq он не
+        выживал никогда. Отключается SCALP_FASTTRACK_IMPULSE_ENABLED=false.
         """
         if not bool(getattr(self._cfg, "scalp_fasttrack_enabled", True)):
             return None
         kind = str(micro.get("kind") or "")
-        if not (bool(micro.get("micro_dip")) or kind == "dip_reversal"):
-            return None  # быстрый трек - только для ям; импульсы ждут ИИ
-        try:
-            bottom_score = float(micro.get("bottom_score") or 0.0)
-        except (TypeError, ValueError):
-            bottom_score = 0.0
-        min_score = max(0.0, float(getattr(
-            self._cfg, "scalp_fasttrack_min_score", 75.0) or 75.0))
-        if bottom_score < min_score:
-            return None
-        expected = self._trigger_expected_move_pct(micro)
+        is_dip = bool(micro.get("micro_dip")) or kind == "dip_reversal"
+        is_impulse = not is_dip and (
+            kind == "micro_impulse" or "projected_30s_pct" in micro)
         cost = max(0.0, float(round_trip_cost or 0.0))
-        mult = max(1.0, float(getattr(
-            self._cfg, "scalp_fasttrack_cost_multiple", 1.25) or 1.25))
-        if cost <= 0 or expected < mult * cost:
+        if cost <= 0:
             return None
-        # Уверенность не выдумывается: она обязана перекрывать безубыточную
-        # вероятность сделки (та же планка, что для вердикта ИИ).
-        base = 0.72 + 0.10 * min(1.0, max(0.0, bottom_score - min_score) / 20.0)
-        confidence = max(base, float(breakeven_confidence or 0.0) + 0.06)
-        confidence = min(0.92, confidence)
-        return {
-            "action": "buy",
-            "confidence": round(confidence, 3),
-            "setup": kind or "dip_reversal",
-            "reason": (f"сильная яма: score {bottom_score:.0f}/100, потенциал "
-                       f"{expected:.2f}% = {expected / cost:.2f}x издержек "
-                       f"{cost:.2f}%"),
-        }
+        if is_dip:
+            try:
+                bottom_score = float(micro.get("bottom_score") or 0.0)
+            except (TypeError, ValueError):
+                bottom_score = 0.0
+            min_score = max(0.0, float(getattr(
+                self._cfg, "scalp_fasttrack_min_score", 75.0) or 75.0))
+            if bottom_score < min_score:
+                return None
+            expected = self._trigger_expected_move_pct(micro)
+            mult = max(1.0, float(getattr(
+                self._cfg, "scalp_fasttrack_cost_multiple", 1.10) or 1.10))
+            if expected < mult * cost:
+                return None
+            # Уверенность не выдумывается: она обязана перекрывать
+            # безубыточную вероятность сделки (та же планка, что для ИИ).
+            base = 0.72 + 0.10 * min(1.0, max(0.0, bottom_score - min_score) / 20.0)
+            confidence = max(base, float(breakeven_confidence or 0.0) + 0.06)
+            confidence = min(0.92, confidence)
+            return {
+                "action": "buy",
+                "confidence": round(confidence, 3),
+                "setup": kind or "dip_reversal",
+                "reason": (f"сильная яма: score {bottom_score:.0f}/100, потенциал "
+                           f"{expected:.2f}% = {expected / cost:.2f}x издержек "
+                           f"{cost:.2f}%"),
+            }
+        if is_impulse:
+            if not bool(getattr(self._cfg, "scalp_fasttrack_impulse_enabled", True)):
+                return None
+            try:
+                expected = float(micro.get("projected_30s_pct") or 0.0)
+            except (TypeError, ValueError):
+                expected = 0.0
+            mult = max(1.0, float(getattr(
+                self._cfg, "scalp_fasttrack_impulse_cost_multiple", 1.25) or 1.25))
+            if expected < mult * cost:
+                return None
+            # Быстрый вход по импульсу только с поддержкой стакана: без
+            # стакана (price_only) покупка "на uprising" - это ровно та
+            # погоня, против которой есть анти-погоня; такой кандидат
+            # идёт в очередь Groq.
+            book_mode = str(micro.get("book_mode") or "none")
+            try:
+                imbalance = float(micro.get("bid_ask_imbalance") or 0.0)
+            except (TypeError, ValueError):
+                imbalance = 0.0
+            if book_mode not in ("stream", "rest") or imbalance < 1.05:
+                return None
+            confidence = max(0.68, float(breakeven_confidence or 0.0) + 0.06)
+            confidence = min(0.88, confidence)
+            return {
+                "action": "buy",
+                "confidence": round(confidence, 3),
+                "setup": kind or "micro_impulse",
+                "reason": (f"свежий микро-импульс: прогноз +{expected:.2f}% = "
+                           f"{expected / cost:.2f}x издержек {cost:.2f}%, "
+                           f"стакан за покупку"),
+            }
+        return None
 
     def _price_only_kwargs(self) -> Dict[str, Any]:
         """Общие kwargs деградации без стакана (v1.17.2) для всех детекторов.
@@ -993,13 +1049,25 @@ class TradingEngine:
         wait_getter = getattr(self._analyst, "candidate_call_wait_seconds", None)
         if callable(wait_getter):
             try:
-                if float(wait_getter(scalp_mode=True) or 0.0) > 0.0:
-                    return  # Сканер/другой пакетный запрос уже использовал общий лимит.
+                wait_sec = float(wait_getter(scalp_mode=True) or 0.0)
             except Exception:
-                pass
+                wait_sec = 0.0
+            if wait_sec > 0.0:
+                # Сканер/другой пакетный запрос уже использовал общий лимит.
+                # v1.17.4: раз в 10 минут объясняем в логе, почему очередь
+                # ждёт, - раньше это было полной тишиной.
+                if now - self._scalp_ai_defer_log_last >= 600.0:
+                    self._scalp_ai_defer_log_last = now
+                    log.info(
+                        "Scalp AI batch: очередь (%d кандидат(ов)) ждёт общего "
+                        "лимита запросов Groq ещё %.0f сек; сильные ямы/импульсы "
+                        "в это время не ждут - заходят по быстрому треку",
+                        len(self._scalp_ai_queue), wait_sec)
+                return
         # Перед отправкой отбрасываем устаревшие записи: за время ожидания
         # Groq рынок мог измениться, и анализировать уже нечего.
         getter = getattr(self._client, "get_scalp_quote", None)
+        queue_len_before = len(self._scalp_ai_queue)
         fresh_rows: List[Dict[str, Any]] = []
         for ticker, row in list(self._scalp_ai_queue.items()):
             quote = getter(ticker) if callable(getter) else None
@@ -1023,6 +1091,14 @@ class TradingEngine:
             key=lambda row: float(row.get("rank_score", 0.0) or 0.0),
             reverse=True,
         )[:3]
+        # v1.17.4: устаревшие кандидаты раньше выбрасывались молча - в логе
+        # не было ни строчки о том, почему очередь "исчезла" без покупок.
+        stale_dropped = (queue_len_before - len(fresh_rows)
+                         + max(0, len(fresh_rows) - len(rows)))
+        if stale_dropped:
+            log.info("Scalp AI batch: %d кандидат(ов) выброшены до отправки - "
+                     "сигнал устарел (импульс отыгрался, цена ушла более чем "
+                     "на 0.15%% или триггер погас)", stale_dropped)
         for row in rows:
             self._scalp_ai_queue.pop(str(row.get("ticker", "")).upper(), None)
         if not rows:
@@ -1986,7 +2062,21 @@ class TradingEngine:
         # первый же откат к средней считался "сигналом" - и покупка выходила
         # на хае (кейс LKOH). Теперь вход запрещён, если цена уже вплотную
         # к максимуму локального окна или отскок от минимума уже отыгран.
-        chase = self._chase_guard(closes, price)
+        # v1.17.4: в скальпе у свежего микротриггера СВОЯ анти-погоня на
+        # масштабе секунд, и она строже 2-часовой: детектор ямы бракует
+        # "отскок больше 70% просадки" (покупка задним числом) и "цена
+        # продолжает обновлять минимум", детектор импульса - "улетевшие"
+        # движения (ret45/ret15). А 2-часовое окно 5-минутных свечей гасило
+        # ровно те входы, ради которых создан скальп: яма у минимума окна
+        # почти всегда стоит в верхней половине 2ч-диапазона, поэтому каждый
+        # кандидат гиб со "жду более глубокий откат" (в логах: "цена всего
+        # на 0.00% ниже максимума последних ~24 свечей" - и покупок нет).
+        # 2ч-анти-погоня остаётся для свечных сетапов без микротриггера
+        # и для обычного (не скальп) режима.
+        if self.scalp_mode() and trigger is not None:
+            chase = None
+        else:
+            chase = self._chase_guard(closes, price)
         if chase:
             log.info("%s: анти-погоня - %s. Жду более глубокий откат", ticker, chase)
             self._state.append_decision({
@@ -2390,8 +2480,12 @@ class TradingEngine:
         budget *= size_mult
         lots = int(budget // lot_cost) if lot_cost > 0 else 0
         if lots < 1:
-            log.info("%s: размер позиции по риск-лимиту меньше 1 лота (лимит %.2f ₽)",
-                     ticker, budget)
+            # v1.17.4: подсказка в логе - частая причина "сигнал был, а покупки
+            # нет" при маленьком балансе/риск-лимите.
+            log.info("%s: размер позиции по риск-лимиту меньше 1 лота "
+                     "(лимит %.2f ₽, лот %.2f ₽). Если такие отказы повторяются "
+                     "часто - поднимите SCALP_RISK_PER_TRADE_PCT в .env",
+                     ticker, budget, lot_cost)
             return
 
         result = await self._client.buy(ticker, lots, price=price)

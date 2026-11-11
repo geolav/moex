@@ -142,6 +142,11 @@ class TinkoffClientError(RuntimeError):
     """Невосполнимая ошибка работы с T-Invest API."""
 
 
+class _ScalpResubscribe(Exception):
+    """v1.17.4: внутренний сигнал - переподключить scalp stream с новыми
+    параметрами подписки (например, глубиной стакана после DEPTH_IS_INVALID)."""
+
+
 class _RateLimiter:
     """
     Простейший скользящий лимитер: не более rpm запросов за 60 секунд.
@@ -195,6 +200,12 @@ class TinkoffClient:
         # каждый сигнал с "стакан устарел". Теперь статусы подписок
         # логируются, а молчащий стакан освежается по REST GetOrderBook.
         self._scalp_subscribe_log_done = False
+        # v1.17.4: сервер может отклонить подписку на стакан по глубине
+        # (DEPTH_IS_INVALID). Одна попытка с depth=1, затем отказ от
+        # stream-стакана целиком: стакан всегда по REST, без спама в лог.
+        self._scalp_ob_depth = 5
+        self._scalp_ob_depth1_tried = False
+        self._scalp_ob_give_up = False
         self._scalp_book_rest_ts: Dict[str, float] = {}
         self._scalp_book_rest_lock = asyncio.Lock()
         self._scalp_book_rest_roundrobin: int = 0
@@ -520,30 +531,43 @@ class TinkoffClient:
             log.error("Scalp stream недоступен: не найдены типы SDK: %s", exc)
             return
 
-        orderbook_items = []
+        orderbook_uids = []
         last_price_items = []
         for ticker in tickers:
             info = self._instruments.get(ticker) or {}
             instrument_id = str(info.get("uid") or info.get("figi") or "")
             if not instrument_id:
                 continue
-            orderbook_items.append(OrderBookInstrument(instrument_id=instrument_id, depth=5))
+            orderbook_uids.append(instrument_id)
             last_price_items.append(LastPriceInstrument(instrument_id=instrument_id))
-        if not orderbook_items or not last_price_items:
+        if not orderbook_uids or not last_price_items:
             log.warning("Scalp stream: нет инструментов для подписки")
             return
 
-        async def request_iterator():
-            yield MarketDataRequest(subscribe_order_book_request=SubscribeOrderBookRequest(
-                subscription_action=SubscriptionAction.SUBSCRIPTION_ACTION_SUBSCRIBE,
-                instruments=orderbook_items))
-            yield MarketDataRequest(subscribe_last_price_request=SubscribeLastPriceRequest(
-                subscription_action=SubscriptionAction.SUBSCRIPTION_ACTION_SUBSCRIBE,
-                instruments=last_price_items))
-            while not stop.is_set():
-                await asyncio.sleep(1.0)
-
         while not stop.is_set():
+            # v1.17.4: элементы подписки собираются НА КАЖДОЕ подключение:
+            # после DEPTH_IS_INVALID глубина стакана снижается (5 -> 1), а
+            # после второй неудачи stream-стакан отключается совсем - стакан
+            # остаётся по REST-фолбэку, спам об отказах прекращается.
+            orderbook_items = []
+            if not self._scalp_ob_give_up:
+                orderbook_items = [
+                    OrderBookInstrument(instrument_id=i, depth=self._scalp_ob_depth)
+                    for i in orderbook_uids]
+
+            async def request_iterator(books, prices):
+                if books:
+                    yield MarketDataRequest(
+                        subscribe_order_book_request=SubscribeOrderBookRequest(
+                            subscription_action=SubscriptionAction.SUBSCRIPTION_ACTION_SUBSCRIBE,
+                            instruments=books))
+                yield MarketDataRequest(
+                    subscribe_last_price_request=SubscribeLastPriceRequest(
+                        subscription_action=SubscriptionAction.SUBSCRIPTION_ACTION_SUBSCRIBE,
+                        instruments=prices))
+                while not stop.is_set():
+                    await asyncio.sleep(1.0)
+
             try:
                 stream_service = getattr(self._api, "market_data_stream", None)
                 method = getattr(stream_service, "market_data_stream", None)
@@ -552,9 +576,15 @@ class TinkoffClient:
                     return
                 self._scalp_feed_ready = True
                 self._scalp_subscribe_log_done = False
-                log.info("Scalp stream: подписываюсь на last-price и стакан для %d бумаг",
-                         len(tickers))
-                async for event in method(request_iterator()):
+                if orderbook_items:
+                    log.info("Scalp stream: подписываюсь на last-price и стакан "
+                             "(глубина %d) для %d бумаг",
+                             self._scalp_ob_depth, len(tickers))
+                else:
+                    log.info("Scalp stream: подписываюсь только на last-price "
+                             "для %d бумаг (стакан - по REST)", len(tickers))
+                async for event in method(request_iterator(orderbook_items,
+                                                           last_price_items)):
                     if stop.is_set():
                         break
                     self._handle_scalp_stream_event(event)
@@ -562,6 +592,10 @@ class TinkoffClient:
                     raise RuntimeError("T-Invest market-data stream завершился без запроса остановки")
             except asyncio.CancelledError:
                 raise
+            except _ScalpResubscribe:
+                # Параметры подписки изменились (глубина стакана) -
+                # переподключаемся сразу, без backoff.
+                continue
             except Exception as exc:  # noqa: BLE001
                 self._scalp_feed_ready = False
                 log.exception("Scalp stream оборвался; переподключение через 3 сек: %s", exc)
@@ -609,6 +643,11 @@ class TinkoffClient:
         появляется на первом событии (обычно это subscribe-ответ) после
         (пере)подключения. Это закрывает случай "стакан молча не приходит":
         теперь причина отказа видна в логе по имени статуса.
+
+        v1.17.4: если сервер отклонил ВСЕ подписки стакана с DEPTH_IS_INVALID,
+        один раз пробуем глубину 1, а если и она отклонена - отключаем
+        stream-стакан совсем (стакан всегда по REST) и прекращаем спам
+        предупреждениями при каждом переподключении.
         """
         self._scalp_subscribe_log_done = True
         for kind, attr, plural in (
@@ -624,6 +663,29 @@ class TinkoffClient:
             if ok:
                 log.info("Scalp stream: подписка %s подтверждена для %d бумаг",
                          kind, len(ok))
+            if (kind == "orderbook" and rejected and not ok):
+                status = self._subscription_status_name(
+                    getattr(rejected[0], "subscription_status", None))
+                if status == "DEPTH_IS_INVALID":
+                    if self._scalp_ob_depth > 1 and not self._scalp_ob_depth1_tried:
+                        self._scalp_ob_depth = 1
+                        self._scalp_ob_depth1_tried = True
+                        log.warning(
+                            "Scalp stream: стакан отклонён с DEPTH_IS_INVALID "
+                            "(глубина 5) для всех бумаг - одна попытка с "
+                            "глубиной 1; если не выйдет, стакан останется "
+                            "только по REST")
+                        raise _ScalpResubscribe()
+                    if not self._scalp_ob_give_up:
+                        self._scalp_ob_give_up = True
+                        log.warning(
+                            "Scalp stream: стакан отклонён и с глубиной 1 "
+                            "(DEPTH_IS_INVALID) - stream-стакан отключён, "
+                            "стакан всегда по REST-фолбэку (refresh каждые "
+                            "%d сек); повторных сообщений об отказе не будет",
+                            int(getattr(self._cfg, "scalp_book_rest_refresh_sec",
+                                        30) or 30))
+                        raise _ScalpResubscribe()
             for s in rejected:
                 uid = str(getattr(s, "instrument_uid", "") or "")
                 figi = str(getattr(s, "figi", "") or "")
