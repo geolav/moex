@@ -168,6 +168,18 @@ class MultiscaleMicroDipTests(unittest.TestCase):
         q = self.quote(bid_volume=500, ask_volume=2000)
         self.assertIsNone(self.detect(q))
 
+    def test_diagnostics_explain_why_no_local_bottom_was_found(self):
+        q = self.quote([100.10, 100.09, 100.08, 100.07, 100.06, 100.05,
+                        100.04, 100.03, 100.02, 100.01, 100.00])
+        diag = {}
+        signal = detect_multiscale_dip_trigger(
+            q, max_spread_pct=0.1, round_trip_cost_pct=0.02,
+            diagnostics=diag)
+        self.assertIsNone(signal)
+        self.assertTrue(diag.get("reason"))
+        self.assertGreaterEqual(diag.get("ticks", 0), 6)
+        self.assertIn("windows_checked", diag)
+
 
 if __name__ == "__main__":
     unittest.main()

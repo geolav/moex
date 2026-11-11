@@ -67,6 +67,7 @@ from scalp_microstructure import (detect_dip_reversal_trigger,  # noqa: F401
                                   detect_microstructure_trigger,
                                   detect_multiscale_dip_trigger)
 from news_filter import classify_headlines
+from trade_costs import estimate_round_trip_pnl, position_round_trip_cost_pct
 
 log = logging.getLogger("engine")
 
@@ -171,6 +172,9 @@ class TradingEngine:
         self._scalp_last_history_record: Dict[str, float] = {}
         self._scalp_last_local_eval: Dict[str, float] = {}
         self._scalp_local_signal_log_last: Dict[str, float] = {}
+        self._scalp_dip_diag_log_last: Dict[str, float] = {}
+        self._last_dip_diagnostics: Dict[str, Any] = {}
+        self._scalp_stream_health_log_last: float = 0.0
         self._scalp_trigger_cache: Dict[str, Dict[str, float]] = {}
         self._scalp_ai_queue: Dict[str, Dict[str, Any]] = {}
         self._scalp_last_ai_batch_attempt = 0.0
@@ -261,6 +265,18 @@ class TradingEngine:
             if not entry_session:
                 entry_session = str(pos.get("scalp_session_key") or "") or None
 
+            # Оценка полного круга едина для /positions, автопродажи и отчёта.
+            # Старые позиции, где было сохранено только значение комиссии,
+            # мигрируем: добавляем текущий спред и проскальзывание один раз.
+            saved_round_trip = float(pos.get("scalp_expected_round_trip_cost_pct") or 0.0)
+            if saved_round_trip <= commission_pct + 1e-9:
+                spread_getter = getattr(self._client, "get_spread_pct", None)
+                try:
+                    spread_pct = max(0.0, float(spread_getter(ticker) or 0.0)) if callable(spread_getter) else 0.0
+                except Exception:
+                    spread_pct = 0.0
+                saved_round_trip = (commission_pct + spread_pct
+                                    + max(0.0, float(getattr(self._cfg, "slippage_pct", 0.0) or 0.0)))
             needs_update = (
                 not was_managed
                 or not pos.get("entry_epoch")
@@ -270,6 +286,7 @@ class TradingEngine:
                 or bool(pos.get("scalp_time_unknown")) != time_unknown
                 or old_stop_price + 1e-9 < stop_price
                 or pos.get("scalp_session_key") != (entry_session or "unknown")
+                or abs(float(pos.get("scalp_expected_round_trip_cost_pct") or 0.0) - saved_round_trip) > 1e-6
             )
             if not needs_update:
                 continue
@@ -285,8 +302,8 @@ class TradingEngine:
                 "scalp_risk_pct": risk_pct,
                 "scalp_atr_pct": max(0.01, atr_pct),
                 "scalp_round_trip_cost_pct": commission_pct,
-                "scalp_expected_round_trip_cost_pct": float(
-                    pos.get("scalp_expected_round_trip_cost_pct") or commission_pct),
+                "scalp_expected_round_trip_cost_pct": round(saved_round_trip, 4),
+                "estimated_round_trip_cost_pct": round(saved_round_trip, 4),
                 "stop_price": round(stop_price, 4),
                 "entry_epoch": entry_epoch,
                 "entry_tf_min": 5,
@@ -333,6 +350,14 @@ class TradingEngine:
                  self._cfg.poll_interval_sec, self._state.aggressiveness(),
                  info["activity"], info["sma_hours"], info["step_min"],
                  scalp_txt)
+        if self.scalp_mode() and bool(getattr(self._cfg, "scalp_dip_enabled", True)):
+            log.info(
+                "Локальный поиск микродон ВКЛ: окна 12/20/35/60/120/240 сек; "
+                "оценка не чаще 1 раза в 2 сек на тикер; min_drop=%.3f%%, "
+                "min_score=%.1f, max_spread=%.3f%%; поиск локальный, без Groq",
+                float(getattr(self._cfg, "scalp_micro_dip_min_drop_pct", 0.02)),
+                float(getattr(self._cfg, "scalp_micro_dip_min_score", 48.0)),
+                float(self._cfg.scalp_max_spread_pct))
         while not self._stop_event.is_set():
             try:
                 if self.scalp_mode():
@@ -407,7 +432,11 @@ class TradingEngine:
         Детектор не ловит падающий нож: требует остановки падения и
         перевеса покупателей в стакане у дна.
         """
-        if not quote or not bool(getattr(self._cfg, "scalp_dip_enabled", True)):
+        if not quote:
+            self._last_dip_diagnostics = {"reason": "поток не передал котировку"}
+            return None
+        if not bool(getattr(self._cfg, "scalp_dip_enabled", True)):
+            self._last_dip_diagnostics = {"reason": "SCALP_DIP_ENABLED выключен"}
             return None
         cost_pct = self._scalp_micro_cost_pct(quote)
         # Сохраняем прежний крупный паттерн для совместимости и дополняем его
@@ -428,14 +457,18 @@ class TradingEngine:
         if legacy is not None:
             legacy["kind"] = "dip_reversal"
             signals.append(legacy)
+        diagnostics: Dict[str, Any] = {}
         micro = detect_multiscale_dip_trigger(
             quote,
             max_spread_pct=float(self._cfg.scalp_max_spread_pct),
             round_trip_cost_pct=cost_pct,
-            min_local_drop_pct=float(getattr(
-                self._cfg, "scalp_micro_dip_min_drop_pct", 0.02)),
-            min_score=float(getattr(self._cfg, "scalp_micro_dip_min_score", 48.0)),
+            min_local_drop_pct=float(
+                getattr(self._cfg, "scalp_micro_dip_min_drop_pct", None) or 0.02),
+            min_score=float(
+                getattr(self._cfg, "scalp_micro_dip_min_score", None) or 48.0),
+            diagnostics=diagnostics,
         )
+        self._last_dip_diagnostics = diagnostics
         if micro is not None:
             micro["kind"] = "dip_reversal"
             signals.append(micro)
@@ -504,6 +537,14 @@ class TradingEngine:
         ready = bool(getattr(self._client, "scalp_feed_ready", False))
         getter = getattr(self._client, "get_scalp_quote", None)
         if not ready or not callable(getter):
+            if now - self._scalp_stream_health_log_last >= 60.0:
+                self._scalp_stream_health_log_last = now
+                log.warning(
+                    "Scalp stream НЕ ГОТОВ: поиск новых микродон приостановлен "
+                    "(ready=%s, quote_api=%s); открытые позиции продолжают "
+                    "защищаться резервным REST-опросом каждые %.0f сек",
+                    ready, callable(getter),
+                    max(5.0, float(getattr(self._cfg, "scalp_exit_poll_sec", 10))))
             if now - self._scalp_last_rest_guard >= max(
                     5.0, float(getattr(self._cfg, "scalp_exit_poll_sec", 10))):
                 self._scalp_last_rest_guard = now
@@ -545,18 +586,33 @@ class TradingEngine:
                         self._cfg.scalp_time_stop_min):
                     continue
                 last_eval = self._scalp_last_local_eval.get(ticker, 0.0)
-                # Детектор полностью локальный и дешёвый: повторно оцениваем
-                # новый тик примерно раз в 2 сек, не расходуя токены ИИ.
-                # Groq отдельно ограничен пакетами до 3 бумаг раз в 4 минуты.
+                # Локальный анализ максимум раз в 2 сек на бумагу: это дешёвые
+                # вычисления без REST и без Groq. Последние тики остаются в буфере.
                 if now - last_eval < 2.0:
                     continue
-                # v1.14.0: сигнал даёт либо импульсный детектор, либо
-                # детектор остановившейся ямы (dip_reversal) - обе интуиции
-                # владельца теперь проверяются локально на каждом тике.
+                self._scalp_last_local_eval[ticker] = now
+                # Проверяем и импульс, и локальную микродон.
                 signal = self._any_micro_trigger(quote)
                 if signal is None:
+                    # Раньше отрицательный результат детектора был полностью
+                    # невидим в логах. Теперь раз в минуту на тикер показываем,
+                    # что проверялось и почему локальная яма не подтвердилась.
+                    last_diag_log = self._scalp_dip_diag_log_last.get(ticker, 0.0)
+                    if now - last_diag_log >= 60.0:
+                        self._scalp_dip_diag_log_last[ticker] = now
+                        diag = dict(self._last_dip_diagnostics or {})
+                        tick_count = diag.get("ticks", len(quote.get("ticks") or []))
+                        windows = diag.get("windows_checked", "нет")
+                        reason = diag.get("reason", "минимум/отскок/поток не подтвердили паттерн")
+                        log.info(
+                            "Микродно %s: локальный анализ выполнен; тиков=%s, "
+                            "окна=%s сек, спред=%.4f%%, цена свежая %.2f сек, "
+                            "стакан свежий %.2f сек; сигнал не подтверждён: %s",
+                            ticker, tick_count, windows,
+                            float(quote.get("spread_pct") or 0.0),
+                            float(quote.get("price_age_sec") or 0.0),
+                            float(quote.get("book_age_sec") or 0.0), reason)
                     continue
-                self._scalp_last_local_eval[ticker] = now
                 self._scalp_trigger_cache[ticker] = signal
                 last_signal_log = self._scalp_local_signal_log_last.get(ticker, 0.0)
                 if now - last_signal_log >= 45.0:
@@ -580,6 +636,35 @@ class TradingEngine:
                 raise
             except Exception:  # noqa: BLE001 - один тикер не ломает поток
                 log.exception("Scalp stream: ошибка обработки %s", ticker)
+
+        # Контроль здоровья stream: ready=True само по себе не значит, что
+        # по тикерам реально приходят свежие цены и стаканы. Один INFO/минуту.
+        if now - self._scalp_stream_health_log_last >= 60.0:
+            fresh = []
+            stale = []
+            for symbol in tickers:
+                try:
+                    q = getter(symbol)
+                    if (q and float(q.get("price_age_sec", float("inf"))) <= 3.0
+                            and float(q.get("book_age_sec", float("inf"))) <= 5.0):
+                        fresh.append(symbol)
+                    else:
+                        stale.append(symbol)
+                except Exception:
+                    stale.append(symbol)
+            buffer_sizes = []
+            for symbol in fresh[:6]:
+                try:
+                    buffer_sizes.append(f"{symbol}:{len((getter(symbol) or {}).get('ticks') or [])}")
+                except Exception:
+                    pass
+            log.info(
+                "Scalp stream ЗДОРОВ: свежие цена+стакан %d/%d бумаг; "
+                "буферы тиков [%s]; без свежих данных [%s]. "
+                "Локальный поиск микродон работает только по свежим тикам, Groq не вызывается на каждом тике.",
+                len(fresh), len(tickers), ", ".join(buffer_sizes) or "нет",
+                ", ".join(stale[:12]) or "нет")
+            self._scalp_stream_health_log_last = now
 
         await self._flush_scalp_ai_queue()
         # Резервная проверка позиций периодически защищает от потери tick stream.
@@ -2298,10 +2383,11 @@ class TradingEngine:
                          min(self._cfg.scalp_stop_loss_pct, self._cfg.scalp_max_stop_pct))
         risk_pct = max(self._cfg.scalp_min_stop_pct,
                        min(risk_pct, self._cfg.scalp_max_stop_pct))
-        commission_cost_pct = float(position.get("scalp_round_trip_cost_pct") or
-                                    self._cfg.scalp_round_trip_cost_pct)
-        expected_cost_pct = float(position.get("scalp_expected_round_trip_cost_pct") or
-                                  commission_cost_pct)
+        # Используем тот же единственный источник стоимости полного круга,
+        # что /positions и отчёт закрытия. Не дублируем fallback-логику здесь:
+        # иначе старая позиция без expected-поля могла бы получить другой
+        # порог автопродажи, чем финансовый отчёт.
+        expected_cost_pct = position_round_trip_cost_pct(position, self._cfg)
         profit_pct = (price / entry - 1.0) * 100.0
         max_price = max(float(position.get("max_price", entry) or entry), price)
         tp1_done = bool(position.get("tp1_done", False))
@@ -2336,14 +2422,12 @@ class TradingEngine:
                              profit_pct, "принудительное закрытие перед окончанием торгов")
             return
 
-        # Быстрый тейк: продаём всю позицию на первой проверке, когда
-        # движение цены покрывает расходы ИМЕННО НА ВЫХОД (половина
-        # оценочных круговых издержек). Это буквально правило владельца:
-        # не ждать возврата покупочной комиссии, а закрывать при первом
-        # небольшом плюсе после расходов продажи. Полный P&L ниже по коду
-        # всё равно учитывает весь круг, включая комиссию покупки.
+        # Единый финансовый критерий: автоматический выход только тогда,
+        # когда ожидаемый P&L ПОСЛЕ ВСЕГО КРУГА (вход + выход + спред + slippage)
+        # уже неотрицательный. Этот же процент используется в /positions,
+        # ручном закрытии и итоговом отчёте сделки.
         # Legacy SCALP_QUICK_TP_MARGIN_PCT полностью игнорируется.
-        quick_target = max(0.0, expected_cost_pct / 2.0)
+        quick_target = max(0.0, expected_cost_pct)
         monitor_now = time.monotonic()
         monitor_every = max(5.0, float(getattr(self._cfg, "scalp_exit_poll_sec", 10)))
         if monitor_now - self._scalp_monitor_log_last.get(ticker, 0.0) >= monitor_every:
@@ -2353,16 +2437,15 @@ class TradingEngine:
                       else f"жду ещё {max(0.0, quick_target - profit_pct):.3f} п.п.")
             log.info(
                 "Скальп-мониторинг %s: цена %.4f ₽, вход %.4f ₽, брутто %+.3f%%, "
-                "издержки выхода %.3f%% (оценка круга %.3f%%), порог быстрой продажи %.3f%%; %s",
-                ticker, price, entry, profit_pct, expected_cost_pct / 2.0,
-                expected_cost_pct, quick_target, status)
+                "оценка полных издержек круга %.3f%%, порог безубыточности %.3f%%; %s",
+                ticker, price, entry, profit_pct, expected_cost_pct,
+                quick_target, status)
         if self._cfg.scalp_quick_tp_enabled:
             if profit_pct >= quick_target:
                 await self._sell(
                     ticker, price, update, "скальп: быстрый плюс", profit_pct,
-                    f"+{profit_pct:.3f}% покрывает оценочные расходы выхода "
-                    f"{quick_target:.3f}% (половина круговых издержек); "
-                    f"позиция закрыта целиком без дополнительной маржи")
+                    f"+{profit_pct:.3f}% покрывает полные оценочные издержки круга "
+                    f"{quick_target:.3f}%; позиция закрыта целиком")
                 return
 
         entry_epoch = float(position.get("entry_epoch", 0) or 0)
@@ -2538,18 +2621,11 @@ class TradingEngine:
         avg_exit = realized_value / max(1, initial_lots)
         shares_total = initial_lots * lot_size
         gross_pnl = (avg_exit - entry) * shares_total if entry > 0 else 0.0
-        if bool(position.get("scalp_managed")):
-            cost_pct = float(position.get("scalp_expected_round_trip_cost_pct")
-                             or position.get("scalp_round_trip_cost_pct")
-                             or self._cfg.scalp_round_trip_cost_pct)
-        else:
-            cost_pct = float(position.get("estimated_round_trip_cost_pct",
-                                          self._cfg.estimated_round_trip_cost_pct) or 0.0)
-        estimated_cost_rub = (entry * shares_total * max(0.0, cost_pct) / 100.0
-                              if entry > 0 else 0.0)
-        pnl = gross_pnl - estimated_cost_rub
-        actual_profit_pct = (pnl / (entry * shares_total) * 100.0
-                             if entry > 0 and shares_total > 0 else profit_pct)
+        cost_pct = position_round_trip_cost_pct(position, self._cfg)
+        pnl_calc = estimate_round_trip_pnl(entry, avg_exit, shares_total, cost_pct)
+        estimated_cost_rub = pnl_calc["estimated_cost_rub"]
+        pnl = pnl_calc["net_pnl_rub"]
+        actual_profit_pct = pnl_calc["net_pnl_pct"] if entry > 0 and shares_total > 0 else profit_pct
         pnl_adder = getattr(self._state, "add_realized_pnl_today", None)
         if callable(pnl_adder):
             pnl_adder(pnl)
@@ -2815,14 +2891,14 @@ class TradingEngine:
             scalp_stop = float(pos_data.get("stop_price") or
                                price * (1.0 - self._cfg.scalp_stop_loss_pct / 100.0))
             quick_target = float(pos_data.get("scalp_expected_round_trip_cost_pct")
-                                 or self._cfg.scalp_round_trip_cost_pct) / 2.0
+                                 or self._cfg.scalp_round_trip_cost_pct)
             return (f"✅ РУЧНАЯ ПОКУПКА {ticker}: {lots} лот(а) = {shares} шт "
                     f"по ~{price:.2f} ₽ (≈{_fmt_rub(cost)} ₽).\n"
                     f"Сопровождаю как свою скальп-сделку: цена пингуется каждые "
                     f"{max(5, int(self._cfg.scalp_exit_poll_sec))} сек (или на каждом "
                     f"тике потока).\n"
-                    f"• Быстрый тейк: продам ВСЁ при +{quick_target:.2f}% "
-                    f"(расходы продажи, без дополнительной маржи).\n"
+                    f"• Автопродажа: продам ВСЁ при +{quick_target:.2f}% "
+                    f"(полные оценочные расходы круга; net P&L неотрицательный).\n"
                     f"• Жёсткий стоп: {scalp_stop:.2f} ₽ "
                     f"(−{float(pos_data.get('scalp_risk_pct') or 0):.2f}%).\n"
                     f"• Тайм-стоп {self._cfg.scalp_time_stop_min} мин и "
@@ -2917,18 +2993,11 @@ class TradingEngine:
                     total_profit_pct = ((avg_exit / entry) - 1.0) * 100.0 if entry > 0 else 0.0
                     total_shares = initial_lots * lot_size
                     gross_pnl = ((avg_exit - entry) * total_shares if entry > 0 else 0.0)
-                    if bool(position.get("scalp_managed")):
-                        cost_pct = float(position.get("scalp_expected_round_trip_cost_pct")
-                                         or position.get("scalp_round_trip_cost_pct")
-                                         or self._cfg.scalp_round_trip_cost_pct)
-                    else:
-                        cost_pct = float(position.get("estimated_round_trip_cost_pct",
-                                                      self._cfg.estimated_round_trip_cost_pct) or 0.0)
-                    estimated_cost_rub = (entry * total_shares * max(0.0, cost_pct) / 100.0
-                                          if entry > 0 else 0.0)
-                    total_pnl = gross_pnl - estimated_cost_rub
-                    total_profit_pct = (total_pnl / (entry * total_shares) * 100.0
-                                        if entry > 0 and total_shares > 0 else 0.0)
+                    cost_pct = position_round_trip_cost_pct(position, self._cfg)
+                    pnl_calc = estimate_round_trip_pnl(entry, avg_exit, total_shares, cost_pct)
+                    estimated_cost_rub = pnl_calc["estimated_cost_rub"]
+                    total_pnl = pnl_calc["net_pnl_rub"]
+                    total_profit_pct = pnl_calc["net_pnl_pct"]
                     pnl_adder = getattr(self._state, "add_realized_pnl_today", None)
                     if callable(pnl_adder):
                         pnl_adder(total_pnl)
@@ -2999,11 +3068,20 @@ class TradingEngine:
             avg = float(held.get("avg_price", 0) or 0)
             shares = executed * lot_size
             gross_pnl = (price - avg) * shares if avg > 0 else 0.0
-            estimated_cost_rub = (avg * shares * self._cfg.estimated_round_trip_cost_pct / 100.0
-                                  if avg > 0 else 0.0)
-            pnl = gross_pnl - estimated_cost_rub
-            profit_pct = (pnl / (avg * shares) * 100.0
-                          if avg > 0 and shares > 0 else 0.0)
+            if self.scalp_mode():
+                spread_getter = getattr(self._client, "get_spread_pct", None)
+                try:
+                    spread_pct = max(0.0, float(spread_getter(ticker) or 0.0)) if callable(spread_getter) else 0.0
+                except Exception:
+                    spread_pct = 0.0
+                cost_pct = (float(self._cfg.scalp_round_trip_cost_pct) + spread_pct
+                            + max(0.0, float(getattr(self._cfg, "slippage_pct", 0.0) or 0.0)))
+            else:
+                cost_pct = float(self._cfg.estimated_round_trip_cost_pct)
+            pnl_calc = estimate_round_trip_pnl(avg, price, shares, cost_pct)
+            estimated_cost_rub = pnl_calc["estimated_cost_rub"]
+            pnl = pnl_calc["net_pnl_rub"]
+            profit_pct = pnl_calc["net_pnl_pct"]
             pnl_adder = getattr(self._state, "add_realized_pnl_today", None)
             if callable(pnl_adder) and avg > 0:
                 pnl_adder(pnl)

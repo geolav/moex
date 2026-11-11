@@ -72,10 +72,11 @@ from aiogram.types import (BufferedInputFile, CallbackQuery, InlineKeyboardButto
 
 import charts
 import predictor
+from trade_costs import estimate_round_trip_pnl, position_round_trip_cost_pct, format_rub
 
 log = logging.getLogger("telegram")
 
-VERSION = "1.15.0"
+VERSION = "1.17.1"
 
 HELP_TEXT = (
     "Команды (можно не печатать - жмите кнопки на клавиатуре ниже чата):\n"
@@ -1122,7 +1123,7 @@ def create_router(ctx: AppContext) -> Router:
         # дополнительно ограничен 70% equity и 15% номинала на бумагу.
         cap_note = (f"• Лимит вложенности {min(ctx.state.max_invested_pct(), 70)}% equity; "
                     "автоматически не повышается.\n")
-        quick_target = float(ctx.config.scalp_round_trip_cost_pct) / 2.0
+        quick_target = float(ctx.config.scalp_round_trip_cost_pct)
         await message.answer(
             "⚡ СКАЛЬП-РЕЖИМ ВКЛЮЧЁН — правила входа и выхода:\n"
             f"• максимум {ctx.config.scalp_max_positions} позиции одновременно, "
@@ -1133,9 +1134,9 @@ def create_router(ctx: AppContext) -> Router:
             f"• ATR-стоп clamp({ctx.config.scalp_atr_multiplier:.1f}×ATR, "
             f"{ctx.config.scalp_min_stop_pct:.1f}–{ctx.config.scalp_max_stop_pct:.1f}%), "
             f"TP1=1R с частичной фиксацией, остаток — 2R/ATR-трейлинг;\n"
-            f"• БЫСТРЫЙ ТЕЙК: продаю позицию ЦЕЛИКОМ при "
-            f"+{quick_target:.2f}% (расходы продажи, без дополнительной маржи) — "
-            f"при первом достижении порога продаю всю позицию; цена пингуется каждые "
+            f"• БЫСТРЫЙ ТЕЙК: продаю позицию ЦЕЛИКОМ, когда net P&L "
+            f"покрывает полный круг затрат (базовая комиссия + спред + проскальзывание); "
+            f"порог рассчитывается отдельно для каждой позиции; цена пингуется каждые "
             f"{max(5, int(ctx.config.scalp_exit_poll_sec))} сек;\n"
             f"• ВХОДЫ: два локальных детектора — микро-импульс потока и "
             f"остановившаяся «локальная яма» (dip_reversal); Groq подтверждает "
@@ -1591,13 +1592,7 @@ async def _balance_line(ctx: AppContext) -> str:
 
 
 async def _position_pnl_line(ctx: AppContext, ticker: str, pos: dict) -> str:
-    """Для /positions и /status: результат позиции с учётом комиссии.
-
-    v1.15.0: раньше строка показывала ГРУБЫЙ процент (цена/покупка - 1),
-    и было непонятно, можно ли продавать в плюс после комиссии за продажу.
-    Теперь рядом: брутто-результат, оценка после расходов выхода, полная
-    оценка после двух сторон сделки и вердикт с порогом быстрой продажи.
-    """
+    """Единый net P&L: полный круг затрат совпадает с отчётом о продаже."""
     try:
         price = None
         try:
@@ -1614,44 +1609,29 @@ async def _position_pnl_line(ctx: AppContext, ticker: str, pos: dict) -> str:
         lots = int(pos.get("lots", 0) or 0)
         lot_size = ctx.client.get_lot_size(ticker) or 1
         shares = lots * lot_size
-        pnl_pct = (price / entry - 1.0) * 100.0
-        pnl_rub = (price - entry) * shares
-        # Полная оценка издержек круга; быстрая продажа использует только
-        # оценку расходов выхода (половина круга), как просил владелец.
-        round_trip = float(
-            pos.get("scalp_expected_round_trip_cost_pct")
-            or pos.get("scalp_round_trip_cost_pct")
-            or pos.get("estimated_round_trip_cost_pct")
-            or getattr(ctx.config, "scalp_round_trip_cost_pct", 0.1) or 0.0)
-        round_trip = max(0.0, round_trip)
-        sell_cost_pct = round_trip / 2.0
-        net_pct = pnl_pct - sell_cost_pct
-        net_rub = pnl_rub - (entry * shares * sell_cost_pct / 100.0)
-        all_in_pct = pnl_pct - round_trip
-        all_in_rub = pnl_rub - (entry * shares * round_trip / 100.0)
-        pnl_str = f"{abs(pnl_rub):,.0f}".replace(",", " ")
-        net_str = f"{abs(net_rub):,.0f}".replace(",", " ")
-        all_in_str = f"{abs(all_in_rub):,.0f}".replace(",", " ")
-        # Порог автопродажи = расходы выхода (половина круга), без legacy-маржи.
-        bot_target = sell_cost_pct
-        target_price = entry * (1.0 + bot_target / 100.0)
-        if pnl_pct >= bot_target:
-            verdict = (f"✅ расходы продажи покрыты: результат после расходов выхода "
-                       f"~{net_pct:+.2f}% "
-                       f"({('+' if net_rub >= 0 else '−')}{net_str} ₽); бот должен "
-                       f"отправлять продажу автоматически. Оценка после полного "
-                       f"круга (включая покупку): {all_in_pct:+.2f}% "
-                       f"({('+' if all_in_rub >= 0 else '−')}{all_in_str} ₽); "
-                       f"порог +{bot_target:.2f}% ≈ {target_price:.2f} ₽")
+        cost_pct = position_round_trip_cost_pct(pos, ctx.config)
+        calc = estimate_round_trip_pnl(entry, float(price), shares, cost_pct)
+        gross_pct = calc["gross_pnl_pct"]
+        gross_rub = calc["gross_pnl_rub"]
+        net_pct = calc["net_pnl_pct"]
+        net_rub = calc["net_pnl_rub"]
+        cost_rub = calc["estimated_cost_rub"]
+        target_price = calc["breakeven_price"]
+        gross_text = f"{'+' if gross_rub >= 0 else '−'}{format_rub(gross_rub)} ₽"
+        net_text = f"{'+' if net_rub >= 0 else '−'}{format_rub(net_rub)} ₽"
+        cost_text = format_rub(cost_rub)
+        if net_rub >= 0:
+            verdict = (f"✅ полный круг издержек покрыт: net P&L {net_pct:+.2f}% "
+                       f"({net_text}); оценка затрат полного круга ~{cost_text} ₽; "
+                       f"порог автопродажи +{cost_pct:.3f}% ≈ {target_price:.2f} ₽")
         else:
-            gap = bot_target - pnl_pct
-            verdict = (f"⏳ расходы выхода ещё не покрыты: после них "
-                       f"~{net_pct:+.2f}% "
-                       f"({('+' if net_rub >= 0 else '−')}{net_str} ₽); до "
-                       f"порога автопродажи +{bot_target:.2f}% не хватает "
+            gap = max(0.0, cost_pct - gross_pct)
+            verdict = (f"⏳ полный круг издержек ещё не покрыт: net P&L "
+                       f"{net_pct:+.2f}% ({net_text}); оценка затрат полного круга "
+                       f"~{cost_text} ₽; до порога +{cost_pct:.3f}% не хватает "
                        f"{gap:.3f} п.п. (цена ≥ {target_price:.2f} ₽)")
-        return (f", сейчас {price:.2f} ₽ → брутто {pnl_pct:+.2f}% "
-                f"({'+' if pnl_rub >= 0 else '−'}{pnl_str} ₽). {verdict}")
+        return (f", сейчас {float(price):.2f} ₽ → брутто {gross_pct:+.2f}% "
+                f"({gross_text}). {verdict}")
     except Exception:  # noqa: BLE001 - статус не должен падать из-за цены
         return ""
 

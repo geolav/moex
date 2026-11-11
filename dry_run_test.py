@@ -266,7 +266,7 @@ class FakeAnalyst:
 
 async def main() -> int:
     print("=" * 64)
-    print("DRY-RUN самопроверка MOEX Trading Bot v1.15.0 (моки, без сети)")
+    print("DRY-RUN самопроверка MOEX Trading Bot v1.17.1 (моки, без сети)")
     print("=" * 64)
 
     tmp = tempfile.mkdtemp(prefix="bot_dryrun_")
@@ -858,8 +858,8 @@ async def main() -> int:
     check("пакетный анализ вызывает модель один раз и блокирует частые /scan",
           batch_calls == 1 and first_decisions.get("SBER", {}).get("action") == "buy"
           and second_decisions == {})
-    check("пакетный скальп-ответ ограничен 320 completion-токенами и JSON mode",
-          batch_kwargs and batch_kwargs[0]["max_tokens"] == 320
+    check("пакетный скальп-ответ имеет budget 1024 и JSON mode",
+          batch_kwargs and batch_kwargs[0]["max_tokens"] == 1024
           and batch_kwargs[0]["response_format"] == {"type": "json_object"},
           str(batch_kwargs))
 
@@ -1329,7 +1329,7 @@ async def main() -> int:
           f"stop_price={after_norm.get('stop_price')}")
 
     # --- Test 38 (v1.14.0): быстрый тейк «как у владельца» ---------------------
-    print("\n[38] v1.16.1: быстрый тейк продаёт ВСЮ позицию при покрытии расходов выхода")
+    print("\n[38] v1.17.1: быстрый тейк продаёт всю позицию при покрытии полного круга затрат")
     quick_state = StateStore(os.path.join(tmp, "quick_tp_state.json"),
                              initial_overrides={"trading_enabled": True})
     quick_state.set_scalp_mode(True)
@@ -1347,14 +1347,13 @@ async def main() -> int:
                  "llm_confidence": 0.75,
                  "scalp_session_key": sessions.scalp_session_key(time.time()) or "unknown"}
     quick_state.set_position("SBER", dict(quick_pos))
-    # Legacy margin=0.05% намеренно задана: порог равен расходам выхода,
-    # то есть половине круговой оценки (0.075%), без доп. запаса.
-    await quick_engine._check_scalp_exit("SBER", 100.07, dict(quick_pos))
-    check("плюс ниже расходов выхода (+0.07% < +0.075%) - позиция не продаётся",
+    # Порог теперь равен полным круговым издержкам (0.15%), чтобы статус,
+    # ручное закрытие и фактический P&L не показывали разные результаты.
+    await quick_engine._check_scalp_exit("SBER", 100.14, dict(quick_pos))
+    check("плюс ниже полного круга (+0.14% < +0.15%) - позиция не продаётся",
           "SBER" in quick_state.positions and not quick_client.sells)
-    # +0.08% уже покрывает расходы выхода; старый margin=0.05 игнорируется.
-    await quick_engine._check_scalp_exit("SBER", 100.08, dict(quick_pos))
-    check("первый плюс выше расходов выхода (+0.08%) продаёт всё без маржи",
+    await quick_engine._check_scalp_exit("SBER", 100.16, dict(quick_pos))
+    check("первый плюс выше полных издержек (+0.16%) продаёт всё",
           "SBER" not in quick_state.positions
           and quick_client.sells == [("SBER", 4)],
           f"sells={quick_client.sells}")
@@ -1462,15 +1461,17 @@ async def main() -> int:
     check("у позиции есть ожидаемые издержки и стоп-цена",
           float(manual_pos.get("scalp_expected_round_trip_cost_pct") or 0) > 0
           and 0 < float(manual_pos.get("stop_price") or 0) < 100.0)
-    # Цена +0.11% выше расходов выхода +0.10%, но ниже старой цели +0.25%.
-    # Старый SCALP_QUICK_TP_MARGIN_PCT=0.05 не должен задерживать продажу.
-    await manual_engine._check_scalp_exit("SBER", 100.11, dict(manual_pos))
-    check("первый рост выше расходов выхода закрывает ручную позицию без маржи",
+    # Для ручной покупки входной оценочный круг хранится в самой позиции;
+    # тест пересекает именно его, а не половину затрат.
+    manual_target = float(manual_pos.get("scalp_expected_round_trip_cost_pct") or 0.0)
+    manual_exit_price = 100.0 * (1.0 + (manual_target + 0.01) / 100.0)
+    await manual_engine._check_scalp_exit("SBER", manual_exit_price, dict(manual_pos))
+    check("рост выше полных издержек закрывает ручную позицию",
           "SBER" not in manual_state.positions
           and manual_client.sells == [("SBER", 1)],
           f"sells={manual_client.sells}")
     check("ответ на /buy обещает быстрый тейк и частый опрос цены",
-          "Быстрый тейк" in manual_result and "сек" in manual_result)
+          "Автопродажа" in manual_result and "сек" in manual_result)
 
     # --- Test 42 (v1.15.0): журнал сделок и единая дневная статистика --------
     print("\n[42] v1.15.0: журнал сделок - один источник счётчика и дневного P&L")

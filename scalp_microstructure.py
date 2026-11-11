@@ -306,18 +306,19 @@ def detect_multiscale_dip_trigger(
     min_score: float = 48.0,
     max_price_age_sec: float = 3.0,
     max_book_age_sec: float = 5.0,
+    diagnostics: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, float]]:
-    """Быстрый многомасштабный поиск локальных микродон (v1.17.0).
+    """Многомасштабный поиск локального микродна (12/20/35/60/120/240 сек).
 
-    В отличие от старого детектора с фиксированным падением 0.20% и
-    стабилизацией 20 секунд, проверяет окна 12/20/35/60/120/240 секунд.
-    Ищет недавний локальный минимум, после которого появились несколько
-    подтверждающих uptick, покупательский баланс и достаточный потенциал
-    восстановления относительно ожидаемых издержек.
-
-    Это эвристический детектор событий, не гарантия нахождения каждого дна и
-    не вероятностная ML-модель. Не вызывает LLM и не делает торговых заявок.
+    Возвращает сигнал только после локального trough, отскока, потока покупок
+    и проверки ожидаемых издержек. При diagnostics заполняет причину отказа;
+    это позволяет логировать работу детектора, даже когда сигналов нет.
     """
+    def report(reason: str, **extra: Any) -> None:
+        if diagnostics is not None:
+            diagnostics.clear()
+            diagnostics.update({"reason": reason, **extra})
+
     try:
         price = float(quote.get("price") or 0.0)
         price_age = float(quote.get("price_age_sec", math.inf))
@@ -329,12 +330,28 @@ def detect_multiscale_dip_trigger(
         spread_pct = float(quote.get("spread_pct") or 0.0)
         raw_ticks = quote.get("ticks") or []
     except (TypeError, ValueError):
+        report("некорректные поля котировки")
         return None
 
-    if (price <= 0 or bid <= 0 or ask <= bid or bid_size <= 0 or ask_size <= 0
-            or price_age > max_price_age_sec or book_age > max_book_age_sec
-            or not quote.get("book_consistent", True)
-            or spread_pct <= 0 or spread_pct > max_spread_pct):
+    if price <= 0:
+        report("нет корректной последней цены")
+        return None
+    if price_age > max_price_age_sec:
+        report("последняя цена устарела", price_age_sec=price_age,
+               ticks=len(raw_ticks))
+        return None
+    if book_age > max_book_age_sec:
+        report("стакан устарел", book_age_sec=book_age, ticks=len(raw_ticks))
+        return None
+    if bid <= 0 or ask <= bid or bid_size <= 0 or ask_size <= 0:
+        report("нет корректного двустороннего стакана", ticks=len(raw_ticks))
+        return None
+    if not quote.get("book_consistent", True):
+        report("стакан не согласован", ticks=len(raw_ticks))
+        return None
+    if spread_pct <= 0 or spread_pct > max_spread_pct:
+        report(f"спред {spread_pct:.4f}% вне лимита {max_spread_pct:.4f}%",
+               ticks=len(raw_ticks))
         return None
 
     parsed = []
@@ -346,10 +363,10 @@ def detect_multiscale_dip_trigger(
         if ts > 0 and value > 0 and math.isfinite(ts) and math.isfinite(value):
             parsed.append((ts, value))
     if len(parsed) < 6:
+        report("в буфере недостаточно ценовых тиков (нужно минимум 6)",
+               ticks=len(parsed), windows_checked=[])
         return None
     parsed.sort(key=lambda x: x[0])
-    # Поток хранит только изменения цены. Если последнее значение котировки
-    # новее последней записи кольцевого буфера, добавляем его в локальный расчёт.
     price_ts = float(quote.get("price_updated_mono", 0.0) or 0.0)
     latest_ts = max(parsed[-1][0], price_ts)
     if abs(parsed[-1][1] - price) > 1e-12:
@@ -357,8 +374,6 @@ def detect_multiscale_dip_trigger(
     else:
         parsed[-1] = (latest_ts, price)
 
-    # Медианное изменение тика оценивает локальный шум, не подгоняя порог
-    # под абсолютную цену бумаги. Все изменения - в процентах.
     moves = [abs((b[1] / a[1] - 1.0) * 100.0)
              for a, b in zip(parsed[-32:], parsed[-31:]) if a[1] > 0 and b[1] > 0]
     moves = [x for x in moves if x > 1e-9]
@@ -367,19 +382,30 @@ def detect_multiscale_dip_trigger(
     depth_floor = max(float(min_local_drop_pct), noise_pct * 1.25, cost_pct * 0.12)
     imbalance = bid_size / max(ask_size, 1e-12)
     if imbalance < 0.95:
+        report(f"продавцы сильнее покупателей в стакане (bid/ask={imbalance:.2f})",
+               ticks=len(parsed), windows_checked=[])
         return None
 
+    rejects: Dict[str, int] = {
+        "no_trough": 0,
+        "still_falling": 0,
+        "shallow_drop": 0,
+        "bounce_not_confirmed": 0,
+        "weak_upticks": 0,
+        "costs_not_covered": 0,
+        "score_below_min": 0,
+    }
+    windows_checked = []
+    total_troughs = 0
     best: Optional[Dict[str, float]] = None
-    # Короткие масштабы ловят локальные откаты, длинные помогают отличить
-    # внутриминутную яму от обычного шума на более широком движении.
     for window_sec in (12.0, 20.0, 35.0, 60.0, 120.0, 240.0):
         pts = [(ts, p) for ts, p in parsed if latest_ts - window_sec <= ts <= latest_ts]
         if len(pts) < 6 or pts[-1][0] - pts[0][0] < min(4.0, window_sec * 0.25):
             continue
+        windows_checked.append(int(window_sec))
         prices = [p for _, p in pts]
         first_idx = max(3, len(pts) - 14)
-        # Проверяем несколько последних локальных trough, а не только минимум
-        # всего окна: это важно, если в окне уже был более глубокий старый лой.
+        found_local_minimum = False
         for low_idx in range(len(pts) - 3, first_idx - 1, -1):
             low = prices[low_idx]
             left = prices[max(0, low_idx - 2):low_idx]
@@ -388,46 +414,48 @@ def detect_multiscale_dip_trigger(
                 continue
             if low > min(left) or low > min(right):
                 continue
+            found_local_minimum = True
+            total_troughs += 1
             low_ts = pts[low_idx][0]
             low_age = latest_ts - low_ts
             if low_age < 1.0 or low_age > min(15.0, max(5.0, window_sec * 0.5)):
+                rejects["bounce_not_confirmed"] += 1
                 continue
-            # Любое обновление минимума после trough отменяет этот кандидат.
             tail = prices[low_idx:]
             if any(p < low - 1e-12 for p in tail[1:]):
+                rejects["still_falling"] += 1
                 continue
             prior = prices[max(0, low_idx - min(12, max(5, len(pts) // 2))):low_idx]
             if len(prior) < 3:
+                rejects["no_trough"] += 1
                 continue
             top3 = sorted(prior)[-min(3, len(prior)):]
             reference = sum(top3) / len(top3)
             drop_pct = (reference / low - 1.0) * 100.0 if low > 0 else 0.0
             if drop_pct < depth_floor:
+                rejects["shallow_drop"] += 1
                 continue
-
             off_low_pct = (price / low - 1.0) * 100.0
             min_bounce = max(0.005, noise_pct * 0.5)
             if off_low_pct < min_bounce or off_low_pct > drop_pct * 0.70:
+                rejects["bounce_not_confirmed"] += 1
                 continue
-
             post_changes = [b - a for a, b in zip(tail, tail[1:])]
             nonzero = [x for x in post_changes if abs(x) > 1e-12]
             up_ratio = (sum(x > 0 for x in nonzero) / len(nonzero)
                         if nonzero else 0.0)
             if sum(x > 0 for x in nonzero) < 2 or up_ratio < 0.60:
+                rejects["weak_upticks"] += 1
                 continue
-            # На микромасштабе цена должна быть выше минимума не случайным
-            # одиночным тиком: требуем положительное изменение последней части.
             tail_start = max(0, len(tail) - 4)
             if tail[-1] <= tail[tail_start]:
+                rejects["weak_upticks"] += 1
                 continue
-
             potential_pct = (reference / price - 1.0) * 100.0 if price > 0 else 0.0
             min_potential = max(0.015, cost_pct * 1.05)
             if potential_pct < min_potential:
+                rejects["costs_not_covered"] += 1
                 continue
-
-            # Интерпретируемый score 0..100 для ранжирования локальных ям.
             depth_score = min(25.0, 12.5 * drop_pct / max(depth_floor, 1e-9))
             bounce_score = min(25.0, 25.0 * off_low_pct /
                                max(drop_pct * 0.45, min_bounce, 1e-9))
@@ -438,6 +466,7 @@ def detect_multiscale_dip_trigger(
             score = min(100.0, depth_score + bounce_score + flow_score
                         + book_score + economics_score)
             if score < float(min_score):
+                rejects["score_below_min"] += 1
                 continue
             result = {
                 "kind": "dip_reversal",
@@ -460,6 +489,35 @@ def detect_multiscale_dip_trigger(
             }
             if best is None or result["bottom_score"] > best["bottom_score"]:
                 best = result
-            # Сначала проверяем наиболее свежий trough на каждом масштабе.
             break
-    return best
+        if not found_local_minimum:
+            rejects["no_trough"] += 1
+
+    if best is not None:
+        report("микродно подтверждено", ticks=len(parsed),
+               windows_checked=windows_checked, rejects=rejects,
+               best_scale_sec=best["dip_scale_sec"], score=best["bottom_score"])
+        return best
+
+    if not windows_checked:
+        reason = "недостаточно частых тиков для окон 12–240 сек"
+    elif total_troughs == 0:
+        reason = "локальный минимум ещё не сформирован в проверенных окнах"
+    else:
+        labels = {
+            "still_falling": "цена продолжает обновлять минимум",
+            "shallow_drop": "просадка меньше локального шумового порога",
+            "bounce_not_confirmed": "отскок ещё не подтверждён или уже слишком большой",
+            "weak_upticks": "мало последовательных повышений цены после минимума",
+            "costs_not_covered": "потенциал отскока меньше полных издержек сделки",
+            "score_below_min": "структура дна слабее минимального score",
+            "no_trough": "локальный минимум не сформирован",
+        }
+        key = max(rejects, key=lambda k: rejects[k])
+        reason = labels[key]
+    report(reason, ticks=len(parsed), windows_checked=windows_checked,
+           troughs=total_troughs, rejects=rejects,
+           noise_pct=round(noise_pct, 5), depth_floor_pct=round(depth_floor, 5),
+           bid_ask_imbalance=round(imbalance, 3))
+    return None
+

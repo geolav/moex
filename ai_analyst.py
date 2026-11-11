@@ -244,6 +244,8 @@ _TRADER_SYSTEM_PROMPT = _load_prompt_file("trader_system_ru.md", _TRADER_SYSTEM_
 _SCALP_SYSTEM_PROMPT = _load_prompt_file("scalp_system_ru.md")
 _AUDITOR_SYSTEM_PROMPT = _load_prompt_file("trade_auditor_ru.md", _AUDIT_SYSTEM_PROMPT)
 _CANDIDATE_BATCH_SYSTEM_PROMPT = _load_prompt_file("candidate_batch_ru.md")
+_SCALP_CANDIDATE_BATCH_SYSTEM_PROMPT = _load_prompt_file(
+    "scalp_candidate_batch_ru.md", _CANDIDATE_BATCH_SYSTEM_PROMPT)
 
 
 def parse_decision_json(raw_text: str) -> Optional[dict]:
@@ -788,12 +790,14 @@ class AIAnalyst:
                 self._last_candidate_call_monotonic = now
             try:
                 raw = await self._chat(
-                    _CANDIDATE_BATCH_SYSTEM_PROMPT,
+                    (_SCALP_CANDIDATE_BATCH_SYSTEM_PROMPT if scalp_mode
+                     else _CANDIDATE_BATCH_SYSTEM_PROMPT),
                     user,
-                    # Скальп пакетно проверяет до трёх коротких решений;
-                    # 320 completion-токенов достаточно для компактного JSON.
-                    # Обычный сканер использует более подробный ответ: 760.
-                    max_tokens=320 if scalp_mode else 760,
+                    # GPT-OSS расходует часть completion budget на reasoning.
+                    # 320 приводило к HTTP 400 json_validate_failed до валидного
+                    # JSON. 1024 достаточно для reasoning + 3 компактных решений;
+                    # частота пакета (4 мин) и дневной budget не увеличиваются.
+                    max_tokens=1024 if scalp_mode else 760,
                     temperature=0.0,
                     tries=1,
                     response_format={"type": "json_object"},

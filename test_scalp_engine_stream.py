@@ -487,7 +487,11 @@ class ScalpEngineStreamTests(unittest.IsolatedAsyncioTestCase):
                 await engine._check_scalp_exit("SBER", 100.07, dict(pos))
             self.assertTrue(any("Скальп-мониторинг SBER" in line for line in captured.output))
             self.assertIn("SBER", state.positions)
-            await engine._check_scalp_exit("SBER", 100.08, dict(pos))
+            # Быстрый выход теперь ждёт покрытие ВСЕГО круга затрат (0.15%),
+            # а не только половины издержек выхода.
+            await engine._check_scalp_exit("SBER", 100.14, dict(pos))
+            self.assertIn("SBER", state.positions)
+            await engine._check_scalp_exit("SBER", 100.16, dict(pos))
             self.assertNotIn("SBER", state.positions)
             self.assertEqual(engine._client.sells, [("SBER", 1)])
 
