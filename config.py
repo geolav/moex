@@ -46,7 +46,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 #: Максимум тикеров ОБЫЧНОГО режима - жёсткое требование по памяти и лимитам
 #: API. v1.6.0: поднято с 5 до 6 - движок ведёт до шести бумаг одновременно.
-#: (В скальп-режиме лимит другой: SCALP_MAX_POSITIONS, по умолчанию 8.)
+#: (В скальп-режиме лимит другой: SCALP_MAX_POSITIONS, по умолчанию 12.)
 MAX_TICKERS = 6
 
 _TRUE_VALUES = {"1", "true", "yes", "on", "y", "t", "да"}
@@ -204,7 +204,7 @@ class BotConfig:
     chase_bounce_pct: float        # не покупать, если отскок от минимума окна уже >= X%
     morning_anchor_until: int      # до скольки часов утренний якорь на вчерашний день
     # --- Скальп-режим (v1.7.0): /scalp в Telegram -----------------------------
-    scalp_max_positions: int       # максимум одновременно открытых скальп-позиций (до 8)
+    scalp_max_positions: int       # максимум одновременно открытых скальп-позиций (до 12)
     scalp_watchlist_max: int        # сколько бумаг держать в скальп-watchlist (до 15)
     scalp_poll_sec: int            # legacy ENV; event-driven scalp не использует
     scalp_exit_poll_sec: int       # резервный интервал охраны при недоступном stream
@@ -238,7 +238,9 @@ class BotConfig:
     # и покрыть круговые издержки (комиссия x2 + спред + проскальзывание)
     # плюс небольшая маржа. Проверяется на каждом тике потока/охраны.
     scalp_quick_tp_enabled: bool
-    scalp_quick_tp_margin_pct: float  # запас сверху издержек, п.п.
+    scalp_quick_tp_margin_pct: float  # legacy: запас сверху издержек, п.п.
+    scalp_min_net_profit_rub: float  # минимум ожидаемой чистой прибыли для обычной фиксации
+    scalp_force_flat_at_session_end: bool  # аварийное закрытие перед клирингом, по умолчанию выкл
     # --- Режим рынка и локальный микро-детектор (v1.13.0) ---------------------
     market_breadth_riskoff_pct: float
     # ниже этого breadth новые лонги запрещены (раньше был жёсткий 35%)
@@ -406,8 +408,8 @@ def load_config() -> BotConfig:
                                     low=0.0, high=50.0),
         morning_anchor_until=_env_int("MORNING_ANCHOR_UNTIL", 13,
                                       low=10, high=17),
-        scalp_max_positions=_env_int("SCALP_MAX_POSITIONS", 8,
-                                     low=1, high=8),
+        scalp_max_positions=_env_int("SCALP_MAX_POSITIONS", 12,
+                                     low=1, high=15),
         scalp_watchlist_max=_env_int("SCALP_WATCHLIST_MAX", 15, low=8, high=15),
         scalp_poll_sec=_env_int("SCALP_POLL_SEC", 300, low=60, high=3600),
         scalp_exit_poll_sec=_env_int("SCALP_EXIT_POLL_SEC", 10,
@@ -430,8 +432,8 @@ def load_config() -> BotConfig:
                                         low=0.3, high=100.0),
         scalp_max_entries_per_day=_env_int("SCALP_MAX_ENTRIES_PER_DAY", 100,
                                            low=1, high=100),
-        scalp_risk_per_trade_pct=_env_float("SCALP_RISK_PER_TRADE_PCT", 0.05,
-                                            low=0.05, high=0.3),
+        scalp_risk_per_trade_pct=_env_float("SCALP_RISK_PER_TRADE_PCT", 0.03,
+                                            low=0.01, high=0.3),
         scalp_max_portfolio_risk_pct=_env_float(
             "SCALP_MAX_PORTFOLIO_RISK_PCT", 0.40, low=0.10, high=2.0),
         scalp_daily_loss_limit_pct=_env_float("SCALP_DAILY_LOSS_LIMIT_PCT", 1.0,
@@ -472,6 +474,10 @@ def load_config() -> BotConfig:
         # больше не добавляет маржу поверх полных круговых издержек.
         scalp_quick_tp_margin_pct=_env_float("SCALP_QUICK_TP_MARGIN_PCT", 0.0,
                                              low=0.0, high=1.0),
+        scalp_min_net_profit_rub=_env_float("SCALP_MIN_NET_PROFIT_RUB", 1.0,
+                                            low=0.0, high=10000.0),
+        scalp_force_flat_at_session_end=_env_bool(
+            "SCALP_FORCE_FLAT_AT_SESSION_END", False),
         # v1.13.0: настраиваемый порог risk-off и пороги локального
         # микро-детектора (см. scalp_microstructure.py). Порог 30% вместо
         # прежнего жёсткого 35%: между 30% и 55% входы разрешены с половинным

@@ -233,8 +233,8 @@ def is_scalp_entry_time(now: Optional[datetime] = None) -> bool:
     """Широкое окно доступности скальп-входов по расписанию MOEX (МСК).
 
     Основная сессия: 10:05-18:40; вечерняя: 19:07-23:40.
-    Отдельная проверка can_open_scalp_entry() требует времени на удержание
-    до закрытия сессии, поэтому бот не открывает сделку за минуту до клиринга.
+    can_open_scalp_entry() использует только небольшой буфер перед закрытием;
+    максимального времени удержания позиции у скальпа больше нет.
     """
     dt = now or msk_now()
     minute = _minutes_of_day(dt)
@@ -280,9 +280,9 @@ def minutes_to_scalp_session_end(now: Optional[datetime] = None) -> int:
     return 0
 
 
-def can_open_scalp_entry(required_minutes: int = 45,
+def can_open_scalp_entry(required_minutes: int = 15,
                          now: Optional[datetime] = None) -> bool:
-    """Вход возможен только если остаётся весь плановый горизонт сделки."""
+    """Новые входы разрешены только в торговое окно с защитным буфером до закрытия."""
     dt = now or msk_now()
     return (is_scalp_entry_time(dt)
             and minutes_to_scalp_session_end(dt) >= max(15, int(required_minutes)))

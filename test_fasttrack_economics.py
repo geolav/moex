@@ -107,6 +107,24 @@ class ScalpConfigTests(unittest.TestCase):
         self.assertTrue(cfg.scalp_fasttrack_enabled)
         self.assertTrue(cfg.scalp_micro_price_only)
 
+    def test_12_positions_and_net_profit_floor_are_configurable(self):
+        values = {
+            "TINKOFF_SANDBOX_TOKEN": "test-token",
+            "GROQ_API_KEY": "test-key",
+            "TELEGRAM_BOT_TOKEN": "123:TEST",
+            "TELEGRAM_ADMIN_ID": "123",
+            "SCALP_MAX_POSITIONS": "12",
+            "SCALP_RISK_PER_TRADE_PCT": "0.03",
+            "SCALP_MIN_NET_PROFIT_RUB": "1.0",
+            "SCALP_FORCE_FLAT_AT_SESSION_END": "false",
+        }
+        with patch.dict("os.environ", values, clear=False):
+            cfg = load_config()
+        self.assertEqual(cfg.scalp_max_positions, 12)
+        self.assertAlmostEqual(cfg.scalp_risk_per_trade_pct, 0.03)
+        self.assertAlmostEqual(cfg.scalp_min_net_profit_rub, 1.0)
+        self.assertFalse(cfg.scalp_force_flat_at_session_end)
+
 
 if __name__ == "__main__":
     unittest.main()

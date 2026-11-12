@@ -709,7 +709,7 @@ class TradingEngine:
                 # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: наблюдение и поиск ям НЕ зависят
                 # от разрешения отправлять ордера и от времени до закрытия.
                 # Раньше оба gate стояли ДО детектора: при trading_enabled=false
-                # или остатке сессии < time-stop Supervisor видел ноль оценок.
+                # или остатке сессии < планового горизонта Supervisor видел ноль оценок.
                 last_eval = self._scalp_last_local_eval.get(ticker, 0.0)
                 if now - last_eval < 2.0:
                     continue
@@ -738,7 +738,7 @@ class TradingEngine:
                 entry_block_reason = None
                 if not self._state.trading_enabled:
                     entry_block_reason = "trading_disabled"
-                elif not sessions.can_open_scalp_entry(self._cfg.scalp_time_stop_min):
+                elif not sessions.can_open_scalp_entry(15):
                     entry_block_reason = "session_time_window"
                 if entry_block_reason:
                     if supervisor is not None:
@@ -1244,9 +1244,9 @@ class TradingEngine:
 
         Каждые SCALP_EXIT_POLL_SEC секунд (по умолчанию 10, минимум 5) для
         КАЖДОЙ открытой позиции - включая ручные покупки владельца - берём
-        свежую цену и проверяем все локальные правила выхода: жёсткий стоп,
-        быстрый тейк «издержки+маржа», частичную фиксацию, безубыток,
-        трейлинг и тайм-стоп. ИИ на охрану не тратится.
+        свежую цену и проверяем все локальные правила выхода: жёсткий ATR-стоп,
+        фиксацию при положительном net P&L, частичную фиксацию и ATR-трейлинг;
+        максимального времени удержания нет. ИИ на охрану не тратится.
         """
         self._migrate_legacy_scalp_positions()
         now_mono = time.monotonic()
@@ -1881,10 +1881,9 @@ class TradingEngine:
                 return
         # Строгие скальп-фильтры исполняются ДО ИИ и не могут быть переопределены.
         if self.scalp_mode():
-            if not sessions.can_open_scalp_entry(self._cfg.scalp_time_stop_min):
+            if not sessions.can_open_scalp_entry(15):
                 log.info("%s: скальп-вход запрещён: вне торгового окна или "
-                         "до закрытия сессии осталось меньше %d мин", ticker,
-                         self._cfg.scalp_time_stop_min)
+                         "до закрытия сессии осталось меньше 15 мин", ticker)
                 return
             if len(self._state.positions) >= self._cfg.scalp_max_positions:
                 log.info("%s: достигнут лимит скальп-позиций (%d)",
@@ -2629,9 +2628,8 @@ class TradingEngine:
                 f"(открытый риск до входа {open_risk_pct:.2f}%); "
                 f"стоп {stop_price:.2f} ₽ (−{scalp_stop_pct:.2f}%, ATR×"
                 f"{self._cfg.scalp_atr_multiplier:.1f}); TP1 1R {take_price:.2f} ₽; "
-                f"после TP1 половину закрываю, стоп переношу к безубытку+издержки; "
-                f"остаток веду к 2R/ATR-трейлингу; тайм-стоп "
-                f"{self._cfg.scalp_time_stop_min} мин.\n")
+                f"после TP1 половину закрываю, стоп переношу к net-profit floor; "
+                f"остаток веду к 2R/ATR-трейлингу; максимального времени удержания нет.\n")
         else:
             trade_stop_pct = float(decision.get("stop_pct") or self._cfg.stop_loss_pct)
             trade_take_pct = float(decision.get("tp1_pct") or self._cfg.take_profit_pct)
@@ -2742,169 +2740,152 @@ class TradingEngine:
         # трейлинг и локальные признаки ослабления импульса. Не тратим Groq
         # на отдельный запрос по каждой уже открытой позиции.
 
+    def _scalp_projected_net_pnl(self, ticker: str, price: float,
+                                 position: Dict[str, Any]) -> float:
+        """Оценка net P&L всей позиции, включая уже закрытые частичные лоты."""
+        entry = float(position.get("entry_price", 0) or 0.0)
+        remaining_lots = max(0, int(position.get("lots", 0) or 0))
+        realized_lots = max(0, int(position.get("realized_lots", 0) or 0))
+        initial_lots = max(remaining_lots + realized_lots,
+                           int(position.get("initial_lots", 0) or 0))
+        lot_size = self._client.get_lot_size(ticker) or 1
+        if entry <= 0 or initial_lots <= 0 or lot_size <= 0:
+            return float("-inf")
+        realized_value = float(position.get("realized_exit_value", 0) or 0.0)
+        avg_exit = (realized_value + price * remaining_lots) / initial_lots
+        cost_pct = position_round_trip_cost_pct(position, self._cfg)
+        return float(estimate_round_trip_pnl(
+            entry, avg_exit, initial_lots * lot_size, cost_pct)["net_pnl_rub"])
+
+    def _scalp_min_remaining_exit_price(self, ticker: str,
+                                        position: Dict[str, Any]) -> float:
+        """Цена выхода остатка, при которой net P&L всей позиции >= минимум."""
+        entry = float(position.get("entry_price", 0) or 0.0)
+        remaining_lots = max(0, int(position.get("lots", 0) or 0))
+        realized_lots = max(0, int(position.get("realized_lots", 0) or 0))
+        initial_lots = max(remaining_lots + realized_lots,
+                           int(position.get("initial_lots", 0) or 0))
+        lot_size = self._client.get_lot_size(ticker) or 1
+        if entry <= 0 or remaining_lots <= 0 or initial_lots <= 0:
+            return entry
+        cost_pct = position_round_trip_cost_pct(position, self._cfg)
+        min_profit = max(0.0, float(getattr(
+            self._cfg, "scalp_min_net_profit_rub", 1.0)))
+        total_shares = initial_lots * lot_size
+        required_avg_exit = entry * (1.0 + cost_pct / 100.0) + min_profit / total_shares
+        realized_value = float(position.get("realized_exit_value", 0) or 0.0)
+        return max(0.0, (required_avg_exit * initial_lots - realized_value) / remaining_lots)
+
     async def _check_scalp_exit(self, ticker: str, price: float,
                                 position: Dict[str, Any]) -> None:
-        """Скальп: hard stop, 1R partial, break-even, 2R/ATR trail, time stop."""
+        """Scalp exit: emergency ATR stop + positive-net profit taking; no age stop."""
         entry = float(position.get("entry_price", 0) or 0)
         lots = int(position.get("lots", 0) or 0)
         if entry <= 0 or lots < 1:
             self._state.drop_position(ticker)
             return
+
         risk_pct = float(position.get("scalp_risk_pct") or
                          min(self._cfg.scalp_stop_loss_pct, self._cfg.scalp_max_stop_pct))
         risk_pct = max(self._cfg.scalp_min_stop_pct,
                        min(risk_pct, self._cfg.scalp_max_stop_pct))
-        # Используем тот же единственный источник стоимости полного круга,
-        # что /positions и отчёт закрытия. Не дублируем fallback-логику здесь:
-        # иначе старая позиция без expected-поля могла бы получить другой
-        # порог автопродажи, чем финансовый отчёт.
         expected_cost_pct = position_round_trip_cost_pct(position, self._cfg)
         profit_pct = (price / entry - 1.0) * 100.0
         max_price = max(float(position.get("max_price", entry) or entry), price)
         tp1_done = bool(position.get("tp1_done", False))
-        stop_price = float(position.get("stop_price") or
-                           entry * (1.0 - risk_pct / 100.0))
+        hard_stop_price = entry * (1.0 - risk_pct / 100.0)
+        stop_price = float(position.get("stop_price") or hard_stop_price)
         update = dict(position)
-        update.update({"max_price": max_price, "max_profit_pct": max(
-            float(position.get("max_profit_pct", 0) or 0), profit_pct),
-            "scalp_managed": True, "scalp_risk_pct": risk_pct})
+        update.update({"max_price": max_price,
+                       "max_profit_pct": max(float(position.get("max_profit_pct", 0) or 0), profit_pct),
+                       "scalp_managed": True, "scalp_risk_pct": risk_pct})
 
-        # Жёсткий стоп имеет приоритет над сервисным закрытием сессии.
-        if price <= stop_price:
-            await self._sell(ticker, price, update, "стоп-лосс",
-                             profit_pct, "жёсткий скальп-стоп сработал немедленно")
+        min_net_profit = max(0.0, float(getattr(
+            self._cfg, "scalp_min_net_profit_rub", 1.0)))
+        projected_net = self._scalp_projected_net_pnl(ticker, price, update)
+
+        # Единственный безусловный ценовой выход в убыток — заранее рассчитанный
+        # защитный ATR-стоп. Время удержания его не заменяет и не запускает.
+        if price <= hard_stop_price:
+            await self._sell(ticker, price, update, "стоп-лосс", profit_pct,
+                             "жёсткий скальп-стоп сработал; аварийный выход важнее порога прибыли")
             return
 
-        # Не переносим скальп-позицию через разрыв между основной и вечерней
-        # сессией или через ночь. Если пропустили окно выхода перед клирингом,
-        # закрываем на первой доступной котировке следующей сессии.
+        # Закрытие на сессионной границе по умолчанию отключено: позиции могут
+        # пережить перерыв/ночь. При желании владелец может явно включить его ENV.
+        force_flat = bool(getattr(self._cfg, "scalp_force_flat_at_session_end", False))
         entry_session = str(position.get("scalp_session_key") or "")
         current_session = sessions.scalp_session_key()
-        if (entry_session and entry_session != "unknown" and current_session
-                and entry_session != current_session):
+        if force_flat and entry_session and entry_session != "unknown" and current_session and entry_session != current_session:
             await self._sell(ticker, price, update, "скальп: закрытие предыдущей сессии",
                              profit_pct, f"entry_session={entry_session}; current={current_session}")
             return
-
-        # Проверяем принудительный выход ДО частичного TP/трейлинга, иначе
-        # ветка TP1 могла вернуть управление и оставить остаток на ночь.
-        if sessions.should_force_flatten_scalp():
+        if force_flat and sessions.should_force_flatten_scalp():
             await self._sell(ticker, price, update, "скальп: закрытие сессии",
-                             profit_pct, "принудительное закрытие перед окончанием торгов")
+                             profit_pct, "включено SCALP_FORCE_FLAT_AT_SESSION_END=true")
             return
 
-        # Единый финансовый критерий: автоматический выход только тогда,
-        # когда ожидаемый P&L ПОСЛЕ ВСЕГО КРУГА (вход + выход + спред + slippage)
-        # уже неотрицательный. Этот же процент используется в /positions,
-        # ручном закрытии и итоговом отчёте сделки.
-        # Legacy SCALP_QUICK_TP_MARGIN_PCT полностью игнорируется.
-        quick_target = max(0.0, expected_cost_pct)
         monitor_now = time.monotonic()
         monitor_every = max(5.0, float(getattr(self._cfg, "scalp_exit_poll_sec", 10)))
         if monitor_now - self._scalp_monitor_log_last.get(ticker, 0.0) >= monitor_every:
             self._scalp_monitor_log_last[ticker] = monitor_now
-            status = ("ПОРОГ ДОСТИГНУТ — отправляю продажу"
-                      if self._cfg.scalp_quick_tp_enabled and profit_pct >= quick_target
-                      else f"жду ещё {max(0.0, quick_target - profit_pct):.3f} п.п.")
             log.info(
                 "Скальп-мониторинг %s: цена %.4f ₽, вход %.4f ₽, брутто %+.3f%%, "
-                "оценка полных издержек круга %.3f%%, порог безубыточности %.3f%%; %s",
+                "издержки круга %.3f%%, ожидаемый net P&L %+.2f ₽, минимум фиксации +%.2f ₽; %s",
                 ticker, price, entry, profit_pct, expected_cost_pct,
-                quick_target, status)
-        if self._cfg.scalp_quick_tp_enabled:
-            if profit_pct >= quick_target:
-                await self._sell(
-                    ticker, price, update, "скальп: быстрый плюс", profit_pct,
-                    f"+{profit_pct:.3f}% покрывает полные оценочные издержки круга "
-                    f"{quick_target:.3f}%; позиция закрыта целиком")
-                return
+                projected_net, min_net_profit,
+                "можно фиксировать прибыль" if projected_net >= min_net_profit else "держу позицию")
 
-        entry_epoch = float(position.get("entry_epoch", 0) or 0)
-        if entry_epoch <= 0:
-            try:
-                entry_dt = datetime.strptime(
-                    str(position.get("entry_ts", "")), "%Y-%m-%d %H:%M:%S")
-                entry_epoch = entry_dt.replace(tzinfo=sessions.MSK).timestamp()
-            except (ValueError, TypeError):
-                entry_epoch = time.time()
-        age_min = max(0.0, (time.time() - entry_epoch) / 60.0)
-        confidence = float(position.get("llm_confidence", 0.0) or 0.0)
-        weak_position = confidence < 0.70
-        # У неизвестной по времени legacy-позиции безопаснее закрыть её на
-        # первой доступной цене, чем начинать новый 45-минутный таймер вслепую.
-        if bool(position.get("scalp_time_unknown")):
-            await self._sell(ticker, price, update, "скальп: время входа неизвестно",
-                             profit_pct, "не удалось достоверно восстановить возраст позиции")
-            return
-        if (bool(position.get("scalp_migrated_from_legacy"))
-                and age_min >= float(self._cfg.scalp_time_stop_min)):
-            await self._sell(ticker, price, update,
-                             "скальп: закрытие устаревшей legacy-позиции",
-                             profit_pct,
-                             f"позиция открыта до миграции; возраст {age_min:.0f} мин")
-            return
-        # Слабый вердикт получает короткий горизонт; если TP1 ещё не достигнут,
-        # закрываем через половину базового time-stop. Любая scalp-позиция
-        # без TP1 имеет жёсткий максимум удержания 45 минут — не оставляем
-        # плавающий +0.3R как повод пересидеть несколько часов.
-        if not tp1_done:
-            if weak_position and age_min >= 20.0 and profit_pct <= -0.45 * risk_pct:
-                await self._sell(ticker, price, update,
-                                 "скальп: ранний выход слабой позиции", profit_pct,
-                                 f"confidence={confidence:.2f}; просадка не лучше -0.45R")
-                return
-            time_limit = max(5.0, self._cfg.scalp_time_stop_min *
-                             (0.5 if weak_position else 1.0))
-            if age_min >= time_limit:
-                await self._sell(ticker, price, update, "скальп: жёсткий тайм-стоп",
-                                 profit_pct,
-                                 f"максимальное удержание {time_limit:.0f} мин; "
-                                 f"confidence={confidence:.2f}; TP1 не достигнут")
-                return
-        elif age_min >= float(self._cfg.scalp_time_stop_min):
-            await self._sell(ticker, price, update, "скальп: тайм-стоп остатка",
-                             profit_pct, "45 минут с момента входа; закрываю остаток после TP1")
+        # Быстрый тейк закрывает позицию только при оценочном net P&L >= 1 ₽.
+        # Одна лишь цена выше входа или нулевой net больше не является сигналом.
+        if self._cfg.scalp_quick_tp_enabled and projected_net >= min_net_profit:
+            await self._sell(
+                ticker, price, update, "скальп: чистая прибыль достигнута", profit_pct,
+                f"ожидаемый net P&L +{projected_net:.2f} ₽ >= +{min_net_profit:.2f} ₽ "
+                f"после оценки полного круга издержек {expected_cost_pct:.3f}%")
             return
 
         if tp1_done:
-            # После первого транша защищаем капитал и остаток позиции.
-            breakeven = entry * (1.0 + expected_cost_pct / 100.0)
             atr_pct = float(position.get("scalp_atr_pct", 0) or 0)
             trailing = (max_price * (1.0 - atr_pct / 100.0)
-                        if atr_pct > 0 else breakeven)
-            stop_price = max(stop_price, breakeven, trailing)
+                        if atr_pct > 0 else hard_stop_price)
+            # Stop остатка поднимаем до уровня, при котором вся позиция
+            # (включая уже реализованную половину) сохраняет минимум net-прибыли.
+            min_net_floor = self._scalp_min_remaining_exit_price(ticker, update)
+            stop_price = max(hard_stop_price, min_net_floor, trailing)
             update["stop_price"] = round(stop_price, 4)
             self._state.set_position(ticker, update)
-            if price <= stop_price:
-                await self._sell(ticker, price, update, "скальп: стоп безубыток/ATR-трейлинг",
-                                 profit_pct, "стоп после TP1; ИИ не участвует")
+            if price <= stop_price and projected_net >= min_net_profit:
+                await self._sell(ticker, price, update,
+                                 "скальп: net-profit floor / ATR-трейлинг", profit_pct,
+                                 f"ожидаемый net P&L +{projected_net:.2f} ₽; минимум +{min_net_profit:.2f} ₽")
                 return
-            if profit_pct >= 2.0 * risk_pct:
+            if profit_pct >= 2.0 * risk_pct and projected_net >= min_net_profit:
                 await self._sell(ticker, price, update, "скальп: цель 2R", profit_pct,
-                                 "достигнута вторая цель")
+                                 f"достигнута вторая цель; net P&L +{projected_net:.2f} ₽")
                 return
         else:
-            # Первый стоп исполняется сразу, без подтверждающих циклов и без LLM.
-            update["stop_price"] = round(stop_price, 4)
-            self._state.set_position(ticker, update)
-            if price <= stop_price:
-                await self._sell(ticker, price, update, "стоп-лосс", profit_pct,
-                                 "жёсткий скальп-стоп сработал немедленно")
-                return
-            if profit_pct >= risk_pct:
+            # TP1 не должен фиксировать частичный результат, если прогноз всего
+            # цикла пока не покрывает все издержки и минимум чистой прибыли.
+            if profit_pct >= risk_pct and projected_net >= min_net_profit:
                 if lots == 1:
                     await self._sell(ticker, price, update, "скальп: TP1 1R", profit_pct,
-                                     "один лот: частичная продажа невозможна, закрыл полностью")
+                                     f"один лот; net P&L +{projected_net:.2f} ₽")
                     return
                 partial_lots = max(1, lots // 2)
                 after_tp1 = dict(update)
                 after_tp1["tp1_done"] = True
-                after_tp1["stop_price"] = round(entry * (1.0 + expected_cost_pct / 100.0), 4)
+                after_tp1["stop_price"] = round(
+                    entry * (1.0 + expected_cost_pct / 100.0), 4)
                 await self._sell(ticker, price, after_tp1, "скальп: TP1 1R", profit_pct,
-                                 "зафиксирована половина; стоп перенесён в безубыток+издержки",
+                                 f"частичная фиксация; прогноз net P&L всей позиции +{projected_net:.2f} ₽; "
+                                 "остаток защищается ATR-трейлингом и net-profit floor",
                                  lots_to_sell=partial_lots, partial=True)
                 return
 
+        # Никакого автоматического выхода из-за возраста позиции: 30/45/60 минут
+        # и более не являются причиной продажи. Позиция держится до ценового
+        # защитного стопа либо до прибыльного выхода; ручное закрытие остаётся доступным.
 
     async def _position_summary(self, ticker: str, price: float
                                 ) -> Tuple[List[Tuple[float, float]], Dict[str, Any]]:
@@ -3223,7 +3204,7 @@ class TradingEngine:
             if self.scalp_mode():
                 # v1.14.0: ручная покупка в скальпе сопровождается РОВНО так
                 # же, как покупки бота: быстрый тейк «издержки+маржа» на каждом
-                # тике, жёсткий стоп, сессионные проверки, тайм-стоп. Цену
+                # тике, жёсткий стоп, ценовые стопы; возраст позиции не запускает выход. Цену
                 # пингуем каждые SCALP_EXIT_POLL_SEC (5-10 сек) или на каждом
                 # тике потока.
                 spread_getter = getattr(self._client, "get_spread_pct", None)
@@ -3265,19 +3246,18 @@ class TradingEngine:
             # В скальпе у позиции свои стоп/издержки (см. pos_data выше).
             scalp_stop = float(pos_data.get("stop_price") or
                                price * (1.0 - self._cfg.scalp_stop_loss_pct / 100.0))
-            quick_target = float(pos_data.get("scalp_expected_round_trip_cost_pct")
-                                 or self._cfg.scalp_round_trip_cost_pct)
             return (f"✅ РУЧНАЯ ПОКУПКА {ticker}: {lots} лот(а) = {shares} шт "
                     f"по ~{price:.2f} ₽ (≈{_fmt_rub(cost)} ₽).\n"
                     f"Сопровождаю как свою скальп-сделку: цена пингуется каждые "
                     f"{max(5, int(self._cfg.scalp_exit_poll_sec))} сек (или на каждом "
                     f"тике потока).\n"
-                    f"• Автопродажа: продам ВСЁ при +{quick_target:.2f}% "
-                    f"(полные оценочные расходы круга; net P&L неотрицательный).\n"
+                    f"• Автопродажа: закрываю при net P&L не менее "
+                    f"+{getattr(self._cfg, 'scalp_min_net_profit_rub', 1.0):.2f} ₽ "
+                    f"после полного круга оценочных издержек.\n"
                     f"• Жёсткий стоп: {scalp_stop:.2f} ₽ "
                     f"(−{float(pos_data.get('scalp_risk_pct') or 0):.2f}%).\n"
-                    f"• Тайм-стоп {self._cfg.scalp_time_stop_min} мин и "
-                    f"закрытие перед концом сессии работают как обычно.")
+                    "• Максимального времени удержания нет; позиция может пережить "
+                    "сессионный перерыв/ночь. Защитный ATR-стоп остаётся активным.")
         stop_price = price * (1.0 - self._cfg.stop_loss_pct / 100.0)
         return (f"✅ РУЧНАЯ ПОКУПКА {ticker}: {lots} лот(а) = {shares} шт "
                 f"по ~{price:.2f} ₽ (≈{_fmt_rub(cost)} ₽).\n"
@@ -3515,7 +3495,7 @@ class TradingEngine:
                             f"стратегия смотрит средние ~{info['sma_hours']:g} ч "
                             f"(свечи {info['step_min']} мин)."
                             + (" СКАЛЬП-РЕЖИМ: позиция живёт минуты-часы; "
-                               "стоп/частичная фиксация/трейлинг/time-stop решает код."
+                               "стоп/частичная фиксация/трейлинг без временного стопа решает код."
                                if self.scalp_mode() else "")]
         if self._market_context:
             age = max(0.0, time.time() - float(self._market_context.get("received_ts", 0)))

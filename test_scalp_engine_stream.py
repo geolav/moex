@@ -475,6 +475,8 @@ class ScalpEngineStreamTests(unittest.IsolatedAsyncioTestCase):
             cfg.harvest_tiers = ()
             cfg.scalp_time_stop_min = 45
             cfg.scalp_quick_tp_margin_pct = 0.05
+            cfg.scalp_min_net_profit_rub = 1.0
+            cfg.scalp_force_flat_at_session_end = False
             cfg.learning_enabled = False
             cfg.slippage_pct = 0.0
             cfg.scalp_round_trip_cost_pct = 0.15
@@ -524,7 +526,13 @@ class ScalpEngineStreamTests(unittest.IsolatedAsyncioTestCase):
             # а не только половины издержек выхода.
             await engine._check_scalp_exit("SBER", 100.14, dict(pos))
             self.assertIn("SBER", state.positions)
+            # +0.16 ₽ gross minus 0.15% round-trip cost is only +0.01 ₽:
+            # ordinary take-profit must not close at effectively zero net.
             await engine._check_scalp_exit("SBER", 100.16, dict(pos))
+            self.assertIn("SBER", state.positions)
+            self.assertEqual(engine._client.sells, [])
+            # At 101.16 ₽ projected net is about +1.01 ₽, so exit is allowed.
+            await engine._check_scalp_exit("SBER", 101.16, dict(pos))
             self.assertNotIn("SBER", state.positions)
             self.assertEqual(engine._client.sells, [("SBER", 1)])
 

@@ -96,7 +96,7 @@ def make_test_config(tmp: str) -> BotConfig:
         # None вместо числа ломал вход: None > 0 в анти-погоне и др.)
         surge_sense_from_pct=3.0, chase_guard_pct=0.0, chase_bounce_pct=0.0,
         morning_anchor_until=13,
-        scalp_max_positions=8, scalp_watchlist_max=15,
+        scalp_max_positions=12, scalp_watchlist_max=15,
         scalp_poll_sec=300, scalp_exit_poll_sec=30,
         scalp_ai_min_request_interval_sec=240,
         scalp_cooldown_min=20,
@@ -618,8 +618,8 @@ async def main() -> int:
           abs(scalp_state.realized_pnl_today() - 32.0) < 1e-6,
           f"net pnl after estimated 0.1% round-trip cost={scalp_state.realized_pnl_today():.2f}")
 
-    # --- Тест 14: стоп-кулдаун 120 минут и time-stop ---------------------------
-    print("\n[14] Скальп: cooldown после стопа и тайм-стоп 45 минут")
+    # --- Тест 14: стоп-кулдаун и отсутствие time-stop --------------------------
+    print("\n[14] Скальп: cooldown после стопа; возраст не закрывает позицию")
     cooldown_state = StateStore(os.path.join(tmp, "scalp_cooldown_state.json"),
                                 initial_overrides={"trading_enabled": True})
     cooldown_state.set_scalp_mode(True)
@@ -645,14 +645,16 @@ async def main() -> int:
     timed_client = FakeClient()
     timed_engine = TradingEngine(no_quick_cfg, timed_state, timed_client, FakeAnalyst(), notify)
     timed_pos = {"lots": 1, "initial_lots": 1, "entry_price": 100.0,
-                 "entry_epoch": time.time() - 46 * 60, "max_price": 100.0,
+                 "entry_epoch": time.time() - 120 * 60, "max_price": 100.0,
                  "scalp_managed": True, "scalp_risk_pct": 0.6,
                  "scalp_atr_pct": 0.2, "scalp_round_trip_cost_pct": 0.1,
-                 "stop_price": 99.4, "tp1_done": False}
+                 "scalp_expected_round_trip_cost_pct": 0.15,
+                 "stop_price": 99.4, "tp1_done": False,
+                 "scalp_session_key": "unknown"}
     timed_state.set_position("SBER", timed_pos)
-    await timed_engine._check_exit("SBER", 100.1, timed_pos)
-    check("после 46 минут без +0.3R сработал time-stop",
-          not timed_state.positions and timed_client.sells == [("SBER", 1)])
+    await timed_engine._check_scalp_exit("SBER", 100.1, timed_pos)
+    check("после 120 минут позиция остаётся открытой при net < +1 ₽",
+          "SBER" in timed_state.positions and timed_client.sells == [])
 
     # --- Итог ---------------------------------------------------------------------
 
@@ -787,16 +789,16 @@ async def main() -> int:
     check("локальный аудит распознаёт RateLimit и не требует вызова модели",
           "Groq TPD/rate limit" in local_report and "ошибки/исключения" in local_report)
 
-    # --- Тест 19: лимит 8 позиций и общий риск --------------------------------
-    print("\n[19] Скальп: 8 слотов, общий риск портфеля ограничен")
+    # --- Тест 19: лимит 12 позиций и общий риск -------------------------------
+    print("\n[19] Скальп: 12 слотов, общий риск портфеля ограничен")
     risk_state = StateStore(os.path.join(tmp, "risk_state.json"),
                             initial_overrides={"trading_enabled": True})
     risk_state.set_scalp_mode(True)
     risk_client = FakeClient()
     risk_engine = TradingEngine(cfg, risk_state, risk_client, FakeAnalyst(), notify)
-    check("лимит скальп-watchlist равен 15 при максимуме 8 открытых позиций",
-          risk_engine.max_tickers() == 15 and cfg.scalp_max_positions == 8)
-    check("дневной лимит скальпа позволяет 40 входов", risk_engine._max_buys_today() == 40)
+    check("лимит скальп-watchlist равен 15 при максимуме 12 открытых позиций",
+          risk_engine.max_tickers() == 15 and cfg.scalp_max_positions == 12)
+    check("дневной лимит скальпа позволяет 100 входов", risk_engine._max_buys_today() == 100)
     risk_state.set_position("SBER", {
         "lots": 1, "entry_price": 100.0, "scalp_risk_pct": 1.0,
         "scalp_managed": True,
@@ -946,7 +948,7 @@ async def main() -> int:
           f"enabled={mismatch_state.trading_enabled}, buys={mismatch_client.buys}")
 
     # --- Тест 24: session windows and no-overnight guard ----------------------
-    print("\n[24] Скальп: окна входов, 45 минут до закрытия, принудительный flat")
+    print("\n[24] Скальп: окна входов, 15 минут до закрытия, опциональный flat")
     def msk_dt(hour: int, minute: int) -> datetime:
         return datetime(2026, 11, 10, hour, minute, tzinfo=sessions.MSK)
     check("основное окно открывается с 10:05 МСК",
@@ -955,10 +957,10 @@ async def main() -> int:
           sessions.is_scalp_entry_time(msk_dt(19, 7)))
     check("перерыв между сессиями не допускает новых входов",
           not sessions.is_scalp_entry_time(msk_dt(18, 55)))
-    check("вход в 18:00 допустим при 45 минутах до закрытия",
-          sessions.can_open_scalp_entry(45, msk_dt(18, 0)))
-    check("вход в 18:01 запрещён: недостаточно 45 минут",
-          not sessions.can_open_scalp_entry(45, msk_dt(18, 1)))
+    check("вход в 18:30 допустим при 15 минутах до закрытия",
+          sessions.can_open_scalp_entry(15, msk_dt(18, 30)))
+    check("вход в 18:31 запрещён: осталось меньше 15 минут",
+          not sessions.can_open_scalp_entry(15, msk_dt(18, 31)))
     check("перед клирингом включается принудительное закрытие",
           sessions.should_force_flatten_scalp(msk_dt(18, 40)))
     check("flat ограничен последними минутами открытой сессии",
@@ -971,7 +973,7 @@ async def main() -> int:
           not sessions.should_force_flatten_scalp(msk_dt(14, 0)))
 
     # --- Тест 25: migration and expiry of old positions -----------------------
-    print("\n[25] Скальп: миграция старой позиции и немедленный time-stop")
+    print("\n[25] Скальп: миграция старой позиции без time-stop")
     legacy_state = StateStore(os.path.join(tmp, "legacy_scalp_state.json"),
                               initial_overrides={"trading_enabled": True})
     legacy_state.set_scalp_mode(True)
@@ -991,9 +993,8 @@ async def main() -> int:
           and migrated.get("scalp_migrated_from_legacy") is True
           and float(migrated.get("scalp_risk_pct", 99)) <= 1.0)
     await legacy_engine._check_scalp_exit("SBER", 100.1, migrated)
-    check("устаревшая позиция старше 45 минут закрывается при первой котировке",
-          "SBER" not in legacy_state.positions
-          and legacy_client.sells == [("SBER", 1)])
+    check("устаревшая legacy-позиция остаётся открытой до ценового стопа/прибыльного выхода",
+          "SBER" in legacy_state.positions and legacy_client.sells == [])
 
     managed_legacy_state = StateStore(
         os.path.join(tmp, "managed_legacy_state.json"),
@@ -1013,9 +1014,9 @@ async def main() -> int:
           and float(normalized_unknown.get("scalp_risk_pct", 99)) <= 1.0
           and float(normalized_unknown.get("stop_price", 0)) >= 99.0)
     await managed_legacy_engine._check_scalp_exit("GAZP", 100.0, normalized_unknown)
-    check("позиция с неизвестным временем закрывается на первой котировке",
-          "GAZP" not in managed_legacy_state.positions
-          and managed_legacy_client.sells == [("GAZP", 1)])
+    check("неизвестное время входа само по себе не закрывает позицию",
+          "GAZP" in managed_legacy_state.positions
+          and managed_legacy_client.sells == [])
 
     # --- Тест 26: weak-position guard -----------------------------------------
     print("\n[26] Скальп: слабая позиция закрывается раньше полного стопа")
@@ -1070,26 +1071,24 @@ async def main() -> int:
           and metrics_memory.trades()[-1].get("mode") == "scalp"
           and metrics_memory.trades()[-1].get("entry_tf_min") == 5)
 
-    # --- Тест 29: strict scalp max age ----------------------------------------
-    print("\n[29] Скальп: жёсткий максимум удержания")
+    # --- Тест 29: возраст позиции больше не вызывает продажу ------------------
+    print("\n[29] Скальп: нет time-stop; обычная фиксация только при net >= +1 ₽")
     max_age_state = StateStore(os.path.join(tmp, "max_age_state.json"),
                                initial_overrides={"trading_enabled": True})
     max_age_state.set_scalp_mode(True)
     max_age_client = FakeClient()
     max_age_engine = TradingEngine(no_quick_cfg, max_age_state, max_age_client, FakeAnalyst(), notify)
     old_but_profitable = {"lots": 1, "initial_lots": 1, "entry_price": 100.0,
-                          "entry_epoch": time.time() - 50 * 60,
+                          "entry_epoch": time.time() - 120 * 60,
                           "scalp_managed": True, "scalp_risk_pct": 0.8,
                           "scalp_atr_pct": 0.2, "scalp_round_trip_cost_pct": 0.1,
                           "scalp_expected_round_trip_cost_pct": 0.15,
                           "stop_price": 99.2, "tp1_done": False,
-                          "llm_confidence": 0.8,
-                          "scalp_session_key": sessions.scalp_session_key() or "unknown"}
+                          "llm_confidence": 0.8, "scalp_session_key": "unknown"}
     max_age_state.set_position("SBER", old_but_profitable)
     await max_age_engine._check_scalp_exit("SBER", 100.3, old_but_profitable)
-    check("позиция не пересиживает 45 минут даже после +0.3R",
-          "SBER" not in max_age_state.positions
-          and max_age_client.sells == [("SBER", 1)])
+    check("позиция старше 120 минут остаётся открытой при net < +1 ₽",
+          "SBER" in max_age_state.positions and max_age_client.sells == [])
 
     # --- Тест 30: positive pullback and mandatory VWAP ------------------------
     print("\n[30] Сетапы: pullback проходит при подтверждении и блокируется без VWAP")

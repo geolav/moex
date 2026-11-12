@@ -356,7 +356,7 @@ class MarketScanner:
                     "отбор за ним",
                     len(fallback_rows),
                     ", ".join(str(r["ticker"]) for r in fallback_rows))
-        if self._engine_scalp() and not sessions.can_open_scalp_entry(45):
+        if self._engine_scalp() and not sessions.can_open_scalp_entry(15):
             log.info("Сканер: новые скальп-входы запрещены временем/недостаточным "
                      "остатком сессии для 45-минутного горизонта; Groq не вызываю")
             ai_candidates = []
