@@ -131,5 +131,78 @@ class ScalpScannerAIRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(engine.watch)
 
 
+class DiversifiedClient(FakeClient):
+    async def get_market_snapshot(self):
+        rows = []
+        for ticker, turnover in [
+            ("SBER", 900_000_000), ("VTBR", 850_000_000),
+            ("GAZP", 800_000_000), ("LKOH", 750_000_000),
+            ("PLZL", 700_000_000), ("GMKN", 650_000_000),
+        ]:
+            rows.append({"ticker": ticker, "price": 100.0,
+                         "turnover": turnover, "day_chg_pct": 0.5,
+                         "spread_pct": 0.03})
+        return rows
+
+
+class DiversifiedEngine(FakeEngine):
+    sectors = {
+        "SBER": "banks", "VTBR": "banks",
+        "GAZP": "oil", "LKOH": "oil",
+        "PLZL": "metals", "GMKN": "metals",
+    }
+
+    def max_tickers(self):
+        return 4
+
+    def _sector(self, ticker):
+        return self.sectors[ticker]
+
+
+class ScalpWatchlistDiversificationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_watchlist_prefers_different_sectors_before_second_same_sector(self):
+        cfg = SimpleNamespace(
+            scan_min_price=5.0, scan_min_turnover=50.0,
+            scan_deep_n=6, scan_report_top=4,
+            scan_min_candidate_rank=0.0,
+            scan_empty_shortlist_fallback=True,
+            scan_ai_candidates=3, scan_llm=False,
+            scalp_max_spread_pct=0.10,
+            scalp_min_reward_cost_multiple=1.10,
+            scalp_min_stop_pct=0.6, scalp_max_stop_pct=1.0,
+            scalp_atr_multiplier=1.2, scalp_round_trip_cost_pct=0.10,
+            slippage_pct=0.02, scalp_watchlist_max_per_sector=1,
+        )
+        engine = DiversifiedEngine()
+        scanner = MarketScanner(cfg, FakeState(), DiversifiedClient(), None,
+                                engine, lambda *_: asyncio.sleep(0), None)
+
+        async def fake_deep_analyze(pool, *, breadth_pct=None):
+            rows = []
+            for i, item in enumerate(pool):
+                rows.append({
+                    **item, "score": 0.2, "rank_score": 90.0 - i,
+                    "atr_pct": 0.30, "spread_pct": 0.03,
+                    "planned_stop_pct": 0.60, "round_trip_cost_pct": 0.15,
+                    "allowed_setups": ["pullback"],
+                    "summary": {"rsi14": 50.0},
+                })
+            return rows
+
+        scanner._deep_analyze = fake_deep_analyze
+        scanner._render_photos = lambda _top: []
+        from scanner import sessions
+        original_gate = sessions.can_open_scalp_entry
+        sessions.can_open_scalp_entry = lambda _minutes: True
+        try:
+            await scanner._scan_and_render()
+        finally:
+            sessions.can_open_scalp_entry = original_gate
+
+        self.assertEqual(len(engine.watch), 3)
+        sectors = [engine._sector(t) for t in engine.watch]
+        self.assertEqual(len(sectors), len(set(sectors)))
+
+
 if __name__ == "__main__":
     unittest.main()

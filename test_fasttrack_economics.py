@@ -24,7 +24,7 @@ class FastTrackEconomicsTests(unittest.TestCase):
         engine = self.engine()
         trigger = {
             "kind": "dip_reversal", "bottom_score": 82.0,
-            "rebound_to_vwap_pct": 0.22, "book_source": "price_only",
+            "rebound_to_vwap_pct": 0.42, "book_source": "price_only",
         }
         decision = engine._scalp_fasttrack_decision(trigger, 0.18, 0.60)
         self.assertIsNotNone(decision)
@@ -42,13 +42,21 @@ class FastTrackEconomicsTests(unittest.TestCase):
         self.assertIsNone(engine._scalp_fasttrack_decision(weak_score, 0.18, 0.60))
         self.assertIsNone(engine._scalp_fasttrack_decision(weak_economics, 0.18, 0.60))
 
+    def test_sample_like_dip_is_rejected_when_reward_is_too_small_vs_stop(self):
+        engine = self.engine()
+        trigger = {"kind": "dip_reversal", "bottom_score": 94.0,
+                   "rebound_to_vwap_pct": 0.249}
+        # 0.249% expected move against a 0.60% stop and 0.182% costs
+        # cannot have positive expectancy at the fast-track confidence cap.
+        self.assertIsNone(engine._scalp_fasttrack_decision(trigger, 0.182, 0.60))
+
     def test_impulse_needs_real_book_and_125x_costs(self):
         engine = self.engine()
-        no_book = {"kind": "micro_impulse", "projected_30s_pct": 0.30,
+        no_book = {"kind": "micro_impulse", "projected_30s_pct": 0.45,
                    "bid_ask_imbalance": 1.3, "book_source": "price_only"}
         thin = {"kind": "micro_impulse", "projected_30s_pct": 0.22,
                 "bid_ask_imbalance": 1.3, "book_source": "stream"}
-        valid = {"kind": "micro_impulse", "projected_30s_pct": 0.24,
+        valid = {"kind": "micro_impulse", "projected_30s_pct": 0.45,
                  "bid_ask_imbalance": 1.10, "book_source": "rest"}
         self.assertIsNone(engine._scalp_fasttrack_decision(no_book, 0.18, 0.60))
         self.assertIsNone(engine._scalp_fasttrack_decision(thin, 0.18, 0.60))
@@ -107,23 +115,29 @@ class ScalpConfigTests(unittest.TestCase):
         self.assertTrue(cfg.scalp_fasttrack_enabled)
         self.assertTrue(cfg.scalp_micro_price_only)
 
-    def test_12_positions_and_net_profit_floor_are_configurable(self):
+    def test_15_positions_and_net_profit_floor_are_configurable(self):
         values = {
             "TINKOFF_SANDBOX_TOKEN": "test-token",
             "GROQ_API_KEY": "test-key",
             "TELEGRAM_BOT_TOKEN": "123:TEST",
             "TELEGRAM_ADMIN_ID": "123",
-            "SCALP_MAX_POSITIONS": "12",
-            "SCALP_RISK_PER_TRADE_PCT": "0.03",
+            "SCALP_MAX_POSITIONS": "15",
+            "SCALP_WATCHLIST_MAX": "25",
+            "SCALP_RISK_PER_TRADE_PCT": "0.025",
+            "SCAN_DEEP_N": "35",
             "SCALP_MIN_NET_PROFIT_RUB": "1.0",
             "SCALP_FORCE_FLAT_AT_SESSION_END": "false",
+            "SCALP_QUICK_TP": "false",
         }
         with patch.dict("os.environ", values, clear=False):
             cfg = load_config()
-        self.assertEqual(cfg.scalp_max_positions, 12)
-        self.assertAlmostEqual(cfg.scalp_risk_per_trade_pct, 0.03)
+        self.assertEqual(cfg.scalp_max_positions, 15)
+        self.assertEqual(cfg.scalp_watchlist_max, 25)
+        self.assertEqual(cfg.scan_deep_n, 35)
+        self.assertAlmostEqual(cfg.scalp_risk_per_trade_pct, 0.025)
         self.assertAlmostEqual(cfg.scalp_min_net_profit_rub, 1.0)
         self.assertFalse(cfg.scalp_force_flat_at_session_end)
+        self.assertFalse(cfg.scalp_quick_tp_enabled)
 
 
 if __name__ == "__main__":

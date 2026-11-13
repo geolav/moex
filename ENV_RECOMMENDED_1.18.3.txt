@@ -1,0 +1,25 @@
+РЕКОМЕНДУЕМЫЕ ПЕРЕОПРЕДЕЛЕНИЯ ДЛЯ СУЩЕСТВУЮЩЕГО .env (MOEX BOT 1.18.3)
+
+Не заменяйте весь .env этим файлом. Не добавляйте дублирующие ключи — найдите существующие параметры и измените их значения.
+
+SCALP_QUICK_TP=false
+SCALP_STOP_CONFIRM_SEC=4
+SCALP_STOP_CONFIRM_TICKS=3
+SCALP_STOP_CONTINUE_PCT=0.03
+SCALP_STOP_RECLAIM_PCT=0.05
+SCALP_STOP_EMERGENCY_EXTRA_PCT=0.10
+SCALP_MAX_POSITIONS=15
+SCALP_WATCHLIST_MAX=25
+SCALP_WATCHLIST_MAX_PER_SECTOR=4
+SCALP_MAX_SECTOR_POSITIONS=2
+SCALP_RISK_PER_TRADE_PCT=0.025
+SCALP_MAX_PORTFOLIO_RISK_PCT=0.40
+SCALP_MAX_ENTRIES_PER_DAY=100
+SCALP_MIN_NET_PROFIT_RUB=1.0
+SCALP_FORCE_FLAT_AT_SESSION_END=false
+SCAN_DEEP_N=35
+SCAN_AI_CANDIDATES=3
+
+SCALP_QUICK_TP=false — особенно важно: отключает закрытие всей позиции при первом net +1 ₽; штатный выход ждёт TP1 1R.
+
+Риск на одну позицию уменьшен до 0.025% equity, чтобы 15 одновременно открытых позиций укладывались в совокупный риск-потолок 0.40%. 15 — максимум, не цель.

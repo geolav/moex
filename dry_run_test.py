@@ -790,14 +790,14 @@ async def main() -> int:
           "Groq TPD/rate limit" in local_report and "ошибки/исключения" in local_report)
 
     # --- Тест 19: лимит 12 позиций и общий риск -------------------------------
-    print("\n[19] Скальп: 12 слотов, общий риск портфеля ограничен")
+    print("\n[19] Скальп: 15 слотов, общий риск портфеля ограничен")
     risk_state = StateStore(os.path.join(tmp, "risk_state.json"),
                             initial_overrides={"trading_enabled": True})
     risk_state.set_scalp_mode(True)
     risk_client = FakeClient()
     risk_engine = TradingEngine(cfg, risk_state, risk_client, FakeAnalyst(), notify)
-    check("лимит скальп-watchlist равен 15 при максимуме 12 открытых позиций",
-          risk_engine.max_tickers() == 15 and cfg.scalp_max_positions == 12)
+    check("лимит скальп-watchlist равен 25 при максимуме 15 открытых позиций",
+          risk_engine.max_tickers() == 25 and cfg.scalp_max_positions == 15)
     check("дневной лимит скальпа позволяет 100 входов", risk_engine._max_buys_today() == 100)
     risk_state.set_position("SBER", {
         "lots": 1, "entry_price": 100.0, "scalp_risk_pct": 1.0,

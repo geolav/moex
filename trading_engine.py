@@ -362,7 +362,8 @@ class TradingEngine:
         """
         info = self.activity_info()
         scalp_txt = (f", СКАЛЬП-РЕЖИМ: поток цены+стакана, локальная проверка "
-                     f"по событиям, Groq batch не чаще 1 раза в "
+                     f"по событиям, watchlist до {self._cfg.scalp_watchlist_max} бумаг, "
+                     f"Groq batch не чаще 1 раза в "
                      f"{self._cfg.scalp_ai_min_request_interval_sec // 60} мин, "
                      f"до {self._cfg.scalp_max_positions} позиций"
                      if self.scalp_mode() else "")
@@ -1555,7 +1556,7 @@ class TradingEngine:
     def max_tickers(self) -> int:
         """Лимит тикеров наблюдения; лимит открытых позиций проверяется отдельно."""
         if self.scalp_mode():
-            return int(getattr(self._cfg, "scalp_watchlist_max", 15) or 15)
+            return int(getattr(self._cfg, "scalp_watchlist_max", 25) or 25)
         return int(getattr(self._cfg, "max_tickers", 6) or 6)
 
     async def add_watchlist(self, ticker: str) -> str:
@@ -1823,13 +1824,19 @@ class TradingEngine:
         else:
             return None
 
-        be_conf = self._breakeven_confidence(stop_pct, stop_pct, cost)
+        # ВАЖНО: раньше fast-track сравнивал вероятность с p*, рассчитанным
+        # для TP=stop. Но прогноз микросигнала часто был в 2-3 раза меньше
+        # стопа (пример SMLT: потенциал 0.249%, стоп 0.60%). Это создавало
+        # отрицательное матожидание даже при 80-90% win-rate. Используем
+        # именно прогнозируемый ход как TP, а не симметричный стоп.
+        be_conf = self._breakeven_confidence(stop_pct, potential, cost)
         required_conf = be_conf + 0.05
         if be_conf >= 1.0 or confidence < required_conf:
-            log.info("Fast-track %s: сигнал найден, но локальная оценка %.0f%% "
-                     "ниже требуемых %.0f%% (p*=%.0f%%); жду Groq/следующий сигнал",
-                     kind, confidence * 100.0, required_conf * 100.0,
-                     be_conf * 100.0)
+            log.info("Fast-track %s: сигнал найден, но риск/награда не проходит: "
+                     "потенциал %.3f%%, стоп %.3f%%, издержки %.3f%%, "
+                     "нужная уверенность %.0f%%, локальная %.0f%%; не покупаю",
+                     kind, potential, stop_pct, cost,
+                     min(1.0, required_conf) * 100.0, confidence * 100.0)
             return None
         return {
             "action": "buy",
@@ -2325,7 +2332,18 @@ class TradingEngine:
         # Это детерминированный фильтр: ИИ не может его обойти.
         be_stop = (float(summary.get("planned_stop_pct") or 0.0)
                    if self.scalp_mode() else float(decision.get("stop_pct") or 0.0))
-        be_tp = be_stop if self.scalp_mode() else float(decision.get("tp1_pct") or 0.0)
+        if self.scalp_mode():
+            # Для локального scalp-сигнала нельзя предполагать, что выигрышный
+            # ход равен стопу. Берём прогноз именно найденной ямы/импульса;
+            # этот же reward используется в fast-track и в AI-queue path.
+            trigger_for_reward = dict(self._scalp_trigger_cache.get(ticker) or {})
+            be_tp = float(
+                trigger_for_reward.get("rebound_to_vwap_pct")
+                or trigger_for_reward.get("rebound_to_mean_pct")
+                or trigger_for_reward.get("projected_30s_pct")
+                or 0.0)
+        else:
+            be_tp = float(decision.get("tp1_pct") or 0.0)
         be_cost = float(summary.get("round_trip_cost_pct")
                         or self._cfg.estimated_round_trip_cost_pct)
         be_conf = self._breakeven_confidence(be_stop, be_tp, be_cost)
@@ -2776,6 +2794,114 @@ class TradingEngine:
         realized_value = float(position.get("realized_exit_value", 0) or 0.0)
         return max(0.0, (required_avg_exit * initial_lots - realized_value) / remaining_lots)
 
+    def _scalp_stop_confirmation(
+        self, ticker: str, price: float, position: Dict[str, Any],
+        stop_level: float, emergency_level: float,
+    ) -> Tuple[Dict[str, Any], bool, str]:
+        """Подтверждает пробой стопа по последовательности новых ценовых тиков.
+
+        Обычный пробой не закрывает позицию мгновенно: сначала ждём паузу,
+        затем продаём только при новом минимуме. Возврат выше stop+buffer
+        отменяет ложный прокол. За аварийной границей закрываем немедленно.
+        Метод вызывается только на новом price_seq, не на одинаковых REST-снимках.
+        """
+        update = dict(position)
+        now = time.time()
+        confirm_sec = max(1.0, float(getattr(self._cfg, "scalp_stop_confirm_sec", 4)))
+        confirm_ticks = max(2, int(getattr(self._cfg, "scalp_stop_confirm_ticks", 3)))
+        continue_pct = max(0.001, float(getattr(
+            self._cfg, "scalp_stop_continue_pct", 0.03)))
+        reclaim_pct = max(0.001, float(getattr(
+            self._cfg, "scalp_stop_reclaim_pct", 0.05)))
+
+        started = float(position.get("scalp_stop_breach_started_ts", 0.0) or 0.0)
+        stored_level = float(position.get("scalp_stop_breach_level", 0.0) or 0.0)
+        active_level = stored_level if started > 0 and stored_level > 0 else stop_level
+
+        # Глубокий пробой не ждёт подтверждения: ограничиваем хвостовой риск.
+        if emergency_level > 0 and price <= emergency_level:
+            for key in ("scalp_stop_breach_started_ts", "scalp_stop_breach_level",
+                        "scalp_stop_breach_low_price", "scalp_stop_breach_last_low_ts",
+                        "scalp_stop_breach_ticks", "scalp_stop_breach_armed"):
+                update.pop(key, None)
+            return update, True, (
+                f"цена достигла аварийной границы {emergency_level:.4f} ₽; "
+                "закрываю без ожидания подтверждения")
+
+        if started <= 0:
+            if price > stop_level:
+                return update, False, "стоп не пробит"
+            update.update({
+                "scalp_stop_breach_started_ts": now,
+                "scalp_stop_breach_level": stop_level,
+                "scalp_stop_breach_low_price": price,
+                "scalp_stop_breach_last_low_ts": now,
+                "scalp_stop_breach_ticks": 1,
+                "scalp_stop_breach_armed": False,
+            })
+            self._state.set_position(ticker, update)
+            log.info("%s: стоп %.4f ₽ проколот; жду стабилизацию и повторное снижение "
+                     "(аварийная граница %.4f ₽)", ticker, stop_level, emergency_level)
+            return update, False, "ожидаю подтверждения пробоя"
+
+        # Возврат над уровнем с небольшим буфером означает вероятный ложный прокол.
+        reclaim_level = active_level * (1.0 + reclaim_pct / 100.0)
+        if price >= reclaim_level:
+            for key in ("scalp_stop_breach_started_ts", "scalp_stop_breach_level",
+                        "scalp_stop_breach_low_price", "scalp_stop_breach_last_low_ts",
+                        "scalp_stop_breach_ticks", "scalp_stop_breach_armed"):
+                update.pop(key, None)
+            self._state.set_position(ticker, update)
+            log.info("%s: ложный прокол стопа отменён — цена вернулась к %.4f ₽", ticker, price)
+            return update, False, "цена восстановилась; пробой отменён"
+
+        low_price = float(position.get("scalp_stop_breach_low_price", price) or price)
+        last_low_ts = float(position.get("scalp_stop_breach_last_low_ts", started) or started)
+        ticks = int(position.get("scalp_stop_breach_ticks", 1) or 1) + 1
+        armed = bool(position.get("scalp_stop_breach_armed", False))
+        was_armed = armed
+
+        if price < low_price:
+            # Если после последнего минимума прошло достаточно времени и были
+            # дополнительные реальные ценовые изменения, считаем паузу состоявшейся
+            # даже когда между двумя опросами цена не менялась.
+            if (not armed and ticks >= confirm_ticks
+                    and now - last_low_ts >= confirm_sec):
+                armed = True
+            new_low_pct = (low_price - price) / max(low_price, 1e-12) * 100.0
+            if (armed and now - started >= confirm_sec
+                    and new_low_pct >= continue_pct):
+                for key in ("scalp_stop_breach_started_ts", "scalp_stop_breach_level",
+                            "scalp_stop_breach_low_price", "scalp_stop_breach_last_low_ts",
+                            "scalp_stop_breach_ticks", "scalp_stop_breach_armed"):
+                    update.pop(key, None)
+                return update, True, (
+                    f"после паузы цена обновила минимум ещё на {new_low_pct:.3f}% "
+                    f"за {now - started:.1f} сек; пробой стопа подтверждён")
+            low_price = price
+            last_low_ts = now
+            armed = False
+        elif ticks >= confirm_ticks and now - last_low_ts >= confirm_sec:
+            # Цена перестала обновлять минимум. Теперь следующее заметное
+            # понижение будет подтверждением продолжения падения.
+            armed = True
+
+        update.update({
+            "scalp_stop_breach_started_ts": started,
+            "scalp_stop_breach_level": active_level,
+            "scalp_stop_breach_low_price": low_price,
+            "scalp_stop_breach_last_low_ts": last_low_ts,
+            "scalp_stop_breach_ticks": ticks,
+            "scalp_stop_breach_armed": armed,
+        })
+        self._state.set_position(ticker, update)
+        if armed and not was_armed:
+            log.info("%s: после пробоя стопа цена стабилизировалась %.1f сек; "
+                     "жду повторного снижения минимум на %.3f%%",
+                     ticker, now - last_low_ts, continue_pct)
+        state = "пауза подтверждена; жду следующего снижения" if armed else "жду стабилизацию"
+        return update, False, state
+
     async def _check_scalp_exit(self, ticker: str, price: float,
                                 position: Dict[str, Any]) -> None:
         """Scalp exit: emergency ATR stop + positive-net profit taking; no age stop."""
@@ -2804,12 +2930,27 @@ class TradingEngine:
             self._cfg, "scalp_min_net_profit_rub", 1.0)))
         projected_net = self._scalp_projected_net_pnl(ticker, price, update)
 
-        # Единственный безусловный ценовой выход в убыток — заранее рассчитанный
-        # защитный ATR-стоп. Время удержания его не заменяет и не запускает.
-        if price <= hard_stop_price:
-            await self._sell(ticker, price, update, "стоп-лосс", profit_pct,
-                             "жёсткий скальп-стоп сработал; аварийный выход важнее порога прибыли")
-            return
+        # Стоп сначала трактуется как предупреждение. Если цена стабилизируется
+        # или восстановится, позиция остаётся открытой; если после паузы цена
+        # снова обновит минимум — закрываем. Слишком глубокий пробой закрывается
+        # сразу, чтобы подтверждение не превращалось в бесконтрольное усреднение.
+        pending_stop = float(position.get("scalp_stop_breach_started_ts", 0.0) or 0.0) > 0
+        if price <= hard_stop_price or pending_stop:
+            emergency_extra = max(0.02, float(getattr(
+                self._cfg, "scalp_stop_emergency_extra_pct", 0.10)))
+            emergency_price = hard_stop_price * (1.0 - emergency_extra / 100.0)
+            update, stop_confirmed, stop_detail = self._scalp_stop_confirmation(
+                ticker, price, update, hard_stop_price, emergency_price)
+            if stop_confirmed:
+                await self._sell(ticker, price, update,
+                                 "стоп-лосс: подтверждено продолжение падения",
+                                 profit_pct, stop_detail)
+                return
+            # Пока пробой не подтверждён, не запускаем обычные тейки/частичную
+            # фиксацию по этой же котировке.
+            if price <= hard_stop_price or float(update.get(
+                    "scalp_stop_breach_started_ts", 0.0) or 0.0) > 0:
+                return
 
         # Закрытие на сессионной границе по умолчанию отключено: позиции могут
         # пережить перерыв/ночь. При желании владелец может явно включить его ENV.
@@ -2855,11 +2996,26 @@ class TradingEngine:
             stop_price = max(hard_stop_price, min_net_floor, trailing)
             update["stop_price"] = round(stop_price, 4)
             self._state.set_position(ticker, update)
-            if price <= stop_price and projected_net >= min_net_profit:
-                await self._sell(ticker, price, update,
-                                 "скальп: net-profit floor / ATR-трейлинг", profit_pct,
-                                 f"ожидаемый net P&L +{projected_net:.2f} ₽; минимум +{min_net_profit:.2f} ₽")
-                return
+            pending_floor = float(position.get("scalp_stop_breach_started_ts", 0.0) or 0.0) > 0
+            if price <= stop_price or pending_floor:
+                emergency_extra = max(0.02, float(getattr(
+                    self._cfg, "scalp_stop_emergency_extra_pct", 0.10)))
+                emergency_price = hard_stop_price * (1.0 - emergency_extra / 100.0)
+                update, floor_confirmed, floor_detail = self._scalp_stop_confirmation(
+                    ticker, price, update, stop_price, emergency_price)
+                if emergency_price > 0 and price <= emergency_price:
+                    await self._sell(ticker, price, update, "стоп-лосс: аварийная граница",
+                                     profit_pct, floor_detail)
+                    return
+                if floor_confirmed and projected_net >= min_net_profit:
+                    await self._sell(ticker, price, update,
+                                     "скальп: подтверждённый net-profit floor / ATR-трейлинг",
+                                     profit_pct,
+                                     f"{floor_detail}; ожидаемый net P&L +{projected_net:.2f} ₽")
+                    return
+                if price <= stop_price or float(update.get(
+                        "scalp_stop_breach_started_ts", 0.0) or 0.0) > 0:
+                    return
             if profit_pct >= 2.0 * risk_pct and projected_net >= min_net_profit:
                 await self._sell(ticker, price, update, "скальп: цель 2R", profit_pct,
                                  f"достигнута вторая цель; net P&L +{projected_net:.2f} ₽")

@@ -16,14 +16,14 @@ scanner.py - сканер рынка Мосбиржи: раз в SCAN_INTERVAL_M
      pullback / breakout / reversal-сетапы.
      Отдельная техническая формула ранжирует кандидатов; падающий тренд,
      ухудшающийся MACD и перекупленность получают штрафы.
-  5. В Groq уходит максимум 3 лучших бумаги. Если строгий shortlist пуст,
+  5. В Groq уходит максимум 3 лучших бумаги (это только ранжирование watchlist, не автопокупка). Если строгий shortlist пуст,
      включается safety-fallback: только ликвидные бумаги с допустимым спредом
      и ATR отправляются ИИ с соответствующей пометкой. Остальной рейтинг,
      отчёт и графики формируются локально; отказ ИИ не разрешает покупку.
 
 СКАЛЬП-РЕЖИМ (v1.7.0): если он включён (/scalp), сканер сам обновляет список
 бумаг под управлением движка: тикеры с открытыми позициями остаются, свободные
-слоты занимают лучшие кандидаты (до 15 бумаг; открытых позиций не более 8) - так бот торгует весь рынок,
+слоты занимают лучшие кандидаты (до 25 бумаг; открытых позиций не более 15) - так бот торгует весь рынок,
 а не только ручной список.
 
 АВТОПОКУПКА (v1.7.1, SCAN_AUTO_BUY, переключение /autobuy): сканер передаёт
@@ -415,7 +415,29 @@ class MarketScanner:
             ordered = sorted(ai_buy, key=lambda t: float(
                 score_by_ticker.get(t, {}).get("rank_score", 0.0)), reverse=True)
             ordered += [r["ticker"] for r in scored if r["ticker"] not in ordered]
-            picks = [t for t in ordered if t not in keep][:free]
+            # Не заполняем расширенный watchlist только бумагами одной отрасли.
+            # Открытые позиции всегда сохраняются; для новых кандидатов сначала
+            # выбираем разные сектора, затем добираем оставшиеся места рейтингом.
+            sector_getter = getattr(self._engine, "_sector", None)
+            max_per_sector = max(1, int(getattr(
+                cfg, "scalp_watchlist_max_per_sector", 4) or 4))
+            sector_counts: Dict[str, int] = {}
+            if callable(sector_getter):
+                for existing in keep:
+                    sector = str(sector_getter(existing))
+                    sector_counts[sector] = sector_counts.get(sector, 0) + 1
+            diverse: List[str] = []
+            seen = set(keep)
+            for candidate in ordered:
+                ticker = str(candidate).upper()
+                if not ticker or ticker in seen:
+                    continue
+                seen.add(ticker)
+                sector = str(sector_getter(ticker)) if callable(sector_getter) else ticker
+                if sector_counts.get(sector, 0) < max_per_sector:
+                    diverse.append(ticker)
+                    sector_counts[sector] = sector_counts.get(sector, 0) + 1
+            picks = diverse[:free]
             new_list = await self._engine.auto_set_watchlist(keep + picks)
             scalp_note = (f"⚡ Скальп-режим: обновил список бумаг по итогам "
                           f"скана ({len(new_list)}/{cap}): "

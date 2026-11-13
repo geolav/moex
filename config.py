@@ -46,7 +46,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 #: Максимум тикеров ОБЫЧНОГО режима - жёсткое требование по памяти и лимитам
 #: API. v1.6.0: поднято с 5 до 6 - движок ведёт до шести бумаг одновременно.
-#: (В скальп-режиме лимит другой: SCALP_MAX_POSITIONS, по умолчанию 12.)
+#: (В скальп-режиме лимит другой: SCALP_MAX_POSITIONS, по умолчанию 15.)
 MAX_TICKERS = 6
 
 _TRUE_VALUES = {"1", "true", "yes", "on", "y", "t", "да"}
@@ -204,8 +204,8 @@ class BotConfig:
     chase_bounce_pct: float        # не покупать, если отскок от минимума окна уже >= X%
     morning_anchor_until: int      # до скольки часов утренний якорь на вчерашний день
     # --- Скальп-режим (v1.7.0): /scalp в Telegram -----------------------------
-    scalp_max_positions: int       # максимум одновременно открытых скальп-позиций (до 12)
-    scalp_watchlist_max: int        # сколько бумаг держать в скальп-watchlist (до 15)
+    scalp_max_positions: int       # максимум одновременно открытых скальп-позиций (до 15)
+    scalp_watchlist_max: int        # сколько бумаг держать в скальп-watchlist (до 25)
     scalp_poll_sec: int            # legacy ENV; event-driven scalp не использует
     scalp_exit_poll_sec: int       # резервный интервал охраны при недоступном stream
     scalp_ai_min_request_interval_sec: int  # минимум секунд между Groq-оценками скальп-сигналов
@@ -233,11 +233,17 @@ class BotConfig:
     scalp_stop_cooldown_min: int  # legacy, не блокирует повторный scalp-вход
     scalp_portfolio_sync_sec: int  # как часто замечать ручные покупки в брокерском приложении
     scalp_max_sector_positions: int
+    scalp_watchlist_max_per_sector: int
     # --- Быстрый тейк «как у владельца» (v1.14.0) -----------------------------
     # Продать ВСЁ, как только цена поднялась достаточно, чтобы быть в плюсе
     # и покрыть круговые издержки (комиссия x2 + спред + проскальзывание)
     # плюс небольшая маржа. Проверяется на каждом тике потока/охраны.
     scalp_quick_tp_enabled: bool
+    scalp_stop_confirm_sec: int
+    scalp_stop_confirm_ticks: int
+    scalp_stop_continue_pct: float
+    scalp_stop_reclaim_pct: float
+    scalp_stop_emergency_extra_pct: float
     scalp_quick_tp_margin_pct: float  # legacy: запас сверху издержек, п.п.
     scalp_min_net_profit_rub: float  # минимум ожидаемой чистой прибыли для обычной фиксации
     scalp_force_flat_at_session_end: bool  # аварийное закрытие перед клирингом, по умолчанию выкл
@@ -408,9 +414,9 @@ def load_config() -> BotConfig:
                                     low=0.0, high=50.0),
         morning_anchor_until=_env_int("MORNING_ANCHOR_UNTIL", 13,
                                       low=10, high=17),
-        scalp_max_positions=_env_int("SCALP_MAX_POSITIONS", 12,
+        scalp_max_positions=_env_int("SCALP_MAX_POSITIONS", 15,
                                      low=1, high=15),
-        scalp_watchlist_max=_env_int("SCALP_WATCHLIST_MAX", 15, low=8, high=15),
+        scalp_watchlist_max=_env_int("SCALP_WATCHLIST_MAX", 25, low=8, high=25),
         scalp_poll_sec=_env_int("SCALP_POLL_SEC", 300, low=60, high=3600),
         scalp_exit_poll_sec=_env_int("SCALP_EXIT_POLL_SEC", 10,
                                      low=5, high=120),
@@ -432,7 +438,7 @@ def load_config() -> BotConfig:
                                         low=0.3, high=100.0),
         scalp_max_entries_per_day=_env_int("SCALP_MAX_ENTRIES_PER_DAY", 100,
                                            low=1, high=100),
-        scalp_risk_per_trade_pct=_env_float("SCALP_RISK_PER_TRADE_PCT", 0.03,
+        scalp_risk_per_trade_pct=_env_float("SCALP_RISK_PER_TRADE_PCT", 0.025,
                                             low=0.01, high=0.3),
         scalp_max_portfolio_risk_pct=_env_float(
             "SCALP_MAX_PORTFOLIO_RISK_PCT", 0.40, low=0.10, high=2.0),
@@ -467,9 +473,16 @@ def load_config() -> BotConfig:
                                           low=15, high=300),
         scalp_max_sector_positions=_env_int("SCALP_MAX_SECTOR_POSITIONS", 2,
                                             low=1, high=4),
+        scalp_watchlist_max_per_sector=_env_int("SCALP_WATCHLIST_MAX_PER_SECTOR", 4,
+                                                low=1, high=10),
         # v1.17.1: быстрый тейк использует полный ожидаемый P&L круга;
         # тот же процент показывается в /positions и отчёте о закрытии.
-        scalp_quick_tp_enabled=_env_bool("SCALP_QUICK_TP", True),
+        scalp_quick_tp_enabled=_env_bool("SCALP_QUICK_TP", False),
+        scalp_stop_confirm_sec=_env_int("SCALP_STOP_CONFIRM_SEC", 4, low=1, high=30),
+        scalp_stop_confirm_ticks=_env_int("SCALP_STOP_CONFIRM_TICKS", 3, low=2, high=10),
+        scalp_stop_continue_pct=_env_float("SCALP_STOP_CONTINUE_PCT", 0.03, low=0.005, high=0.25),
+        scalp_stop_reclaim_pct=_env_float("SCALP_STOP_RECLAIM_PCT", 0.05, low=0.005, high=0.30),
+        scalp_stop_emergency_extra_pct=_env_float("SCALP_STOP_EMERGENCY_EXTRA_PCT", 0.10, low=0.02, high=0.50),
         # Legacy-настройка оставлена для совместимости .env. Быстрый тейк
         # больше не добавляет маржу поверх полных круговых издержек.
         scalp_quick_tp_margin_pct=_env_float("SCALP_QUICK_TP_MARGIN_PCT", 0.0,
@@ -529,10 +542,10 @@ def load_config() -> BotConfig:
         scan_min_turnover=_env_float("SCAN_MIN_TURNOVER_MLN", 50.0,
                                      low=0.0, high=1e12),
         scan_min_price=_env_float("SCAN_MIN_PRICE", 5.0, low=0.0, high=1e9),
-        scan_deep_n=_env_int("SCAN_DEEP_N", 20, low=5, high=60),
+        scan_deep_n=_env_int("SCAN_DEEP_N", 35, low=5, high=60),
         scan_report_top=_env_int("SCAN_REPORT_TOP", 4, low=3, high=10),
         scan_llm=_env_bool("SCAN_LLM", True),
-        scan_ai_candidates=_env_int("SCAN_AI_CANDIDATES", 3, low=1, high=3),
+        scan_ai_candidates=_env_int("SCAN_AI_CANDIDATES", 3, low=1, high=5),
         scan_min_candidate_rank=_env_float("SCAN_MIN_CANDIDATE_RANK", 48.0,
                                            low=0.0, high=100.0),
         # v1.14.0: если после всех локальных фильтров shortlist пуст, ИИ
@@ -916,7 +929,7 @@ class StateStore:
     # --- скальп-режим (v1.7.0) --------------------------------------------------
     @property
     def scalp_mode(self) -> bool:
-        """Включён ли скальп-режим (много мелких сделок, до 8 бумаг)."""
+        """Включён ли скальп-режим (много мелких сделок, до 15 бумаг)."""
         return bool(self._data.get("scalp_mode", False))
 
     def set_scalp_mode(self, value: bool) -> None:
