@@ -22,6 +22,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
+from local_learning import features_from_quote
+
 log = logging.getLogger("supervisor")
 
 _ALLOWED_PATCH_FILES = {
@@ -151,6 +153,20 @@ class LearningSupervisor:
         );
         CREATE INDEX IF NOT EXISTS idx_trades_ts ON trades(ts);
         """)
+        # Миграция существующей supervisor.sqlite3 без удаления старой телеметрии.
+        columns = {str(row[1]) for row in self._db.execute("PRAGMA table_info(samples)").fetchall()}
+        for name, declaration in (
+            ("features_json", "TEXT"),
+            ("ml_label", "INTEGER"),
+            ("ml_return_pct", "REAL"),
+            ("ml_prediction", "REAL"),
+            ("actual_pnl_pct", "REAL"),
+            ("ml_source", "TEXT"),
+            ("ml_updated_ts", "REAL"),
+        ):
+            if name not in columns:
+                self._db.execute(f"ALTER TABLE samples ADD COLUMN {name} {declaration}")
+        self._db.execute("CREATE INDEX IF NOT EXISTS idx_samples_ml ON samples(ml_label, ts)")
         self._db.commit()
 
     def request_stop(self) -> None:
@@ -234,17 +250,23 @@ class LearningSupervisor:
         if price <= 0:
             return
         try:
+            features = features_from_quote(quote, signal, shadow)
+            model = getattr(self._analyst, "local_model", None)
+            prediction = (model.predict_probability(features)
+                          if model is not None and bool(getattr(model, "ready", False)) else None)
             self._db.execute("""INSERT INTO samples(
                 ts,ticker,price,price_source,price_age,book_age,spread_pct,cost_pct,
-                stop_pct,has_position,signal_json,shadow_json,reason,stage)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
+                stop_pct,has_position,signal_json,shadow_json,reason,stage,
+                features_json,ml_prediction)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
                 now, ticker, price, str(quote.get("price_source") or "stream"),
                 _number(quote.get("price_age_sec"), 9999.0),
                 _number(quote.get("book_age_sec"), 9999.0),
                 _number(quote.get("spread_pct")), max(0.0, cost_pct),
                 max(0.1, stop_pct), int(bool(has_position)),
                 _json(signal) if signal else None, _json(shadow) if shadow else None,
-                (reason or "")[:500], "signal" if signal else ("shadow" if shadow else "no_signal")))
+                (reason or "")[:500], "signal" if signal else ("shadow" if shadow else "no_signal"),
+                _json(features), prediction))
             self._db.commit()
         except sqlite3.Error as exc:
             log.warning("Supervisor: не удалось сохранить sample %s: %s", ticker, exc)
@@ -270,10 +292,24 @@ class LearningSupervisor:
                      pnl_rub: Optional[float] = None,
                      pnl_pct: Optional[float] = None, reason: str = "") -> None:
         try:
+            now = time.time()
+            ticker = ticker.upper()
             self._db.execute("""INSERT INTO trades(ts,ticker,side,price,lots,pnl_rub,pnl_pct,reason)
                 VALUES(?,?,?,?,?,?,?,?)""", (
-                time.time(), ticker.upper(), side, float(price), int(lots),
+                now, ticker, side, float(price), int(lots),
                 pnl_rub, pnl_pct, (reason or "")[:400]))
+            # Реальный исход закрытой scalp-сделки важнее виртуального барьерного
+            # исхода. Привязываем net P&L к последнему sample, помеченному bought.
+            if side.lower() == "sell" and pnl_pct is not None:
+                entry_sample = self._db.execute("""SELECT id FROM samples
+                    WHERE ticker=? AND stage='bought' AND features_json IS NOT NULL
+                    AND actual_pnl_pct IS NULL AND ts>? ORDER BY ts DESC LIMIT 1""",
+                    (ticker, now - 30 * 86400)).fetchone()
+                if entry_sample is not None:
+                    actual_label = 1 if float(pnl_pct) > 0.0 else 0
+                    self._db.execute("""UPDATE samples SET ml_label=?,ml_return_pct=?,
+                        actual_pnl_pct=?,ml_source='actual',ml_updated_ts=? WHERE id=?""",
+                        (actual_label, float(pnl_pct), float(pnl_pct), now, entry_sample["id"]))
             self._db.commit()
         except (sqlite3.Error, TypeError, ValueError) as exc:
             log.warning("Supervisor: не удалось сохранить сделку %s %s: %s", ticker, side, exc)
@@ -318,6 +354,128 @@ class LearningSupervisor:
             counts["missed"] += missed
         self._db.commit()
         return counts
+
+    def _label_ml_pending(self, now: float) -> Dict[str, int]:
+        """Размечает ML-исход по первому касанию цели/стопа на горизонте.
+
+        В отличие от legacy-разметки эта очередь повторно проверяется, пока
+        нет итоговой метки: поздний/редкий REST-снимок не теряет обучающий пример.
+        Метка 1 — цель достигнута раньше стопа, 0 — стоп раньше цели,
+        -1 — ни одна граница не достигнута или данных недостаточно.
+        """
+        pending = self._db.execute(
+            "SELECT * FROM samples WHERE ml_label IS NULL AND features_json IS NOT NULL "
+            "AND has_position=0 AND stage!='bought' "
+            "AND (signal_json IS NOT NULL OR shadow_json IS NOT NULL) "
+            "AND ts<=? ORDER BY ts LIMIT 500",
+            (now - self._lookahead_sec,)).fetchall()
+        counts = {"up": 0, "down": 0, "neutral": 0, "pending": 0}
+        target_multiple = max(1.05, _number(os.getenv("SUPERVISOR_TARGET_COST_MULTIPLE", "1.25"), 1.25))
+        for row in pending:
+            horizon_end = float(row["ts"]) + self._lookahead_sec
+            future = self._db.execute(
+                "SELECT ts,price FROM samples WHERE ticker=? AND ts>? AND ts<=? "
+                "ORDER BY ts LIMIT 1000",
+                (row["ticker"], row["ts"], horizon_end)).fetchall()
+            if not future:
+                # Не закрываем пример раньше, чем закончится допустимое окно.
+                if now < horizon_end + 30.0:
+                    counts["pending"] += 1
+                    continue
+                self._db.execute(
+                    "UPDATE samples SET ml_label=-1,ml_return_pct=NULL,ml_source='counterfactual',"
+                    "ml_updated_ts=? WHERE id=?",
+                    (now, row["id"]))
+                counts["neutral"] += 1
+                continue
+            # Когда триггер указывает измеренный потенциал, проверяем именно
+            # его, а не более лёгкую цель «издержки × 1.25». Для слабых/теневых
+            # наблюдений без прогноза остаётся консервативная cost-based цель.
+            try:
+                trigger_data = json.loads(row["signal_json"] or row["shadow_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                trigger_data = {}
+            projected = _number(
+                trigger_data.get("projected_30s_pct"),
+                _number(trigger_data.get("rebound_to_mean_pct"),
+                        _number(trigger_data.get("rebound_to_vwap_pct"))))
+            up_barrier = max(float(row["cost_pct"] or 0.0) * target_multiple, 0.08)
+            if projected > 0:
+                up_barrier = max(up_barrier, min(projected, 1.5))
+            down_barrier = max(float(row["stop_pct"] or 0.6) * 0.75, 0.08)
+            outcome = -1
+            net_return = 0.0
+            for point in future:
+                price = float(point["price"] or 0.0)
+                if price <= 0 or float(row["price"] or 0.0) <= 0:
+                    continue
+                change = (price / float(row["price"]) - 1.0) * 100.0
+                if change >= up_barrier:
+                    outcome = 1
+                    net_return = change - float(row["cost_pct"] or 0.0)
+                    break
+                if change <= -down_barrier:
+                    outcome = 0
+                    net_return = change - float(row["cost_pct"] or 0.0)
+                    break
+            if outcome == -1 and now < horizon_end + 30.0:
+                counts["pending"] += 1
+                continue
+            self._db.execute(
+                "UPDATE samples SET ml_label=?,ml_return_pct=?,ml_source='counterfactual',"
+                "ml_updated_ts=? WHERE id=?",
+                (outcome, net_return if outcome in (0, 1) else None, now, row["id"]))
+            counts["up" if outcome == 1 else "down" if outcome == 0 else "neutral"] += 1
+        self._db.commit()
+        return counts
+
+    def _train_local_model(self) -> Optional[Dict[str, Any]]:
+        """Переобучает локальную модель на зрелых out-of-time исходах.
+
+        Используем только feature snapshots реальных/теневых триггеров,
+        сделанные ДО будущего движения. Обычные no-signal snapshots не смешиваем
+        с распределением входов. Контрфактические наблюдения одного тикера разрежаются на полный
+        горизонт прогноза. Реальные закрытые сделки имеют приоритет и
+        добавляются по фактическому net P&L.
+        """
+        model = getattr(self._analyst, "local_model", None)
+        if model is None or not callable(getattr(model, "fit", None)):
+            return None
+        rows = self._db.execute("""SELECT id,ticker,ts,features_json,ml_label,ml_source,ml_updated_ts
+            FROM samples WHERE ml_label IN (0,1) AND features_json IS NOT NULL
+            AND has_position=0 AND (signal_json IS NOT NULL OR shadow_json IS NOT NULL)
+            AND ts>? ORDER BY ts DESC LIMIT 5000""",
+            (time.time() - 30 * 86400,)).fetchall()
+        if not rows:
+            return None
+        rows = list(reversed(rows))
+        last_by_ticker: Dict[str, float] = {}
+        examples = []
+        max_id = 0
+        for row in rows:
+            max_id = max(max_id, int(row["id"]))
+            ticker = str(row["ticker"])
+            ts = float(row["ts"])
+            source = str(row["ml_source"] or "counterfactual")
+            if source != "actual" and ts - last_by_ticker.get(ticker, -1e12) < self._lookahead_sec:
+                continue
+            last_by_ticker[ticker] = max(ts, last_by_ticker.get(ticker, -1e12))
+            try:
+                features = json.loads(row["features_json"])
+                if not isinstance(features, list) or len(features) != 13:
+                    continue
+                examples.append((features, int(row["ml_label"])))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+        previous_id = int(getattr(model, "last_sample_id", 0))
+        last_fit_epoch = float(getattr(model, "last_fit_epoch", 0.0) or 0.0)
+        new_count = sum(1 for row in rows
+                        if float(row["ml_updated_ts"] or row["ts"]) > last_fit_epoch)
+        if (max_id <= previous_id and new_count == 0) or new_count < 20:
+            return None
+        status = model.fit(examples, last_sample_id=max_id)
+        status["new_samples"] = new_count
+        return status
 
     def _auto_tune(self, now: float) -> Optional[Dict[str, Any]]:
         if not self._auto_tune_enabled:
@@ -419,6 +577,7 @@ class LearningSupervisor:
         win_text = f"{win_rate:.0%}" if isinstance(win_rate, (float, int)) else "н/д"
         lines = [
             "🧠 SUPERVISOR — состояние наблюдения",
+            f"Backend решений: {getattr(self._analyst, 'decision_backend', 'unknown')}",
             ("Автоторговля: ВКЛ" if m["trading_enabled"] else
              "⛔ Автоторговля ВЫКЛ — новые ордера запрещены; включить /trading_on"),
             (f"Снимки свежие: stream {m['price_stream_fresh']}, REST {m['price_rest_fresh']}, "
@@ -439,6 +598,7 @@ class LearningSupervisor:
              f"открыто позиций: {m['open_positions']}"),
             (f"Адаптивные пороги: dip score ≥{policy['dip_min_score']:.1f}; "
              f"локальная просадка ≥{policy['dip_min_drop_pct']:.4f}%"),
+            f"Локальная ML-модель: {self._local_model_text()}",
             f"SQLite: {self._db_path}",
         ]
         last = self._db.execute("SELECT details FROM events WHERE kind='groq_diagnosis' ORDER BY id DESC LIMIT 1").fetchone()
@@ -449,6 +609,17 @@ class LearningSupervisor:
             except (TypeError, json.JSONDecodeError):
                 pass
         return "\n".join(lines)
+
+    def _local_model_text(self) -> str:
+        model = getattr(self._analyst, "local_model", None)
+        if model is None:
+            return "не подключена"
+        status = model.status() if callable(getattr(model, "status", None)) else {}
+        return (f"{'ГОТОВА' if status.get('ready') else 'прогрев'}; "
+                f"размечено {status.get('sample_count', 0)}; "
+                f"up/down={status.get('positive_count', 0)}/{status.get('negative_count', 0)}; "
+                f"holdout AUC={status.get('validation_auc', 0.5):.3f}; "
+                f"порог BUY={status.get('min_probability', 0.62):.0%}")
 
     def _metrics(self, tickers: List[str]) -> Dict[str, Any]:
         getter = getattr(self._client, "get_scalp_quote", None)
@@ -528,7 +699,8 @@ class LearningSupervisor:
         return bad_feed or missed or losses or starvation
 
     async def _ask_groq(self, metrics: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        if not self._groq_enabled or self._analyst is None:
+        if (not self._groq_enabled or self._analyst is None
+                or getattr(self._analyst, "decision_backend", "groq") == "local"):
             return None
         now = time.monotonic()
         if now - self._last_groq < self._groq_interval_sec:
@@ -702,7 +874,19 @@ class LearningSupervisor:
     async def _cycle(self) -> None:
         tickers = sorted(set(str(t).upper() for t in self._get_tickers() if t))
         metrics = self._metrics(tickers)
-        labels = self._label_pending(time.time())
+        cycle_now = time.time()
+        labels = self._label_pending(cycle_now)
+        ml_labels = self._label_ml_pending(cycle_now)
+        ml_update = self._train_local_model()
+        if sum(ml_labels.values()) > 0 and self._cycle_count % 5 == 0:
+            log.info("Supervisor ML-разметка: up=%d, down=%d, neutral=%d, ждут=%d",
+                     ml_labels["up"], ml_labels["down"], ml_labels["neutral"], ml_labels["pending"])
+        if ml_update:
+            log.info("Supervisor: локальная ML-модель обновлена: n=%d, up=%d, down=%d, "
+                     "AUC=%.3f, ready=%s; новых размеченных=%d",
+                     ml_update.get("sample_count", 0), ml_update.get("positive_count", 0),
+                     ml_update.get("negative_count", 0), ml_update.get("validation_auc", 0.5),
+                     ml_update.get("ready", False), ml_update.get("new_samples", 0))
         policy_update = self._auto_tune(time.time())
         log.info("Supervisor: снимки stream=%d REST=%d stale=%d/%d; "
                  "реальные изменения цены за 8с=%d/%d; "
@@ -717,6 +901,13 @@ class LearningSupervisor:
                  metrics["blocked_events_24h"],
                  "ВКЛ" if metrics["trading_enabled"] else "ВЫКЛ",
                  metrics["net_pnl_24h_rub"])
+        model = getattr(self._analyst, "local_model", None)
+        if model is not None:
+            ms = model.status()
+            log.info("Supervisor ML: ready=%s, samples=%d (up=%d/down=%d), holdout AUC=%.3f",
+                     ms.get("ready"), ms.get("sample_count", 0),
+                     ms.get("positive_count", 0), ms.get("negative_count", 0),
+                     ms.get("validation_auc", 0.5))
         if metrics["samples_1h"] == 0:
             if metrics["price_changed_recent"] == 0:
                 log.info("Supervisor: новых изменений цены сейчас нет; свежие REST-снимки "
@@ -777,10 +968,11 @@ class LearningSupervisor:
             log.warning("Supervisor: Telegram-уведомление не отправлено: %s", exc)
 
     async def run(self) -> None:
+        backend = getattr(self._analyst, "decision_backend", "groq") if self._analyst else "none"
         log.info("Learning Supervisor запущен: SQLite=%s; interval=%ds; lookahead=%ds; "
-                 "Groq=%s; auto_tune=%s; code patches=staging only",
+                 "backend=%s; Groq-diagnostics=%s; auto_tune=%s; code patches=staging only",
                  self._db_path, self._interval_sec, self._lookahead_sec,
-                 self._groq_enabled, self._auto_tune_enabled)
+                 backend, self._groq_enabled and backend != "local", self._auto_tune_enabled)
         if not self._enabled:
             log.info("Learning Supervisor выключен: SUPERVISOR_ENABLED=false")
             return

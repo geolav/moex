@@ -252,6 +252,44 @@ class ScalpEngineStreamTests(unittest.IsolatedAsyncioTestCase):
                              "BUY-разрешения должны удаляться после одной попытки входа")
 
 
+    async def test_local_backend_does_not_wait_for_groq_cooldown_and_rechecks_trigger(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = StateStore(str(Path(tmp) / "state.json"),
+                               initial_overrides={"trading_enabled": True})
+            state.set_scalp_mode(True)
+            quote = make_quote(seq=42)
+            client = FakeStreamClient({"SBER": quote})
+            analyst = FakeBatchAnalyst()
+            analyst.decision_backend = "local"
+            engine = TradingEngine(make_config(tmp), state, client, analyst, notify)
+            # A recent Groq attempt must not rate-limit the local model.
+            engine._scalp_last_ai_batch_attempt = time.monotonic()
+            engine._trigger_by_kind = lambda _quote, kind: {
+                "kind": kind, "projected_30s_pct": 0.3,
+                "bid_ask_imbalance": 1.5,
+            }
+            attempted = []
+
+            async def fake_process(ticker: str, *, current_price=None, **kwargs):
+                attempted.append((ticker, current_price))
+
+            engine._process_ticker = fake_process  # type: ignore[method-assign]
+            engine._scalp_ai_queue["SBER"] = {
+                "ticker": "SBER", "price": quote["price"], "rank_score": 90,
+                "allowed_setups": ["dip_reversal"],
+                "trigger_kind": "dip_reversal",
+                "round_trip_cost_pct": 0.15,
+                "microstructure": {"kind": "dip_reversal"},
+            }
+
+            await engine._flush_scalp_ai_queue()
+
+            self.assertEqual(len(analyst.calls), 1)
+            self.assertEqual(len(analyst.calls[0]), 1)
+            self.assertEqual(len(analyst.calls[0][0]["local_model_features"]), 13)
+            self.assertEqual(attempted, [("SBER", quote["price"])])
+
+
     async def test_scalp_forces_batch_even_when_global_batch_flag_is_off(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = make_config(tmp)
@@ -417,6 +455,35 @@ class ScalpEngineStreamTests(unittest.IsolatedAsyncioTestCase):
             await engine.scalp_stream_cycle()
 
             engine.exit_cycle.assert_awaited_once()
+
+    async def test_local_backend_is_not_disabled_by_legacy_llm_flag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_config(tmp)
+            cfg.llm_decisions_enabled = False
+            state = StateStore(str(Path(tmp) / "state.json"),
+                               initial_overrides={"trading_enabled": True})
+            state.set_scalp_mode(True)
+            quote = make_quote(seq=72)
+            analyst = FakeBatchAnalyst()
+            analyst.decision_backend = "local"
+            client = FakeStreamClient({"SBER": quote})
+            engine = TradingEngine(cfg, state, client, analyst, notify)
+            engine._trigger_by_kind = lambda _quote, kind: {"kind": kind}
+            attempted = []
+
+            async def fake_process(ticker: str, *, current_price=None, **kwargs):
+                attempted.append(ticker)
+
+            engine._process_ticker = fake_process  # type: ignore[method-assign]
+            engine._scalp_ai_queue["SBER"] = {
+                "ticker": "SBER", "price": quote["price"], "rank_score": 90,
+                "trigger_kind": "dip_reversal", "allowed_setups": ["dip_reversal"],
+                "round_trip_cost_pct": 0.1,
+            }
+            await engine._flush_scalp_ai_queue()
+            self.assertEqual(len(analyst.calls), 1)
+            self.assertEqual(attempted, ["SBER"])
+
 
     async def test_disabled_llm_does_not_spend_groq_or_keep_scalp_candidates(self):
         with tempfile.TemporaryDirectory() as tmp:

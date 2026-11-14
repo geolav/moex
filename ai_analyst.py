@@ -1,10 +1,9 @@
 """
-ai_analyst.py — компактный слой Groq для финального решения по MOEX.
+ai_analyst.py — переключаемый decision backend: Groq или локальная ML-модель.
 
-В штатной автоторговле вызывается один раз на скан: получает до трёх
-кандидатов, уже отобранных локальной математикой и прошедших OHLCV-фильтр.
-Новости, рейтинг, сетапы, sizing, стопы, выходы и аудит работают локально.
-Ручной /ask остаётся отдельным пользовательским вызовом.
+Groq сохраняет прежний пакетный JSON-интерфейс. Локальная модель обучается
+Supervisor и выдаёт BUY/HOLD для scalp event-trigger без внешнего API.
+Новости, рейтинги, сетапы, sizing, стопы и выходы остаются в коде движка.
 
 Защита квоты: персистентный дневной token budget, резерв до запроса,
 учёт фактического usage, ограничение частоты пакетных запросов, короткий
@@ -23,6 +22,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+from local_learning import LocalAdaptiveModel
 
 from groq import (
     APIConnectionError,
@@ -482,12 +483,18 @@ class DailyTokenBudget:
 
 
 class AIAnalyst:
-    """Обёртка над AsyncGroq с общим дневным бюджетом токенов."""
+    """Переключаемый слой решений с общим лимитом токенов для Groq backend."""
 
     def __init__(self, config) -> None:
         self._cfg = config
         self._client: Optional[AsyncGroq] = None
         data_dir = getattr(config, "data_dir", os.path.join(os.path.dirname(__file__), "data"))
+        Path(data_dir).mkdir(parents=True, exist_ok=True)
+        self.decision_backend = os.getenv("DECISION_BACKEND", "groq").strip().lower()
+        if self.decision_backend not in {"groq", "local"}:
+            log.warning("Неизвестный DECISION_BACKEND=%r; использую groq", self.decision_backend)
+            self.decision_backend = "groq"
+        self.local_model = LocalAdaptiveModel(os.path.join(data_dir, "local_directional_model.json"))
         usage_path = os.path.join(data_dir, "groq_usage.json")
         self._budget = DailyTokenBudget(usage_path,
                                         getattr(config, "groq_daily_token_budget", 120000))
@@ -497,6 +504,12 @@ class AIAnalyst:
 
     # --- жизненный цикл ------------------------------------------------------
     async def start(self) -> None:
+        if self.decision_backend == "local":
+            status = self.local_model.status()
+            log.info("Локальная ML-модель активна: обученных примеров=%d, ready=%s, "
+                     "holdout AUC=%.3f; сетевые AI-запросы отключены",
+                     status["sample_count"], status["ready"], status["validation_auc"])
+            return
         # max_retries=0: ретраи и бюджет контролируются здесь, а не SDK.
         base_url = os.getenv("GROQ_BASE_URL", "").strip().rstrip("/") or None
         if base_url:
@@ -635,6 +648,9 @@ class AIAnalyst:
         """
         if not news_text or not news_text.strip():
             return 0.0
+        if self.decision_backend == "local":
+            # В рабочем торговом пути новости уже проходят локальный news_filter.
+            return 0.0
         # ~1500 символов хватит с запасом: экономим TPM free-тарифа (6K TPM).
         # max_tokens 384: gpt-oss тратит часть на рассуждения - раньше лимит
         # 16 токенов давал пустой ответ, и сентимент молча считался нейтральным.
@@ -655,6 +671,10 @@ class AIAnalyst:
         """Вердикт аудитора: короткий текст ('Все ОК' или описание проблемы)."""
         if not log_text.strip():
             return "Лог пуст - анализировать нечего."
+        if self.decision_backend == "local":
+            return ("Свободный LLM-аудит отключён: DECISION_BACKEND=local. "
+                    "Локальный Learning Supervisor продолжает проверять свежесть данных, "
+                    "размечать исходы, контролировать качество модели и risk-метрики.")
         snippet = log_text.strip()[-8000:]  # страховка по размеру запроса
         raw = await self._chat(
             _AUDITOR_SYSTEM_PROMPT,
@@ -669,6 +689,10 @@ class AIAnalyst:
         """Вердикт трейдера. Ошибка/невалидный JSON -> None (движок HOLD)."""
         brief = (market_brief or "").strip()[:7000]
         if not brief:
+            return None
+        if self.decision_backend == "local":
+            # Локальная модель обучена на event-driven микроструктуре. Текстовый
+            # интрадей-вердикт не подменяем фиктивным прогнозом: fail-closed.
             return None
         system_prompt = _TRADER_SYSTEM_PROMPT
         if scalp_mode and _SCALP_SYSTEM_PROMPT:
@@ -697,6 +721,8 @@ class AIAnalyst:
 
     def candidate_call_wait_seconds(self, scalp_mode: bool = False) -> float:
         """Сколько осталось до следующего разрешённого пакетного вызова Groq."""
+        if self.decision_backend == "local":
+            return 0.0
         if scalp_mode:
             minimum = int(getattr(self._cfg, "scalp_ai_min_request_interval_sec", 240) or 240)
             last = self._last_scalp_candidate_call_monotonic
@@ -707,9 +733,15 @@ class AIAnalyst:
 
     async def analyze_candidates(self, rows: List[Dict[str, Any]],
                                  scalp_mode: bool = False) -> Dict[str, dict]:
-        """Оценивает до трёх уже отфильтрованных кандидатов одним Groq-запросом."""
+        """Оценивает кандидатов выбранным backend: local ML или Groq."""
         if not rows:
             return {}
+        if self.decision_backend == "local":
+            decisions = self.local_model.analyze_candidates(rows, scalp_mode=scalp_mode)
+            log.info("Local ML batch: кандидатов=%d, BUY/HOLD=%d, ready=%s, n=%d, AUC=%.3f",
+                     len(rows[:3]), len(decisions), self.local_model.ready,
+                     self.local_model.sample_count, self.local_model.validation_auc)
+            return decisions
         compact: List[Dict[str, Any]] = []
         for row in rows[:3]:
             summary = row.get("summary") or {}
@@ -906,6 +938,8 @@ class AIAnalyst:
         """
         if not rows:
             return {}, ""
+        if self.decision_backend == "local":
+            return {}, ""
         lines = []
         for r in rows:
             lines.append(
@@ -939,6 +973,14 @@ class AIAnalyst:
         ctx_text = (context or "").strip()[:6000]  # страховка TPM free-тарифа
         if not q:
             return "Пустой вопрос - нечего отвечать."
+        if self.decision_backend == "local":
+            status = self.local_model.status()
+            return ("Сейчас включён DECISION_BACKEND=local: свободные ответы языковой модели "
+                    "отключены. Локальная модель используется только для BUY/HOLD "
+                    "по scalp event-trigger. "
+                    f"Статус обучения: {status['sample_count']} примеров, "
+                    f"AUC={status['validation_auc']:.3f}, ready={status['ready']}. "
+                    "Для свободного /ask переключите DECISION_BACKEND=groq и перезапустите бота.")
         raw = await self._chat(
             _ASK_SYSTEM_PROMPT,
             f"Сводка:\n{ctx_text}\n\nВопрос владельца: {q}",

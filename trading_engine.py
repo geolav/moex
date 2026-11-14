@@ -1,5 +1,5 @@
 """
-trading_engine.py - торговая логика бота v2: гибрид "индикаторы + LLM-трейдер".
+trading_engine.py - торговая логика бота v2: индикаторы + переключаемый Groq/Local ML.
 
 Скиллы (по мотивам AI-Trader/HKUDS, TradingAgents и классических трейдинг-
 скиллов: теханализ, риск-менеджмент, дисциплина):
@@ -64,6 +64,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 import indicators
 import predictor
 import sessions
+from local_learning import features_from_quote
 from scalp_microstructure import (detect_dip_reversal_trigger,  # noqa: F401
                                   detect_microstructure_trigger,
                                   detect_multiscale_dip_trigger,
@@ -93,6 +94,17 @@ def _human_sentiment(score: float) -> str:
     if score <= -0.3:
         return "плохие"
     return "нейтральные"
+
+
+def _decision_size_multiplier(decision: Dict[str, Any]) -> float:
+    """Сохраняет любой безопасный fractional size_mult из verdict (0..1)."""
+    try:
+        value = float(decision.get("size_mult", 1.0))
+    except (TypeError, ValueError):
+        value = 1.0
+    if not math.isfinite(value):
+        value = 1.0
+    return max(0.0, min(1.0, value))
 
 
 def harvest_signal(max_profit_pct: float, profit_pct: float,
@@ -1043,22 +1055,26 @@ class TradingEngine:
                 log.debug("Не удалось отправить уведомление о синхронизации позиций")
 
     async def _flush_scalp_ai_queue(self) -> None:
-        """Отправляет до трёх свежих локальных кандидатов одним запросом Groq."""
+        """Проверяет до трёх свежих кандидатов через выбранный decision backend."""
         if not self._scalp_ai_queue or self._analyst is None:
             return
-        if not bool(getattr(self._cfg, "llm_decisions_enabled", False)):
+        local_backend = getattr(self._analyst, "decision_backend", "groq") == "local"
+        # Legacy LLM_DECISIONS выключает внешний LLM-путь, но не должен
+        # выключать выбранную локальную обучаемую модель.
+        if (not local_backend
+                and not bool(getattr(self._cfg, "llm_decisions_enabled", False))):
             self._scalp_ai_queue.clear()
             if not self._scalp_ai_disabled_logged:
-                log.warning("Скальп-входы отключены: LLM_DECISIONS_ENABLED=false; Groq не вызываю")
+                log.warning("Скальп-входы отключены: LLM_DECISIONS=false; Groq не вызываю")
                 self._scalp_ai_disabled_logged = True
             return
-        interval = max(120.0, float(getattr(
-            self._cfg, "scalp_ai_min_request_interval_sec", 240) or 240))
+        interval = (0.0 if local_backend else max(120.0, float(getattr(
+            self._cfg, "scalp_ai_min_request_interval_sec", 240) or 240)))
         now = time.monotonic()
-        if self._scalp_last_ai_batch_attempt and now - self._scalp_last_ai_batch_attempt < interval:
+        if interval > 0 and self._scalp_last_ai_batch_attempt and now - self._scalp_last_ai_batch_attempt < interval:
             wait_left = interval - (now - self._scalp_last_ai_batch_attempt)
             if now - self._scalp_ai_limit_log_last >= 600.0:
-                log.info("Scalp AI batch: очередь ждёт локальный интервал Groq ещё %.0f сек; "
+                log.info("Scalp AI batch: очередь ждёт интервал Groq ещё %.0f сек; "
                          "%d кандидат(ов) остаются под проверкой свежести",
                          wait_left, len(self._scalp_ai_queue))
                 self._scalp_ai_limit_log_last = now
@@ -1098,6 +1114,10 @@ class TradingEngine:
                 continue
             row["price"] = price
             row["microstructure"] = signal
+            if local_backend:
+                # Сохраняем именно тот вектор, на котором модель сейчас
+                # принимает решение; он соответствует snapshot, который увидит Supervisor.
+                row["local_model_features"] = features_from_quote(quote, signal, None)
             self._scalp_trigger_cache[ticker] = signal
             fresh_rows.append(row)
         if expired_rows:
@@ -1139,10 +1159,12 @@ class TradingEngine:
             decided_rows = [row for row in rows
                             if str(row.get("ticker", "")).upper() in decisions]
             self.set_ai_batch_decisions(decisions, decided_rows)
-        log.info("Scalp AI batch: отправлено %d кандидата(ов), валидных решений %d; без ответа оставлено в очереди %d",
-                 len(rows), len(decisions), sum(1 for r in rows if str(r.get("ticker", "")).upper() in self._scalp_ai_queue))
+        backend_name = "Local ML" if local_backend else "Groq AI"
+        log.info("%s batch: отправлено %d кандидата(ов), валидных решений %d; без ответа оставлено в очереди %d",
+                 backend_name, len(rows), len(decisions),
+                 sum(1 for r in rows if str(r.get("ticker", "")).upper() in self._scalp_ai_queue))
 
-        # ИИ только подтверждает кандидата. Перед заявкой заново требуем свежий
+        # Модель подтверждает только кандидата. Перед заявкой заново требуем свежий
         # импульс, стакан и почти неизменившуюся цену.
         for row in rows:
             ticker = str(row.get("ticker", "")).upper()
@@ -1161,7 +1183,7 @@ class TradingEngine:
                 supervisor = getattr(self, "_supervisor", None)
                 if supervisor is not None:
                     supervisor.record_entry_outcome(ticker, "ai_buy_cancelled", "цена устарела")
-                log.info("%s: AI BUY отменён: цена потока устарела", ticker)
+                log.info("%s: %s BUY отменён: цена потока устарела", ticker, backend_name)
                 self._ai_batch_candidates.pop(ticker, None)
                 self._ai_batch_shortlist.discard(ticker)
                 continue
@@ -1172,8 +1194,8 @@ class TradingEngine:
                 supervisor = getattr(self, "_supervisor", None)
                 if supervisor is not None:
                     supervisor.record_entry_outcome(ticker, "ai_buy_cancelled", "цена ушла от сигнала >0.15%")
-                log.info("%s: AI BUY отменён: цена ушла от сигнала более чем на 0.15%%",
-                         ticker)
+                log.info("%s: %s BUY отменён: цена ушла от сигнала более чем на 0.15%%",
+                         ticker, backend_name)
                 self._ai_batch_candidates.pop(ticker, None)
                 self._ai_batch_shortlist.discard(ticker)
                 continue
@@ -2200,16 +2222,38 @@ class TradingEngine:
                 micro = dict(self._scalp_trigger_cache.get(ticker) or {})
                 be_stop = float(summary.get("planned_stop_pct") or 0.0)
                 be_cost = float(summary.get("round_trip_cost_pct") or 0.0)
-                be_conf = self._breakeven_confidence(be_stop, be_stop, be_cost)
+                trigger_reward = float(
+                    micro.get("rebound_to_vwap_pct") or micro.get("rebound_to_mean_pct")
+                    or micro.get("projected_30s_pct") or 0.0)
+                be_conf = self._breakeven_confidence(be_stop, trigger_reward, be_cost)
                 summary["breakeven_confidence"] = round(be_conf, 3)
-                fasttrack_decision = self._scalp_fasttrack_decision(
-                    micro, be_cost, be_stop)
+                local_backend = getattr(self._analyst, "decision_backend", "groq") == "local"
+                local_model = getattr(self._analyst, "local_model", None) if local_backend else None
+                local_ready = bool(getattr(local_model, "ready", False)) if local_backend else False
+                sandbox = bool(getattr(self._state, "use_sandbox", False))
+                # В режиме local обученная ML-модель является обязательным gate.
+                # До её готовности в песочнице допускаем только старый строгий
+                # fast-track с четвертью размера; на реальном счёте — никаких
+                # покупок до подтверждённого out-of-time качества модели.
+                allow_warmup_fasttrack = local_backend and not local_ready and sandbox
+                if local_backend and local_ready:
+                    fasttrack_decision = None
+                elif local_backend and not sandbox:
+                    fasttrack_decision = None
+                else:
+                    fasttrack_decision = self._scalp_fasttrack_decision(
+                        micro, be_cost, be_stop)
                 if fasttrack_decision is not None:
-                    decision = fasttrack_decision
+                    decision = dict(fasttrack_decision)
+                    if allow_warmup_fasttrack:
+                        decision["size_mult"] = 0.25
+                        decision["reason"] = "sandbox warm-up x0.25: " + decision["reason"]
                     fasttracked = True
-                    log.info("%s: FAST-TRACK BUY без Groq: %s; уверенность-эвристика %.0f%%, "
-                             "размер позиции ограничен x0.5",
-                             ticker, decision["reason"], decision["confidence"] * 100.0)
+                    source_name = "локальная эвристика прогрева" if allow_warmup_fasttrack else "fast-track"
+                    log.info("%s: %s BUY: %s; confidence %.0f%%, size_mult=x%.2f",
+                             ticker, source_name, decision["reason"],
+                             decision["confidence"] * 100.0,
+                             float(decision.get("size_mult", 0.5) or 0.5))
                 else:
                     trigger_kind = str(micro.get("kind") or "micro_impulse")
                     projected = float(micro.get("projected_30s_pct")
@@ -2237,8 +2281,10 @@ class TradingEngine:
                         "day_chg_pct": summary.get("chg_1h"),
                         "turnover": 0.0,
                     }
-                    log.info("%s: локальные фильтры пройдены (%s); кандидат добавлен в очередь Groq batch",
-                             ticker, trigger_kind)
+                    backend_name = "локальной ML-модели" if getattr(
+                        self._analyst, "decision_backend", "groq") == "local" else "Groq batch"
+                    log.info("%s: локальные фильтры пройдены (%s); кандидат добавлен в очередь %s",
+                             ticker, trigger_kind, backend_name)
                     return
             if not fasttracked:
                 decision = await self._get_llm_decision(ticker, price, summary, score,
@@ -2251,9 +2297,12 @@ class TradingEngine:
         if decision is None:
             # FAIL-CLOSED: никакой автономной покупки при недоступности Groq,
             # пустом/битом ответе или исчерпанной квоте.
-            log.warning("%s: LLM недоступен/ответ некорректен - HOLD, покупка запрещена", ticker)
+            backend_name = "локальная ML-модель" if getattr(
+                self._analyst, "decision_backend", "groq") == "local" else "ИИ"
+            log.warning("%s: %s недоступен/ответ некорректен - HOLD, покупка запрещена",
+                        ticker, backend_name)
             await self._notify_skip(ticker, score,
-                                    "ИИ недоступен или не вернул корректный JSON; безопасный режим HOLD.")
+                                    f"{backend_name} не вернул корректный вердикт; безопасный режим HOLD.")
             return
 
         self._state.append_decision({
@@ -2271,12 +2320,14 @@ class TradingEngine:
                                         "ИИ указал сетап, который не подтверждён OHLCV-данными.")
                 return
         if decision["action"] != "buy":
-            log.info("%s: трейдер-LLM сказал '%s' (%.2f): %s",
-                     ticker, decision["action"], decision["confidence"],
+            decision_source = "локальная ML-модель" if getattr(
+                self._analyst, "decision_backend", "groq") == "local" else "трейдер-LLM"
+            log.info("%s: %s сказал '%s' (%.2f): %s",
+                     ticker, decision_source, decision["action"], decision["confidence"],
                      decision["reason"])
             await self._notify_skip(
                 ticker, score,
-                f"сигнал был ({score:+.2f}), но ИИ-трейдер выбрал "
+                f"сигнал был ({score:+.2f}), но {decision_source} выбрал "
                 f"«{decision['action']}» (уверенность "
                 f"{decision['confidence']:.0%}): {decision['reason']}")
             return
@@ -2370,7 +2421,9 @@ class TradingEngine:
                        else "neutral")
         summary["market_mode"] = market_mode
         if market_mode != "risk_on":
-            decision["size_mult"] = 0.5
+            # Не перезаписываем более строгий multiplier (например x0.25 на
+            # прогреве local ML в песочнице) — только дополнительно ограничиваем.
+            decision["size_mult"] = min(_decision_size_multiplier(decision), 0.5)
 
         await self._buy(ticker, price, sentiment, summary, score, decision,
                         morning_ctx=morning_ctx)
@@ -2556,7 +2609,7 @@ class TradingEngine:
         else:
             budget = min(budget, cash * self._cfg.max_position_pct / 100.0)
 
-        size_mult = 0.5 if decision.get("size_mult") == 0.5 else 1.0
+        size_mult = _decision_size_multiplier(decision)
         # v1.13.0: нейтральная зона breadth урезает риск сделки вдвое.
         if float(summary.get("breadth_size_mult") or 1.0) < 1.0:
             size_mult *= 0.5

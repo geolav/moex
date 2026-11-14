@@ -365,8 +365,11 @@ class MarketScanner:
             row["market_breadth_pct"] = breadth_pct
 
         # Один batch-запрос на весь скан: максимум 2-3 кандидата.
-        # Решения сохраняются в движке; он повторно проверит текущие данные,
-        # OHLCV-сетап, ATR, спред, cooldown и риск до любого ордера.
+        # Backend выбирается через DECISION_BACKEND=groq|local.
+        # В scalp BUY здесь только повышает приоритет watchlist; сам ордер
+        # требует свежего event-trigger и отдельной проверки движка.
+        backend_label = ("Local ML" if getattr(self._analyst, "decision_backend", "groq") == "local"
+                         else "Groq") if self._analyst is not None else "AI"
         set_batch = getattr(self._engine, "set_ai_batch_decisions", None)
         decisions: Dict[str, dict] = {}
         wait_sec = 0.0
@@ -384,19 +387,20 @@ class MarketScanner:
                     except Exception:
                         wait_sec = 0.0
                 if wait_sec > 0:
-                    log.info("Сканер: пакетный Groq-анализ отложен общим лимитом; повтор через %.0f сек", wait_sec)
+                    log.info("Сканер: пакетный %s-анализ отложен общим лимитом; повтор через %.0f сек",
+                             backend_label, wait_sec)
                 else:
                     try:
                         ai_sent_count = len(ai_candidates)
                         decisions = await batch_method(
                             ai_candidates, scalp_mode=self._engine_scalp()) or {}
                     except Exception as exc:  # noqa: BLE001
-                        log.warning("Сканер: пакетное решение ИИ недоступно (%s)", exc)
+                        log.warning("Сканер: пакетное решение %s недоступно (%s)", backend_label, exc)
                         decisions = {}
         if callable(set_batch) and not self._engine_scalp():
             set_batch(decisions, ai_candidates)
-        log.info("Сканер: математический рейтинг посчитал %d бумаг; Groq отправлено %d кандидата(ов), валидных ответов %d%s",
-                 len(scored), ai_sent_count, len(decisions),
+        log.info("Сканер: математический рейтинг посчитал %d бумаг; %s обработал %d кандидата(ов), решений %d%s",
+                 len(scored), backend_label, ai_sent_count, len(decisions),
                  " (scalp: BUY только повод для приоритета watchlist, не ордер)" if self._engine_scalp() else "")
 
         # Скальп-режим: лучшие кандидаты автоматически занимают свободные

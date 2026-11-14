@@ -124,11 +124,12 @@ def _print_banner(config: BotConfig, state: StateStore) -> None:
              "переключение в Telegram: /autobuy)",
              "вкл" if config.scan_auto_buy else "выкл",
              config.scan_auto_buy_per_scan)
+    backend = os.getenv("DECISION_BACKEND", "groq").strip().lower()
+    backend_label = "Local ML" if backend == "local" else "Groq"
     if state.scalp_mode:
         log.info("Скальп: потоковый поиск входов; резервная охрана позиций "
-                 "каждые %d сек, Groq batch не чаще %d мин, кулдаун %d мин",
-                 config.scalp_exit_poll_sec,
-                 max(120, config.scalp_ai_min_request_interval_sec) // 60,
+                 "каждые %d сек, backend=%s, кулдаун %d мин",
+                 config.scalp_exit_poll_sec, backend_label,
                  config.scalp_cooldown_min)
     log.info("Агрессивность %d/100 | активность %d/100 "
              "(масштаб времени задаётся в Telegram: /set_activity)",
@@ -147,8 +148,12 @@ def _print_banner(config: BotConfig, state: StateStore) -> None:
              "пауза бумаге после 3 убытков %.1f ч",
              "вкл" if config.learning_enabled else "выкл",
              config.daily_loss_limit_pct, config.loss_streak_pause_h)
-    log.info("Groq-модель: %s | аудит каждые %d сек",
-             config.groq_model, config.audit_interval_sec)
+    if backend == "local":
+        log.info("Backend решений: Local ML | обучение Supervisor включено при SUPERVISOR_ENABLED=true; "
+                 "аудит каждые %d сек", config.audit_interval_sec)
+    else:
+        log.info("Backend решений: Groq (%s) | аудит каждые %d сек",
+                 config.groq_model, config.audit_interval_sec)
     log.info("=" * 60)
 
 
