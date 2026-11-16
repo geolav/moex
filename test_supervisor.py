@@ -1,8 +1,10 @@
 """Регрессии локального самообучения Supervisor без вызова Groq."""
 import json
+import os
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,6 +16,14 @@ async def _notify(_message):
 
 
 class SupervisorTests(unittest.TestCase):
+    def test_auto_tune_is_disabled_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {}, clear=True):
+            sup = self.supervisor(Path(tmp))
+            self.assertFalse(sup._auto_tune_enabled)
+            self.assertFalse(sup._groq_enabled)
+            self.assertFalse(sup._generate_patches)
+            sup.close()
+
     def supervisor(self, root):
         config = SimpleNamespace(
             data_dir=str(root / "data"), base_dir=str(root),
@@ -97,7 +107,7 @@ class SupervisorTests(unittest.TestCase):
             sup.close()
 
     def test_policy_is_not_retrained_repeatedly_on_same_samples(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"SUPERVISOR_AUTO_TUNE": "true"}):
             sup = self.supervisor(Path(tmp))
             now = time.time()
             for i in range(20):

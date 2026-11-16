@@ -5,15 +5,46 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
-import importlib.util
+import sys
 
-if importlib.util.find_spec("groq") is None:
-    raise unittest.SkipTest("Groq SDK отсутствует в текущем test environment; зависимость указана в requirements.txt")
+# The local backend must be testable without installing/importing the Groq SDK.
+# If the SDK is absent, provide import-only exception/client stubs; constructing
+# the client is a test failure because local mode must never do so.
+try:
+    import groq  # noqa: F401
+except ModuleNotFoundError:
+    class _GroqError(Exception):
+        pass
+
+    class _UnexpectedGroqClient:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("Groq client must not be constructed in local mode")
+
+    sys.modules["groq"] = SimpleNamespace(
+        APIConnectionError=_GroqError, APIStatusError=_GroqError,
+        APITimeoutError=_GroqError, AsyncGroq=_UnexpectedGroqClient,
+        AuthenticationError=_GroqError, BadRequestError=_GroqError,
+        InternalServerError=_GroqError, NotFoundError=_GroqError,
+        RateLimitError=_GroqError,
+    )
 
 from ai_analyst import AIAnalyst
 
 
 class BackendSwitchTests(unittest.TestCase):
+    def test_missing_backend_setting_defaults_to_local(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {}, clear=True):
+            cfg = SimpleNamespace(
+                data_dir=tmp, groq_daily_token_budget=1000,
+                groq_api_key="not-used-in-local-mode", groq_model="openai/gpt-oss-20b",
+                http_timeout_sec=2,
+            )
+            analyst = AIAnalyst(cfg)
+            self.assertEqual(analyst.decision_backend, "local")
+            asyncio.run(analyst.start())
+            self.assertIsNone(analyst._client)
+            asyncio.run(analyst.close())
+
     def test_local_backend_starts_without_groq_client(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"DECISION_BACKEND": "local"}):
             cfg = SimpleNamespace(

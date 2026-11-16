@@ -124,7 +124,7 @@ def _print_banner(config: BotConfig, state: StateStore) -> None:
              "переключение в Telegram: /autobuy)",
              "вкл" if config.scan_auto_buy else "выкл",
              config.scan_auto_buy_per_scan)
-    backend = os.getenv("DECISION_BACKEND", "groq").strip().lower()
+    backend = os.getenv("DECISION_BACKEND", "local").strip().lower()
     backend_label = "Local ML" if backend == "local" else "Groq"
     if state.scalp_mode:
         log.info("Скальп: потоковый поиск входов; резервная охрана позиций "

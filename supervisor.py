@@ -103,9 +103,9 @@ class LearningSupervisor:
         self._interval_sec = max(30, int(os.getenv("SUPERVISOR_INTERVAL_SEC", "60")))
         self._groq_interval_sec = max(1800, int(os.getenv("SUPERVISOR_GROQ_MIN_INTERVAL_SEC", "3600")))
         self._enabled = os.getenv("SUPERVISOR_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
-        self._groq_enabled = os.getenv("SUPERVISOR_GROQ_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
-        self._auto_tune_enabled = os.getenv("SUPERVISOR_AUTO_TUNE", "true").strip().lower() in {"1", "true", "yes", "on"}
-        self._generate_patches = os.getenv("SUPERVISOR_GENERATE_PATCHES", "true").strip().lower() in {"1", "true", "yes", "on"}
+        self._groq_enabled = os.getenv("SUPERVISOR_GROQ_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+        self._auto_tune_enabled = os.getenv("SUPERVISOR_AUTO_TUNE", "false").strip().lower() in {"1", "true", "yes", "on"}
+        self._generate_patches = os.getenv("SUPERVISOR_GENERATE_PATCHES", "false").strip().lower() in {"1", "true", "yes", "on"}
 
     def _init_db(self) -> None:
         self._db.executescript("""

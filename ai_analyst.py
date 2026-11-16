@@ -490,10 +490,10 @@ class AIAnalyst:
         self._client: Optional[AsyncGroq] = None
         data_dir = getattr(config, "data_dir", os.path.join(os.path.dirname(__file__), "data"))
         Path(data_dir).mkdir(parents=True, exist_ok=True)
-        self.decision_backend = os.getenv("DECISION_BACKEND", "groq").strip().lower()
+        self.decision_backend = os.getenv("DECISION_BACKEND", "local").strip().lower()
         if self.decision_backend not in {"groq", "local"}:
-            log.warning("Неизвестный DECISION_BACKEND=%r; использую groq", self.decision_backend)
-            self.decision_backend = "groq"
+            log.warning("Неизвестный DECISION_BACKEND=%r; использую local", self.decision_backend)
+            self.decision_backend = "local"
         self.local_model = LocalAdaptiveModel(os.path.join(data_dir, "local_directional_model.json"))
         usage_path = os.path.join(data_dir, "groq_usage.json")
         self._budget = DailyTokenBudget(usage_path,

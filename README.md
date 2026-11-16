@@ -1,4 +1,6 @@
-# MOEX Trading Bot v1.18.4 (local adaptive ML + Supervisor learning + switchable Groq)
+# MOEX Trading Bot v1.18.5 — local-first
+
+# MOEX Trading Bot v1.18.5 (local-first adaptive ML + Supervisor learning)
 
 ## Hotfix v1.17.1
 - Единый расчёт: `/positions`, автопродажа и итог ручного/автоматического закрытия считают полный круг издержек одной формулой. Быстрая автопродажа ждёт, когда оценочный net P&L станет неотрицательным.
@@ -692,3 +694,8 @@ venv/bin/python cleanup.py      # ручная чистка старых лог�
 Параметры модели: `LOCAL_MODEL_MIN_SAMPLES=240`, `LOCAL_MODEL_MIN_CLASS_SAMPLES=40`, `LOCAL_MODEL_MIN_AUC=0.53`, `LOCAL_MODEL_MIN_PROBABILITY=0.62`, `LOCAL_MODEL_MIN_EDGE_MULTIPLE=1.25`. Хранилище модели — `data/local_directional_model.json`; база опыта — `data/supervisor.sqlite3`. Не удаляйте эти файлы при обновлении.
 
 Режим `local` предназначен именно для scalp event-trigger. Обычная swing-стратегия без Groq работает fail-closed и новые покупки не делает. Это экспериментальная модель с проверкой качества, а не гарантия прибыли; сначала используйте песочницу и проверяйте отчёт `/supervisor`.
+
+
+## v1.18.5 — local-first
+
+По умолчанию торговые решения принимает локальная логистическая регрессия; Groq не создаётся и не вызывается. Для явного возврата внешнего backend требуется `DECISION_BACKEND=groq`. Supervisor Groq-диагностика, генерация патчей и auto-tune порогов по умолчанию выключены. Подробности обновления — `UPGRADE_1.18.5_RU.md`.
