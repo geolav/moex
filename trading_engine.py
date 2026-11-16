@@ -69,7 +69,7 @@ from scalp_microstructure import (detect_dip_reversal_trigger,  # noqa: F401
                                   detect_microstructure_trigger,
                                   detect_multiscale_dip_trigger,
                                   detect_shadow_dip_opportunity)
-from news_filter import classify_headlines
+from news_filter import classify_headlines, matching_risk_headlines
 from trade_costs import estimate_round_trip_pnl, position_round_trip_cost_pct
 
 log = logging.getLogger("engine")
@@ -3966,8 +3966,14 @@ class TradingEngine:
     async def _get_sentiment(self, ticker: str) -> float:
         """Детерминированный фильтр новостных рисков без отдельного Groq-вызова."""
         cached = self._sentiment_cache.get(ticker)
-        if cached and (time.monotonic() - cached[0]) < self._cfg.sentiment_ttl_sec:
-            return cached[1]
+        if cached:
+            # Негативная новость перепроверяется чаще: RSS может исправить
+            # ошибочную/устаревшую привязку, а шестичасовой негативный кэш
+            # чрезмерно долго блокировал бумагу после одной публикации.
+            cache_ttl = (min(float(self._cfg.sentiment_ttl_sec), 900.0)
+                         if float(cached[1]) < 0 else float(self._cfg.sentiment_ttl_sec))
+            if time.monotonic() - cached[0] < cache_ttl:
+                return cached[1]
         try:
             news_items = await self._client.get_news(ticker)
         except Exception as exc:  # noqa: BLE001
@@ -3976,8 +3982,10 @@ class TradingEngine:
         self._news_cache[ticker] = list(news_items or [])
         score, reasons = classify_headlines(news_items or [])
         if reasons:
-            log.warning("%s: локальный новостной фильтр заблокировал вход: %s",
-                        ticker, ", ".join(reasons))
+            evidence = matching_risk_headlines(news_items or [])
+            examples = " | ".join(f"{label}: {headline}" for label, headline in evidence[:3])
+            log.warning("%s: локальный новостной фильтр заблокировал вход: %s; RSS: %s",
+                        ticker, ", ".join(reasons), examples or "заголовок не сохранён")
         else:
             log.debug("%s: локальный новостной фильтр: блокирующих заголовков нет", ticker)
         self._sentiment_cache[ticker] = (time.monotonic(), score)

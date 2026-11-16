@@ -1,6 +1,6 @@
-# MOEX Trading Bot v1.18.5 — local-first
+# MOEX Trading Bot v1.18.6 — local-first
 
-# MOEX Trading Bot v1.18.5 (local-first adaptive ML + Supervisor learning)
+# MOEX Trading Bot v1.18.6 (local adaptive ML + calibrated Supervisor learning)
 
 ## Hotfix v1.17.1
 - Единый расчёт: `/positions`, автопродажа и итог ручного/автоматического закрытия считают полный круг издержек одной формулой. Быстрая автопродажа ждёт, когда оценочный net P&L станет неотрицательным.
@@ -695,6 +695,16 @@ venv/bin/python cleanup.py      # ручная чистка старых лог�
 
 Режим `local` предназначен именно для scalp event-trigger. Обычная swing-стратегия без Groq работает fail-closed и новые покупки не делает. Это экспериментальная модель с проверкой качества, а не гарантия прибыли; сначала используйте песочницу и проверяйте отчёт `/supervisor`.
 
+
+## v1.18.6 — local ML labeling, issuer-specific news, cautious Supervisor tuning
+
+- RSS articles are now associated with an issuer through exact ticker/company aliases; generic first words such as «банк» are no longer sufficient. Risk reasons are logged with the matching headline for inspection.
+- Negative news cache is refreshed at most every 15 minutes, while neutral cache keeps the configured TTL.
+- The local logistic classifier now includes mature no-target outcomes as HOLD examples, but does not label missing or incomplete future quote coverage as a negative example. A no-hit outcome requires quote coverage near the end of the configured horizon.
+- Model warmup defaults to 200 mature labels (still requires both classes and a passing out-of-time AUC/Brier quality gate). The model remains fail-closed until validation passes; this is not an unconditional BUY switch.
+- Supervisor v1 learned thresholds are ignored once, returning to explicit strategy defaults. Its v2 auto-tuning uses spaced episodes across multiple tickers, a minimum evidence set, net-expectancy confidence interval and a six-hour cooldown. It only changes thresholds when the evidence supports it.
+- Supervisor telemetry and training remain enabled with `SUPERVISOR_ENABLED=true`; `SUPERVISOR_AUTO_TUNE=true` enables the safer v2 threshold calibration. Groq diagnostics remain optional and are not required for local decisions.
+- See `UPGRADE_1.18.6_RU.md` before deployment.
 
 ## v1.18.5 — local-first
 

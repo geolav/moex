@@ -196,7 +196,7 @@ class LocalAdaptiveModel:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.min_samples = max(120, int(os.getenv("LOCAL_MODEL_MIN_SAMPLES", "240")))
+        self.min_samples = max(120, int(os.getenv("LOCAL_MODEL_MIN_SAMPLES", "200")))
         self.min_class_samples = max(20, int(os.getenv("LOCAL_MODEL_MIN_CLASS_SAMPLES", "40")))
         self.min_auc = min(0.70, max(0.50, _finite(os.getenv("LOCAL_MODEL_MIN_AUC", "0.53"), 0.53)))
         self.min_probability = min(0.85, max(0.55, _finite(os.getenv("LOCAL_MODEL_MIN_PROBABILITY", "0.62"), 0.62)))
@@ -212,6 +212,7 @@ class LocalAdaptiveModel:
         self.baseline_brier = 0.25
         self.last_sample_id = 0
         self.last_fit_epoch = 0.0
+        self.not_ready_reason = "недостаточно размеченных примеров"
         self._load()
 
     def _load(self) -> None:
@@ -236,6 +237,9 @@ class LocalAdaptiveModel:
             self.baseline_brier = _finite(data.get("baseline_brier"), 0.25)
             self.last_sample_id = int(data.get("last_sample_id", 0))
             self.last_fit_epoch = _finite(data.get("last_fit_epoch"))
+            self.not_ready_reason = str(data.get("not_ready_reason") or
+                                        ("модель прошла проверку качества" if self.ready else
+                                         "модель ещё не прошла проверку качества"))
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             return
 
@@ -274,6 +278,12 @@ class LocalAdaptiveModel:
         negatives = n - positives
         if n < self.min_samples or positives < self.min_class_samples or negatives < self.min_class_samples:
             self.ready = False
+            if n < self.min_samples:
+                self.not_ready_reason = f"нужно ещё {self.min_samples - n} размеченных примеров"
+            elif positives < self.min_class_samples:
+                self.not_ready_reason = f"нужно ещё {self.min_class_samples - positives} target-примеров"
+            else:
+                self.not_ready_reason = f"нужно ещё {self.min_class_samples - negatives} HOLD-примеров"
             self.sample_count, self.positive_count, self.negative_count = n, positives, negatives
             self.last_sample_id = max(self.last_sample_id, int(last_sample_id))
             self.last_fit_epoch = time.time()
@@ -289,6 +299,8 @@ class LocalAdaptiveModel:
         if (train_pos < self.min_class_samples // 2 or train_neg < self.min_class_samples // 2
                 or val_pos < 10 or val_neg < 10):
             self.ready = False
+            self.not_ready_reason = (f"недостаточно обоих классов во временной проверке "
+                                     f"(holdout target={val_pos}, HOLD={val_neg}; нужно >=10 каждого)")
             self.sample_count, self.positive_count, self.negative_count = n, positives, negatives
             self.last_sample_id = max(self.last_sample_id, int(last_sample_id))
             self.last_fit_epoch = time.time()
@@ -330,6 +342,9 @@ class LocalAdaptiveModel:
         self.weights = weights
         self.bias = bias
         self.ready = bool(auc >= self.min_auc and brier < baseline_brier)
+        self.not_ready_reason = ("модель прошла временную проверку качества" if self.ready else
+                                 f"quality gate: AUC {auc:.3f} < {self.min_auc:.3f} "
+                                 f"или Brier {brier:.4f} >= baseline {baseline_brier:.4f}")
         self.sample_count, self.positive_count, self.negative_count = n, positives, negatives
         self.validation_auc = auc
         self.validation_brier = brier
@@ -337,9 +352,10 @@ class LocalAdaptiveModel:
         self.last_sample_id = max(self.last_sample_id, int(last_sample_id))
         self.last_fit_epoch = time.time()
         self._save()
-        log.info("Local ML: обучено %d примеров (up=%d/down=%d), holdout AUC=%.3f, "
-                 "Brier=%.4f против baseline %.4f; ready=%s",
-                 n, positives, negatives, auc, brier, baseline_brier, self.ready)
+        log.info("Local ML: обучено %d примеров (target=%d/HOLD=%d), holdout AUC=%.3f, "
+                 "Brier=%.4f против baseline %.4f; ready=%s; причина=%s",
+                 n, positives, negatives, auc, brier, baseline_brier, self.ready,
+                 self.not_ready_reason)
         return self.status()
 
     def _save(self) -> None:
@@ -357,6 +373,7 @@ class LocalAdaptiveModel:
             "baseline_brier": self.baseline_brier,
             "last_sample_id": self.last_sample_id,
             "last_fit_epoch": self.last_fit_epoch,
+            "not_ready_reason": self.not_ready_reason,
             "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
@@ -374,6 +391,7 @@ class LocalAdaptiveModel:
             "baseline_brier": self.baseline_brier,
             "last_sample_id": self.last_sample_id,
             "last_fit_epoch": self.last_fit_epoch,
+            "not_ready_reason": self.not_ready_reason,
             "min_samples": self.min_samples,
             "min_auc": self.min_auc,
             "min_probability": self.min_probability,
@@ -427,8 +445,8 @@ class LocalAdaptiveModel:
                     "action": "hold", "confidence": 0.0, "setup": "none",
                     "stop_pct": 0.0, "tp1_pct": 0.0, "size_mult": 0.0,
                     "reason": (f"локальная ML-модель прогревается: размечено "
-                               f"{self.sample_count}/{self.min_samples}; вход без обученной "
-                               f"модели запрещён"),
+                               f"{self.sample_count}/{self.min_samples}; {self.not_ready_reason}; "
+                               f"вход без прошедшей проверку модели запрещён"),
                 }
                 continue
 

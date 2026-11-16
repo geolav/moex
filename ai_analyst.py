@@ -506,9 +506,12 @@ class AIAnalyst:
     async def start(self) -> None:
         if self.decision_backend == "local":
             status = self.local_model.status()
-            log.info("Локальная ML-модель активна: обученных примеров=%d, ready=%s, "
-                     "holdout AUC=%.3f; сетевые AI-запросы отключены",
-                     status["sample_count"], status["ready"], status["validation_auc"])
+            log.info("Локальная ML-модель активна: размеченных примеров=%d/%d, ready=%s, "
+                     "holdout AUC=%.3f, Brier=%.4f/baseline %.4f; причина=%s; "
+                     "сетевые AI-запросы отключены",
+                     status["sample_count"], status["min_samples"], status["ready"],
+                     status["validation_auc"], status["validation_brier"],
+                     status["baseline_brier"], status.get("not_ready_reason", "не указана"))
             return
         # max_retries=0: ретраи и бюджет контролируются здесь, а не SDK.
         base_url = os.getenv("GROQ_BASE_URL", "").strip().rstrip("/") or None
@@ -738,9 +741,11 @@ class AIAnalyst:
             return {}
         if self.decision_backend == "local":
             decisions = self.local_model.analyze_candidates(rows, scalp_mode=scalp_mode)
-            log.info("Local ML batch: кандидатов=%d, BUY/HOLD=%d, ready=%s, n=%d, AUC=%.3f",
+            log.info("Local ML batch: кандидатов=%d, решений=%d, ready=%s, n=%d/%d, "
+                     "AUC=%.3f, причина=%s",
                      len(rows[:3]), len(decisions), self.local_model.ready,
-                     self.local_model.sample_count, self.local_model.validation_auc)
+                     self.local_model.sample_count, self.local_model.min_samples,
+                     self.local_model.validation_auc, self.local_model.not_ready_reason)
             return decisions
         compact: List[Dict[str, Any]] = []
         for row in rows[:3]:
@@ -978,8 +983,11 @@ class AIAnalyst:
             return ("Сейчас включён DECISION_BACKEND=local: свободные ответы языковой модели "
                     "отключены. Локальная модель используется только для BUY/HOLD "
                     "по scalp event-trigger. "
-                    f"Статус обучения: {status['sample_count']} примеров, "
-                    f"AUC={status['validation_auc']:.3f}, ready={status['ready']}. "
+                    f"Статус обучения: {status['sample_count']}/{status['min_samples']} примеров, "
+                    f"AUC={status['validation_auc']:.3f}, "
+                    f"Brier={status['validation_brier']:.4f}/baseline "
+                    f"{status['baseline_brier']:.4f}, ready={status['ready']}; "
+                    f"причина: {status.get('not_ready_reason', 'не указана')}. "
                     "Для свободного /ask переключите DECISION_BACKEND=groq и перезапустите бота.")
         raw = await self._chat(
             _ASK_SYSTEM_PROMPT,

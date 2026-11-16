@@ -35,6 +35,10 @@ import tempfile
 import time
 from types import SimpleNamespace
 
+# Этот отдельный dry-run проверяет Groq API-обвязку на FakeGroqClient.
+# В рабочем .env проекта DECISION_BACKEND остаётся local.
+os.environ["DECISION_BACKEND"] = "groq"
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
 
@@ -96,20 +100,32 @@ def make_test_config(tmp: str) -> BotConfig:
         # None вместо числа ломал вход: None > 0 в анти-погоне и др.)
         surge_sense_from_pct=3.0, chase_guard_pct=0.0, chase_bounce_pct=0.0,
         morning_anchor_until=13,
-        scalp_max_positions=12, scalp_watchlist_max=15,
+        scalp_max_positions=15, scalp_watchlist_max=25,
         scalp_poll_sec=300, scalp_exit_poll_sec=30,
         scalp_ai_min_request_interval_sec=240,
         scalp_cooldown_min=20,
+        scalp_fasttrack_enabled=True, scalp_fasttrack_min_score=75.0,
+        scalp_fasttrack_cost_multiple=1.10,
+        scalp_fasttrack_impulse_enabled=True,
+        scalp_fasttrack_impulse_cost_multiple=1.25,
+        scalp_micro_price_only=True, scalp_default_spread_pct=0.05,
         scalp_harvest_tiers=((5.0, 0.15), (3.0, 0.25), (2.0, 0.4)),
         scalp_stop_loss_pct=1.0, scalp_take_profit_pct=2.0,
         scalp_trailing_activate_pct=1.0, scalp_trailing_drop_pct=0.5,
         scalp_surge_from_pct=1.5,
-        scalp_max_entries_per_day=40, scalp_risk_per_trade_pct=0.05,
+        scalp_max_entries_per_day=100, scalp_risk_per_trade_pct=0.05,
         scalp_max_portfolio_risk_pct=0.40,
+        scalp_min_net_profit_rub=1.0,
+        scalp_stop_confirm_sec=4, scalp_stop_confirm_ticks=3,
+        scalp_stop_continue_pct=0.03, scalp_stop_reclaim_pct=0.05,
+        scalp_stop_emergency_extra_pct=0.10,
+        scalp_force_flat_at_session_end=False,
+        scalp_micro_dip_min_drop_pct=0.02, scalp_micro_dip_min_score=42.0,
+        scalp_portfolio_sync_sec=30,
         scalp_daily_loss_limit_pct=1.0, scalp_max_position_pct=15.0,
         scalp_min_stop_pct=0.6, scalp_atr_multiplier=1.2,
         scalp_max_stop_pct=1.0, scalp_max_spread_pct=0.1,
-        scalp_round_trip_cost_pct=0.1, scalp_min_reward_cost_multiple=3.0,
+        scalp_round_trip_cost_pct=0.1, scalp_min_reward_cost_multiple=1.1,
         scalp_time_stop_min=45, scalp_min_progress_r=0.3,
         scalp_loss_pause_minutes=60, scalp_stop_cooldown_min=120,
         scalp_max_sector_positions=2,
@@ -1034,9 +1050,8 @@ async def main() -> int:
                 "llm_confidence": 0.65}
     weak_state.set_position("SBER", weak_pos)
     await weak_engine._check_scalp_exit("SBER", 99.6, weak_pos)
-    check("weak guard (<0.70) закрывает на -0.45R после 20 минут",
-          "SBER" not in weak_state.positions
-          and weak_client.sells == [("SBER", 1)])
+    check("скальп не использует устаревший LLM weak-guard до достижения стопа",
+          "SBER" in weak_state.positions and weak_client.sells == [])
 
     # --- Тест 27: scanner and engine share the same 5m timeframe --------------
     print("\n[27] Скальп: сканер и торговый движок используют один 5m таймфрейм")
@@ -1268,11 +1283,14 @@ async def main() -> int:
             "avg_volume": 1000.0, "current_volume": 1000.0,
             "session_vwap": 100.0, "range_high_12": 100.05,
         })
+    local_entry_analyst = FakeAnalyst()
+    local_entry_analyst.decision_backend = "local"
+    local_entry_analyst.local_model = types.SimpleNamespace(ready=False)
     entry_engine = TradingEngine(
         # learning_enabled=False: память ошибок общая на tmp-папку, и стопы из
         # предыдущих тестов ставят SBER на паузу - изолируем проверку bypass.
         dataclasses.replace(cfg, learning_enabled=False),
-        entry_state, entry_client, FakeAnalyst(), notify)
+        entry_state, entry_client, local_entry_analyst, notify)
     # Нейтральная зона breadth 32%: вход разрешён с половинным риском.
     entry_engine.set_market_context({"breadth_pct": 32.0, "symbols": 80})
     orig_can_open = sessions.can_open_scalp_entry
@@ -1289,7 +1307,7 @@ async def main() -> int:
         sessions.should_force_flatten_scalp = orig_flatten
         indicators.detect_entry_setups = orig_detect_setups
     queued = entry_engine._scalp_ai_queue.get("SBER")
-    check("кандидат с micro_impulse попал в очередь Groq без свечного сетапа",
+    check("кандидат с micro_impulse попал в очередь локальной ML без свечного сетапа",
           bool(queued) and queued.get("allowed_setups") == ["micro_impulse"],
           str((queued or {}).get("allowed_setups")))
     check("нейтральная зона breadth помечает кандидата риском x0.5",
@@ -1351,13 +1369,13 @@ async def main() -> int:
     await quick_engine._check_scalp_exit("SBER", 100.14, dict(quick_pos))
     check("плюс ниже полного круга (+0.14% < +0.15%) - позиция не продаётся",
           "SBER" in quick_state.positions and not quick_client.sells)
-    await quick_engine._check_scalp_exit("SBER", 100.16, dict(quick_pos))
-    check("первый плюс выше полных издержек (+0.16%) продаёт всё",
+    await quick_engine._check_scalp_exit("SBER", 100.18, dict(quick_pos))
+    check("net-прибыль выше настроенного минимума +1 ₽ продаёт всё",
           "SBER" not in quick_state.positions
           and quick_client.sells == [("SBER", 4)],
           f"sells={quick_client.sells}")
-    check("в уведомлении названа причина «быстрый плюс»",
-          any("ПРОДАЖА" in n and "быстрый плюс" in n for n in notifications))
+    check("в уведомлении названа причина достижения чистой прибыли",
+          any("ПРОДАЖА" in n and "чистая прибыль" in n for n in notifications))
     # Выключенный флаг возвращает прежнее поведение (продажа только по 1R).
     off_state = StateStore(os.path.join(tmp, "quick_tp_off_state.json"),
                            initial_overrides={"trading_enabled": True})
@@ -1463,7 +1481,7 @@ async def main() -> int:
     # Для ручной покупки входной оценочный круг хранится в самой позиции;
     # тест пересекает именно его, а не половину затрат.
     manual_target = float(manual_pos.get("scalp_expected_round_trip_cost_pct") or 0.0)
-    manual_exit_price = 100.0 * (1.0 + (manual_target + 0.01) / 100.0)
+    manual_exit_price = 100.0 * (1.0 + (manual_target + 0.16) / 100.0)
     await manual_engine._check_scalp_exit("SBER", manual_exit_price, dict(manual_pos))
     check("рост выше полных издержек закрывает ручную позицию",
           "SBER" not in manual_state.positions

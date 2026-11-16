@@ -106,6 +106,7 @@ class LearningSupervisor:
         self._groq_enabled = os.getenv("SUPERVISOR_GROQ_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
         self._auto_tune_enabled = os.getenv("SUPERVISOR_AUTO_TUNE", "false").strip().lower() in {"1", "true", "yes", "on"}
         self._generate_patches = os.getenv("SUPERVISOR_GENERATE_PATCHES", "false").strip().lower() in {"1", "true", "yes", "on"}
+        self._legacy_policy_ignored = False
 
     def _init_db(self) -> None:
         self._db.executescript("""
@@ -188,10 +189,18 @@ class LearningSupervisor:
         }
         try:
             payload = json.loads(self._policy_path.read_text(encoding="utf-8"))
-            for key in base:
-                if key in payload:
-                    base[key] = _number(payload[key], base[key])
-        except (OSError, json.JSONDecodeError, TypeError):
+            # Политика v1 могла за несколько минут поднять фильтры до верхних
+            # границ на коррелированных shadow-событиях. После обновления такие
+            # параметры не наследуем: стартуем с явно заданных безопасных ENV.
+            if int(payload.get("version", 0) or 0) >= 2:
+                for key in base:
+                    if key in payload:
+                        base[key] = _number(payload[key], base[key])
+            elif not self._legacy_policy_ignored:
+                log.warning("Supervisor: устаревшая learned_policy v1 не применяется; "
+                            "возвращаю базовые пороги из конфигурации")
+                self._legacy_policy_ignored = True
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
             pass
         base["dip_min_score"] = min(60.0, max(42.0, base["dip_min_score"]))
         base["dip_min_drop_pct"] = min(0.05, max(0.005, base["dip_min_drop_pct"]))
@@ -356,41 +365,48 @@ class LearningSupervisor:
         return counts
 
     def _label_ml_pending(self, now: float) -> Dict[str, int]:
-        """Размечает ML-исход по первому касанию цели/стопа на горизонте.
+        """Размечает задачу BUY/HOLD по первому касанию целевого барьера.
 
-        В отличие от legacy-разметки эта очередь повторно проверяется, пока
-        нет итоговой метки: поздний/редкий REST-снимок не теряет обучающий пример.
-        Метка 1 — цель достигнута раньше стопа, 0 — стоп раньше цели,
-        -1 — ни одна граница не достигнута или данных недостаточно.
+        1: цель достигнута раньше стопа.
+        0: стоп достигнут раньше цели ИЛИ цель не достигнута за горизонт,
+           хотя в окне есть реальные будущие ценовые наблюдения.
+        -1: данных для оценки вообще нет; такие строки не попадают в обучение.
+
+        Это делает HOLD полноценным обучающим классом, но не превращает
+        отсутствие котировок в отрицательный пример. Старые -1 переоцениваются,
+        если в SQLite уже есть будущие ценовые точки для их временного окна.
         """
         pending = self._db.execute(
-            "SELECT * FROM samples WHERE ml_label IS NULL AND features_json IS NOT NULL "
-            "AND has_position=0 AND stage!='bought' "
-            "AND (signal_json IS NOT NULL OR shadow_json IS NOT NULL) "
-            "AND ts<=? ORDER BY ts LIMIT 500",
-            (now - self._lookahead_sec,)).fetchall()
-        counts = {"up": 0, "down": 0, "neutral": 0, "pending": 0}
+            "SELECT s.* FROM samples s WHERE (s.ml_label IS NULL OR "
+            "(s.ml_label=-1 AND (s.ml_source IS NULL OR s.ml_source IN ('counterfactual','no_future_data')) "
+            "AND EXISTS (SELECT 1 FROM samples f "
+            "WHERE f.ticker=s.ticker AND f.ts>s.ts AND f.ts<=s.ts+?))) "
+            "AND s.features_json IS NOT NULL AND s.has_position=0 AND s.stage!='bought' "
+            "AND (s.signal_json IS NOT NULL OR s.shadow_json IS NOT NULL) "
+            "AND s.ts<=? ORDER BY s.ts LIMIT 1000",
+            (self._lookahead_sec, now - self._lookahead_sec),
+        ).fetchall()
+        counts = {"up": 0, "not_up": 0, "neutral": 0, "pending": 0}
         target_multiple = max(1.05, _number(os.getenv("SUPERVISOR_TARGET_COST_MULTIPLE", "1.25"), 1.25))
         for row in pending:
             horizon_end = float(row["ts"]) + self._lookahead_sec
             future = self._db.execute(
                 "SELECT ts,price FROM samples WHERE ticker=? AND ts>? AND ts<=? "
                 "ORDER BY ts LIMIT 1000",
-                (row["ticker"], row["ts"], horizon_end)).fetchall()
+                (row["ticker"], row["ts"], horizon_end),
+            ).fetchall()
             if not future:
-                # Не закрываем пример раньше, чем закончится допустимое окно.
                 if now < horizon_end + 30.0:
                     counts["pending"] += 1
                     continue
                 self._db.execute(
-                    "UPDATE samples SET ml_label=-1,ml_return_pct=NULL,ml_source='counterfactual',"
+                    "UPDATE samples SET ml_label=-1,ml_return_pct=NULL,ml_source='no_future_data',"
                     "ml_updated_ts=? WHERE id=?",
-                    (now, row["id"]))
+                    (now, row["id"]),
+                )
                 counts["neutral"] += 1
                 continue
-            # Когда триггер указывает измеренный потенциал, проверяем именно
-            # его, а не более лёгкую цель «издержки × 1.25». Для слабых/теневых
-            # наблюдений без прогноза остаётся консервативная cost-based цель.
+
             try:
                 trigger_data = json.loads(row["signal_json"] or row["shadow_json"] or "{}")
             except (TypeError, json.JSONDecodeError):
@@ -398,18 +414,22 @@ class LearningSupervisor:
             projected = _number(
                 trigger_data.get("projected_30s_pct"),
                 _number(trigger_data.get("rebound_to_mean_pct"),
-                        _number(trigger_data.get("rebound_to_vwap_pct"))))
+                        _number(trigger_data.get("rebound_to_vwap_pct"))),
+            )
             up_barrier = max(float(row["cost_pct"] or 0.0) * target_multiple, 0.08)
             if projected > 0:
                 up_barrier = max(up_barrier, min(projected, 1.5))
             down_barrier = max(float(row["stop_pct"] or 0.6) * 0.75, 0.08)
             outcome = -1
             net_return = 0.0
+            last_change = 0.0
+            entry_price = float(row["price"] or 0.0)
             for point in future:
-                price = float(point["price"] or 0.0)
-                if price <= 0 or float(row["price"] or 0.0) <= 0:
+                future_price = float(point["price"] or 0.0)
+                if future_price <= 0 or entry_price <= 0:
                     continue
-                change = (price / float(row["price"]) - 1.0) * 100.0
+                change = (future_price / entry_price - 1.0) * 100.0
+                last_change = change
                 if change >= up_barrier:
                     outcome = 1
                     net_return = change - float(row["cost_pct"] or 0.0)
@@ -418,14 +438,35 @@ class LearningSupervisor:
                     outcome = 0
                     net_return = change - float(row["cost_pct"] or 0.0)
                     break
-            if outcome == -1 and now < horizon_end + 30.0:
-                counts["pending"] += 1
-                continue
+
+            if outcome == -1:
+                # Если цель/стоп не достигнуты, HOLD ставится только при
+                # достаточном покрытии горизонта реальными котировками. Один
+                # ранний snapshot не должен изображать полноценный 5-минутный
+                # исход: это мог бы быть пропуск данных, а не отсутствие движения.
+                latest_future_ts = max(float(point["ts"]) for point in future)
+                coverage_tolerance = max(30.0, self._lookahead_sec * 0.20)
+                if now < horizon_end + 30.0:
+                    counts["pending"] += 1
+                    continue
+                if latest_future_ts < horizon_end - coverage_tolerance:
+                    self._db.execute(
+                        "UPDATE samples SET ml_label=-1,ml_return_pct=NULL,"
+                        "ml_source='insufficient_future_coverage',ml_updated_ts=? WHERE id=?",
+                        (now, row["id"]),
+                    )
+                    counts["neutral"] += 1
+                    continue
+                # Горизонт покрыт котировками, но ни цель, ни стоп
+                # не достигнуты: это HOLD; return оцениваем по последней цене окна.
+                outcome = 0
+                net_return = last_change - float(row["cost_pct"] or 0.0)
             self._db.execute(
                 "UPDATE samples SET ml_label=?,ml_return_pct=?,ml_source='counterfactual',"
                 "ml_updated_ts=? WHERE id=?",
-                (outcome, net_return if outcome in (0, 1) else None, now, row["id"]))
-            counts["up" if outcome == 1 else "down" if outcome == 0 else "neutral"] += 1
+                (outcome, net_return, now, row["id"]),
+            )
+            counts["up" if outcome == 1 else "not_up"] += 1
         self._db.commit()
         return counts
 
@@ -471,78 +512,121 @@ class LearningSupervisor:
         last_fit_epoch = float(getattr(model, "last_fit_epoch", 0.0) or 0.0)
         new_count = sum(1 for row in rows
                         if float(row["ml_updated_ts"] or row["ts"]) > last_fit_epoch)
-        if (max_id <= previous_id and new_count == 0) or new_count < 20:
+        if (max_id <= previous_id and new_count == 0) or new_count < 10:
             return None
         status = model.fit(examples, last_sample_id=max_id)
         status["new_samples"] = new_count
         return status
 
     def _auto_tune(self, now: float) -> Optional[Dict[str, Any]]:
+        """Осторожная калибровка порогов на независимых завершённых эпизодах.
+
+        Не меняет политику по 20 соседним точкам одной и той же ямы. Для
+        изменения нужны 40+ независимых эпизодов, 8+ тикеров, минимум час
+        наблюдений и статистически заметное изменение net expectancy.
+        Между фактическими изменениями действует шестичасовой cooldown.
+        """
         if not self._auto_tune_enabled:
             return None
         since = now - 7 * 86400
+        try:
+            previous_policy = json.loads(self._policy_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            previous_policy = {}
+        last_trained_id = int(previous_policy.get("last_sample_id", 0) or 0)
+        last_tune_ts = (_number(previous_policy.get("last_tune_ts"))
+                        if int(previous_policy.get("version", 0) or 0) >= 2 else 0.0)
+        if last_tune_ts and now - last_tune_ts < 6 * 3600:
+            return None
+
         raw_rows = self._db.execute("""SELECT id,ticker,ts,label,label_net_pct FROM samples
-            WHERE ts>=? AND (shadow_json IS NOT NULL OR stage IN
+            WHERE ts>=? AND id>? AND (shadow_json IS NOT NULL OR stage IN
             ('signal_not_bought','queued_ai','ai_hold','ai_expired','ai_buy_cancelled','buy_attempt_failed',
              'blocked_trading_disabled','blocked_session_time_window'))
             AND missed IN (0,1) AND label IN ('target','stop')
-            ORDER BY ts DESC LIMIT 1000""", (since,)).fetchall()
-        # Не переобучаем политику каждую минуту на одном и том же наборе.
-        # Для нового шага нужны новые размеченные эпизоды после предыдущего обучения.
-        max_sample_id = max((int(r["id"]) for r in raw_rows), default=0)
-        try:
-            previous_policy = json.loads(self._policy_path.read_text(encoding="utf-8"))
-            last_trained_id = int(previous_policy.get("last_sample_id", 0))
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
-            last_trained_id = 0
+            ORDER BY ts DESC LIMIT 2000""", (since, last_trained_id)).fetchall()
+        max_sample_id = max((int(r["id"]) for r in raw_rows), default=last_trained_id)
         if max_sample_id <= last_trained_id:
             return None
-        # Не считаем соседние точки одной и той же ямы отдельными сделками.
+
+        # Берём не более одного наблюдения с тикера на полный горизонт label.
+        spacing = max(float(self._lookahead_sec), 300.0)
         rows = []
         last_by_ticker: Dict[str, float] = {}
         for row in raw_rows:
             ticker = str(row["ticker"])
             ts = float(row["ts"])
             previous = last_by_ticker.get(ticker)
-            if previous is not None and abs(ts - previous) < 180.0:
+            if previous is not None and abs(ts - previous) < spacing:
                 continue
             last_by_ticker[ticker] = ts
             rows.append(row)
-        # Require multiple independent candidate episodes; otherwise do not learn.
-        if len(rows) < 20:
+
+        min_episodes = max(40, int(os.getenv("SUPERVISOR_TUNE_MIN_EPISODES", "40")))
+        unique_tickers = {str(row["ticker"]) for row in rows}
+        span_sec = (max((float(r["ts"]) for r in rows), default=0.0)
+                    - min((float(r["ts"]) for r in rows), default=0.0))
+        if len(rows) < min_episodes or len(unique_tickers) < 8 or span_sec < 3600.0:
             return None
+
+        values = [float(r["label_net_pct"] or 0.0) for r in rows]
         wins = sum(1 for r in rows if r["label"] == "target")
         win_rate = wins / len(rows)
-        expectancy = sum(float(r["label_net_pct"] or 0.0) for r in rows) / len(rows)
+        expectancy = sum(values) / len(values)
+        variance = sum((value - expectancy) ** 2 for value in values) / max(1, len(values))
+        standard_error = math.sqrt(variance) / math.sqrt(len(values))
+        lower_95 = expectancy - 1.96 * standard_error
+        upper_95 = expectancy + 1.96 * standard_error
+
         policy = self.current_policy()
         old = dict(policy)
-        if win_rate >= 0.62 and expectancy > 0.0:
-            policy["dip_min_score"] = max(42.0, policy["dip_min_score"] - 1.5)
-            policy["dip_min_drop_pct"] = max(0.005, policy["dip_min_drop_pct"] * 0.95)
-            reason = "shadow-сигналы часто достигали цели раньше стопа; осторожно расширяю поиск"
-        elif win_rate <= 0.42 or expectancy < -0.03:
-            policy["dip_min_score"] = min(60.0, policy["dip_min_score"] + 2.0)
-            policy["dip_min_drop_pct"] = min(0.05, policy["dip_min_drop_pct"] * 1.05)
-            reason = "shadow-сигналы часто уходили к стопу/не покрывали трение; ужесточаю поиск"
-        else:
-            return None
-        if all(abs(policy[k] - old[k]) < 1e-9 for k in old):
-            return None
+        reason = ""
+        if upper_95 < -0.03:
+            # Подтверждённо отрицательное ожидание: лишь маленький шаг по score.
+            # Не увеличиваем min_drop: это дополнительно прятало бы новые
+            # наблюдения и замедляло сбор обучающих примеров.
+            policy["dip_min_score"] = min(60.0, policy["dip_min_score"] + 0.5)
+            reason = "net expectancy статистически отрицательный; осторожно повышаю score"
+        elif lower_95 > 0.03 and win_rate >= 0.62:
+            policy["dip_min_score"] = max(42.0, policy["dip_min_score"] - 0.5)
+            policy["dip_min_drop_pct"] = max(0.005, policy["dip_min_drop_pct"] * 0.99)
+            reason = "net expectancy устойчиво положительный; немного расширяю поиск"
+
+        changed = any(abs(policy[k] - old[k]) > 1e-9 for k in old)
+        last_tune_value = now if changed else last_tune_ts
         payload = {
-            **policy, "updated_at": datetime.now(timezone.utc).isoformat(),
+            "version": 2,
+            **policy,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
             "last_sample_id": max_sample_id,
-            "evidence_n": len(rows), "win_rate": round(win_rate, 4),
-            "expectancy_net_pct": round(expectancy, 5), "reason": reason,
+            "last_tune_ts": last_tune_value,
+            "last_evaluated_ts": now,
+            "evidence_n": len(rows),
+            "unique_tickers": len(unique_tickers),
+            "span_sec": round(span_sec, 1),
+            "win_rate": round(win_rate, 4),
+            "expectancy_net_pct": round(expectancy, 5),
+            "expectancy_ci95": [round(lower_95, 5), round(upper_95, 5)],
+            "reason": reason or "недостаточно статистических доказательств для изменения порогов",
         }
+        # Сохраняем watermark даже при отсутствии изменения: одни и те же
+        # данные не должны переоцениваться каждую минуту.
         tmp = self._policy_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         os.replace(tmp, self._policy_path)
+        if not changed:
+            log.info("Supervisor: пороги оставлены без изменений: episodes=%d, tickers=%d, "
+                     "net expectancy=%.4f%%, 95%% CI=[%.4f%%; %.4f%%]",
+                     len(rows), len(unique_tickers), expectancy, lower_95, upper_95)
+            return None
+
         self.record_event("policy_updated", **payload)
-        log.warning("Supervisor: самообучение изменило learned_policy: score %.1f→%.1f; "
-                    "min_drop %.4f%%→%.4f%%; n=%d, win_rate=%.1f%%, net expectancy=%.4f%%",
+        log.warning("Supervisor: адаптивная политика v2: score %.1f→%.1f; "
+                    "min_drop %.4f%%→%.4f%%; episodes=%d/%d тикеров; "
+                    "net expectancy=%.4f%% (95%% CI %.4f..%.4f)",
                     old["dip_min_score"], policy["dip_min_score"],
                     old["dip_min_drop_pct"], policy["dip_min_drop_pct"],
-                    len(rows), win_rate * 100.0, expectancy)
+                    len(rows), len(unique_tickers), expectancy, lower_95, upper_95)
         return payload
 
     def _recent_log_excerpt(self) -> str:
@@ -616,9 +700,12 @@ class LearningSupervisor:
             return "не подключена"
         status = model.status() if callable(getattr(model, "status", None)) else {}
         return (f"{'ГОТОВА' if status.get('ready') else 'прогрев'}; "
-                f"размечено {status.get('sample_count', 0)}; "
-                f"up/down={status.get('positive_count', 0)}/{status.get('negative_count', 0)}; "
-                f"holdout AUC={status.get('validation_auc', 0.5):.3f}; "
+                f"размечено {status.get('sample_count', 0)}/{status.get('min_samples', 200)} "
+                f"(target/HOLD={status.get('positive_count', 0)}/{status.get('negative_count', 0)}); "
+                f"AUC={status.get('validation_auc', 0.5):.3f}; "
+                f"Brier={status.get('validation_brier', 0.25):.4f}/"
+                f"{status.get('baseline_brier', 0.25):.4f}; "
+                f"причина: {status.get('not_ready_reason', 'не указана')}; "
                 f"порог BUY={status.get('min_probability', 0.62):.0%}")
 
     def _metrics(self, tickers: List[str]) -> Dict[str, Any]:
@@ -879,10 +966,10 @@ class LearningSupervisor:
         ml_labels = self._label_ml_pending(cycle_now)
         ml_update = self._train_local_model()
         if sum(ml_labels.values()) > 0 and self._cycle_count % 5 == 0:
-            log.info("Supervisor ML-разметка: up=%d, down=%d, neutral=%d, ждут=%d",
-                     ml_labels["up"], ml_labels["down"], ml_labels["neutral"], ml_labels["pending"])
+            log.info("Supervisor ML-разметка: target=%d, HOLD/no-target=%d, без данных=%d, ждут=%d",
+                     ml_labels["up"], ml_labels["not_up"], ml_labels["neutral"], ml_labels["pending"])
         if ml_update:
-            log.info("Supervisor: локальная ML-модель обновлена: n=%d, up=%d, down=%d, "
+            log.info("Supervisor: локальная ML-модель обновлена: n=%d, target=%d, HOLD/no-target=%d, "
                      "AUC=%.3f, ready=%s; новых размеченных=%d",
                      ml_update.get("sample_count", 0), ml_update.get("positive_count", 0),
                      ml_update.get("negative_count", 0), ml_update.get("validation_auc", 0.5),
@@ -904,10 +991,12 @@ class LearningSupervisor:
         model = getattr(self._analyst, "local_model", None)
         if model is not None:
             ms = model.status()
-            log.info("Supervisor ML: ready=%s, samples=%d (up=%d/down=%d), holdout AUC=%.3f",
+            log.info("Supervisor ML: ready=%s, samples=%d (target=%d/HOLD=%d), "
+                     "holdout AUC=%.3f, Brier=%.4f/baseline %.4f; причина=%s",
                      ms.get("ready"), ms.get("sample_count", 0),
                      ms.get("positive_count", 0), ms.get("negative_count", 0),
-                     ms.get("validation_auc", 0.5))
+                     ms.get("validation_auc", 0.5), ms.get("validation_brier", 0.25),
+                     ms.get("baseline_brier", 0.25), ms.get("not_ready_reason", "не указана"))
         if metrics["samples_1h"] == 0:
             if metrics["price_changed_recent"] == 0:
                 log.info("Supervisor: новых изменений цены сейчас нет; свежие REST-снимки "

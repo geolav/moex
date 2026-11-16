@@ -93,11 +93,26 @@ class SupervisorTests(unittest.TestCase):
             self.assertEqual(row["missed"], 0)
             sup.close()
 
-    def test_policy_values_are_bounded(self):
+    def test_legacy_policy_is_reset_to_explicit_config_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sup = self.supervisor(Path(tmp))
+            # learned_policy v1 могла чрезмерно ужесточить входы; её thresholds
+            # не переносим, пока нет устойчивой выборки по алгоритму v2.
+            sup._policy_path.write_text(json.dumps({
+                "dip_min_score": 60, "dip_min_drop_pct": 0.05,
+                "fasttrack_min_score": 85, "last_sample_id": 123,
+            }), encoding="utf-8")
+            policy = sup.current_policy()
+            self.assertEqual(policy["dip_min_score"], 48.0)
+            self.assertEqual(policy["dip_min_drop_pct"], 0.02)
+            self.assertEqual(policy["fasttrack_min_score"], 75.0)
+            sup.close()
+
+    def test_version_two_policy_values_are_bounded(self):
         with tempfile.TemporaryDirectory() as tmp:
             sup = self.supervisor(Path(tmp))
             sup._policy_path.write_text(json.dumps({
-                "dip_min_score": 1, "dip_min_drop_pct": 9,
+                "version": 2, "dip_min_score": 1, "dip_min_drop_pct": 9,
                 "fasttrack_min_score": 200,
             }), encoding="utf-8")
             policy = sup.current_policy()
@@ -106,10 +121,11 @@ class SupervisorTests(unittest.TestCase):
             self.assertEqual(policy["fasttrack_min_score"], 85.0)
             sup.close()
 
-    def test_policy_is_not_retrained_repeatedly_on_same_samples(self):
+    def test_policy_requires_independent_samples_and_cooldown(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"SUPERVISOR_AUTO_TUNE": "true"}):
             sup = self.supervisor(Path(tmp))
             now = time.time()
+            # 20 samples одного тикера недостаточно для изменения порогов.
             for i in range(20):
                 sup._db.execute("""INSERT INTO samples(
                     ts,ticker,price,price_source,price_age,book_age,spread_pct,cost_pct,
@@ -117,13 +133,29 @@ class SupervisorTests(unittest.TestCase):
                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (now - 4000 + i * 240, "SBER", 100.0, "rest", 0.0, 0.0,
                      0.05, 0.10, 0.6, 0, json.dumps({"score": 40}),
-                     "counterfactual test", "shadow", "target", 0.025, 1))
+                     "counterfactual test", "shadow", "target", 0.10, 1))
+            sup._db.commit()
+            self.assertIsNone(sup._auto_tune(now))
+            # Ещё 40 независимых эпизодов на 8 тикерах и более чем за час.
+            for i in range(40):
+                ticker = f"T{i % 8}"
+                ts = now - 9000 + i * 180
+                sup._db.execute("""INSERT INTO samples(
+                    ts,ticker,price,price_source,price_age,book_age,spread_pct,cost_pct,
+                    stop_pct,has_position,shadow_json,reason,stage,label,label_net_pct,missed)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (ts, ticker, 100.0, "rest", 0.0, 0.0,
+                     0.05, 0.10, 0.6, 0, json.dumps({"score": 40}),
+                     "independent episode", "shadow", "target", 0.10, 1))
             sup._db.commit()
             first = sup._auto_tune(now)
             self.assertIsNotNone(first)
-            self.assertEqual(first["evidence_n"], 20)
+            self.assertGreaterEqual(first["evidence_n"], 40)
+            self.assertGreaterEqual(first["unique_tickers"], 8)
+            self.assertEqual(first["version"], 2)
+            self.assertAlmostEqual(first["dip_min_score"], 47.5)
             second = sup._auto_tune(now + 60)
-            self.assertIsNone(second, "тот же набор размеченных эпизодов нельзя применять повторно")
+            self.assertIsNone(second, "6-часовой cooldown не допускает повторную настройку")
             sup.close()
 
 
@@ -154,6 +186,82 @@ class SupervisorTests(unittest.TestCase):
             self.assertEqual(row["ml_source"], "counterfactual")
             self.assertGreater(row["ml_return_pct"], 0)
             self.assertEqual(counts["up"], 1)
+            sup.close()
+
+
+    def test_ml_no_hit_with_future_prices_becomes_hold_training_example(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sup = self.supervisor(Path(tmp))
+            now = time.time()
+            base = now - 400
+            features = [0.0] * 13
+            sup._db.execute("""INSERT INTO samples(
+                ts,ticker,price,price_source,price_age,book_age,spread_pct,cost_pct,
+                stop_pct,has_position,signal_json,reason,stage,features_json,ml_label,ml_source)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (base, "SBER", 100.0, "stream", 0, 0, .05, .10, .6,
+                 0, json.dumps({"kind": "dip_reversal"}), "old neutral", "shadow",
+                 json.dumps(features), -1, "counterfactual"))
+            for offset, price in ((20, 100.05), (150, 100.03), (295, 100.04)):
+                sup._db.execute("""INSERT INTO samples(
+                    ts,ticker,price,price_source,price_age,book_age,spread_pct,cost_pct,
+                    stop_pct,has_position,reason,stage)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (base + offset, "SBER", price, "stream", 0, 0, .05, .10, .6,
+                     0, "future quote", "future"))
+            sup._db.commit()
+            counts = sup._label_ml_pending(now)
+            row = sup._db.execute("SELECT ml_label,ml_return_pct,ml_source FROM samples WHERE ts=?",
+                                  (base,)).fetchone()
+            self.assertEqual(row["ml_label"], 0)
+            self.assertEqual(row["ml_source"], "counterfactual")
+            self.assertAlmostEqual(row["ml_return_pct"], -0.06, places=5)
+            self.assertEqual(counts["not_up"], 1)
+            sup.close()
+
+    def test_ml_partial_future_coverage_is_not_a_negative_example(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sup = self.supervisor(Path(tmp))
+            now = time.time()
+            base = now - 400
+            sup._db.execute("""INSERT INTO samples(
+                ts,ticker,price,price_source,price_age,book_age,spread_pct,cost_pct,
+                stop_pct,has_position,signal_json,reason,stage,features_json)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (base, "SBER", 100.0, "stream", 0, 0, .05, .10, .6,
+                 0, json.dumps({"kind": "dip_reversal"}), "partial horizon", "shadow",
+                 json.dumps([0.0] * 13)))
+            sup._db.execute("""INSERT INTO samples(
+                ts,ticker,price,price_source,price_age,book_age,spread_pct,cost_pct,
+                stop_pct,has_position,reason,stage)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (base + 20, "SBER", 100.01, "stream", 0, 0, .05, .10, .6,
+                 0, "only early future quote", "future"))
+            sup._db.commit()
+            sup._label_ml_pending(now)
+            row = sup._db.execute("SELECT ml_label,ml_source FROM samples WHERE ts=?", (base,)).fetchone()
+            self.assertEqual(row["ml_label"], -1)
+            self.assertEqual(row["ml_source"], "insufficient_future_coverage")
+            sup.close()
+
+    def test_ml_sample_without_future_quotes_is_not_a_negative_example(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sup = self.supervisor(Path(tmp))
+            now = time.time()
+            base = now - 400
+            sup._db.execute("""INSERT INTO samples(
+                ts,ticker,price,price_source,price_age,book_age,spread_pct,cost_pct,
+                stop_pct,has_position,signal_json,reason,stage,features_json)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (base, "SBER", 100.0, "stream", 0, 0, .05, .10, .6,
+                 0, json.dumps({"kind": "dip_reversal"}), "no future", "shadow",
+                 json.dumps([0.0] * 13)))
+            sup._db.commit()
+            counts = sup._label_ml_pending(now)
+            row = sup._db.execute("SELECT ml_label,ml_source FROM samples WHERE ts=?", (base,)).fetchone()
+            self.assertEqual(row["ml_label"], -1)
+            self.assertEqual(row["ml_source"], "no_future_data")
+            self.assertEqual(counts["neutral"], 1)
             sup.close()
 
     def test_live_bought_sample_waits_for_actual_close_and_uses_actual_pnl(self):
@@ -198,17 +306,18 @@ class SupervisorTests(unittest.TestCase):
                 (base, "SBER", 100.0, "stream", 0, 0, 0.05, 0.10, 0.6,
                  0, json.dumps({"kind": "dip_reversal", "projected_30s_pct": 0.30}),
                  "signal", "signal", json.dumps([0.0] * 13)))
-            sup._db.execute("""INSERT INTO samples(
-                ts,ticker,price,price_source,price_age,book_age,spread_pct,cost_pct,
-                stop_pct,has_position,reason,stage)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (base + 10, "SBER", 100.20, "stream", 0, 0, 0.05, 0.10,
-                 0.6, 0, "future quote", "future"))
+            for offset, price in ((10, 100.20), (150, 100.10), (295, 100.08)):
+                sup._db.execute("""INSERT INTO samples(
+                    ts,ticker,price,price_source,price_age,book_age,spread_pct,cost_pct,
+                    stop_pct,has_position,reason,stage)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (base + offset, "SBER", price, "stream", 0, 0, 0.05, 0.10,
+                     0.6, 0, "future quote", "future"))
             sup._db.commit()
             sup._label_ml_pending(now)
             row = sup._db.execute("SELECT ml_label FROM samples WHERE ts=?", (base,)).fetchone()
-            self.assertEqual(row["ml_label"], -1,
-                             "достижение cost×1.25 недостаточно, если trigger ожидал 0.30%")
+            self.assertEqual(row["ml_label"], 0,
+                             "полный горизонт без достижения projected target даёт HOLD")
             sup.close()
 
 

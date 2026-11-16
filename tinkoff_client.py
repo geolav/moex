@@ -39,6 +39,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 from xml.etree import ElementTree as ET
 
 import aiohttp
+from news_filter import news_matches_issuer
 
 # ---------------------------------------------------------------------------
 # Импорт официального SDK. Если пакет не установлен, модуль всё равно
@@ -1361,13 +1362,10 @@ class TinkoffClient:
         if self._http is None:
             return []
         instrument = self._instruments.get(ticker)
-        keywords = {ticker.lower()}
-        if instrument and instrument.get("name"):
-            first_word = instrument["name"].split()[0].lower()
-            if len(first_word) >= 4:  # отсекаем предлоги/короткие слова
-                keywords.add(first_word)
+        company_name = str((instrument or {}).get("name") or "")
 
         found: List[str] = []
+        seen = set()
         for url in self._cfg.news_rss_urls:
             if len(found) >= limit:
                 break
@@ -1375,12 +1373,19 @@ class TinkoffClient:
             if raw_bytes is None:
                 continue
             for item in self._parse_rss_items(raw_bytes):
-                text = _SPACES_RE.sub(" ", _TAG_RE.sub(" ", item)).strip()
-                lowered = text.lower()
-                if any(keyword in lowered for keyword in keywords):
-                    found.append(html.unescape(text)[:400])
+                text = html.unescape(_SPACES_RE.sub(" ", _TAG_RE.sub(" ", item))).strip()
+                if not news_matches_issuer(text, ticker, company_name):
+                    continue
+                # Одна и та же статья может прийти из нескольких RSS-лент.
+                key = text.casefold()
+                if key in seen:
+                    continue
+                seen.add(key)
+                found.append(text[:400])
                 if len(found) >= limit:
                     break
+        if not found:
+            log.debug("RSS: для %s не найдено статей с однозначным упоминанием эмитента", ticker)
         return found
 
     async def _fetch_url(self, url: str) -> Optional[bytes]:
