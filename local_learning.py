@@ -212,6 +212,11 @@ class LocalAdaptiveModel:
         self.baseline_brier = 0.25
         self.last_sample_id = 0
         self.last_fit_epoch = 0.0
+        # Качество holdout на коротком горизонте шумное. После первой
+        # успешной проверки не выключаем входы из-за одного неудачного
+        # переобучения: сохраняем последнюю проверенную модель и требуем
+        # три последовательных провала, прежде чем снять ready.
+        self.bad_validation_streak = 0
         self.not_ready_reason = "недостаточно размеченных примеров"
         self._load()
 
@@ -237,6 +242,7 @@ class LocalAdaptiveModel:
             self.baseline_brier = _finite(data.get("baseline_brier"), 0.25)
             self.last_sample_id = int(data.get("last_sample_id", 0))
             self.last_fit_epoch = _finite(data.get("last_fit_epoch"))
+            self.bad_validation_streak = max(0, int(data.get("bad_validation_streak", 0) or 0))
             self.not_ready_reason = str(data.get("not_ready_reason") or
                                         ("модель прошла проверку качества" if self.ready else
                                          "модель ещё не прошла проверку качества"))
@@ -339,12 +345,35 @@ class LocalAdaptiveModel:
         brier /= len(validation)
         baseline_brier /= len(validation)
         auc = self._auc(val_pairs)
-        self.weights = weights
-        self.bias = bias
-        self.ready = bool(auc >= self.min_auc and brier < baseline_brier)
-        self.not_ready_reason = ("модель прошла временную проверку качества" if self.ready else
-                                 f"quality gate: AUC {auc:.3f} < {self.min_auc:.3f} "
-                                 f"или Brier {brier:.4f} >= baseline {baseline_brier:.4f}")
+        quality_ok = bool(auc >= self.min_auc and brier < baseline_brier)
+        if quality_ok:
+            self.weights = weights
+            self.bias = bias
+            self.ready = True
+            self.bad_validation_streak = 0
+            self.not_ready_reason = "модель прошла временную проверку качества"
+        elif self.ready:
+            # Не заменяем последнюю валидированную модель заведомо худшей.
+            # Один-два неудачных пересчёта на шумном holdout не должны
+            # мгновенно останавливать все входы; три подряд уже отключают её.
+            self.bad_validation_streak += 1
+            if self.bad_validation_streak >= 3:
+                self.ready = False
+                self.not_ready_reason = (
+                    f"3 последовательных провала quality gate: AUC {auc:.3f} "
+                    f"(нужно >= {self.min_auc:.3f}), Brier {brier:.4f} "
+                    f"(baseline {baseline_brier:.4f})")
+            else:
+                self.not_ready_reason = (
+                    f"сохранена последняя проверенная модель; неудачная проверка "
+                    f"{self.bad_validation_streak}/3: AUC {auc:.3f}, "
+                    f"Brier {brier:.4f} / {baseline_brier:.4f}")
+        else:
+            self.bad_validation_streak += 1
+            self.not_ready_reason = (
+                f"quality gate не пройден: AUC {auc:.3f} "
+                f"(нужно >= {self.min_auc:.3f}), Brier {brier:.4f} "
+                f"(baseline {baseline_brier:.4f})")
         self.sample_count, self.positive_count, self.negative_count = n, positives, negatives
         self.validation_auc = auc
         self.validation_brier = brier
@@ -373,6 +402,7 @@ class LocalAdaptiveModel:
             "baseline_brier": self.baseline_brier,
             "last_sample_id": self.last_sample_id,
             "last_fit_epoch": self.last_fit_epoch,
+            "bad_validation_streak": self.bad_validation_streak,
             "not_ready_reason": self.not_ready_reason,
             "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
@@ -391,6 +421,7 @@ class LocalAdaptiveModel:
             "baseline_brier": self.baseline_brier,
             "last_sample_id": self.last_sample_id,
             "last_fit_epoch": self.last_fit_epoch,
+            "bad_validation_streak": self.bad_validation_streak,
             "not_ready_reason": self.not_ready_reason,
             "min_samples": self.min_samples,
             "min_auc": self.min_auc,

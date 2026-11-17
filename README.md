@@ -1,6 +1,6 @@
-# MOEX Trading Bot v1.18.6 — local-first
+# MOEX Trading Bot v1.18.7 — local-first
 
-# MOEX Trading Bot v1.18.6 (local adaptive ML + calibrated Supervisor learning)
+# MOEX Trading Bot v1.18.7 (local adaptive ML + calibrated Supervisor learning)
 
 ## Hotfix v1.17.1
 - Единый расчёт: `/positions`, автопродажа и итог ручного/автоматического закрытия считают полный круг издержек одной формулой. Быстрая автопродажа ждёт, когда оценочный net P&L станет неотрицательным.

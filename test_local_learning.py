@@ -2,6 +2,7 @@
 import random
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from local_learning import FEATURE_NAMES, LocalAdaptiveModel, features_from_candidate, features_from_quote
@@ -79,6 +80,47 @@ class LocalLearningTests(unittest.TestCase):
             }], scalp_mode=True)
             self.assertEqual(result["SBER"]["action"], "buy", result)
             self.assertEqual(result["SBER"]["size_mult"], 0.5)
+
+
+    def test_validated_model_uses_three_strike_quality_hysteresis(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            model_path = Path(tmp) / "model.json"
+            model = LocalAdaptiveModel(model_path)
+            model.min_samples = 120
+            model.min_class_samples = 30
+            rng = random.Random(41)
+            examples = []
+            for _ in range(180):
+                positive = [0.0] * len(FEATURE_NAMES)
+                positive[1] = 1.5 + rng.uniform(-0.15, 0.15)
+                positive[4] = 0.4 + rng.uniform(-0.1, 0.1)
+                examples.append((positive, 1))
+                negative = [0.0] * len(FEATURE_NAMES)
+                negative[1] = -1.5 + rng.uniform(-0.15, 0.15)
+                negative[4] = -0.4 + rng.uniform(-0.1, 0.1)
+                examples.append((negative, 0))
+            rng.shuffle(examples)
+            self.assertTrue(model.fit(examples, last_sample_id=1000)["ready"])
+            validated_weights = list(model.weights)
+
+            with patch.object(LocalAdaptiveModel, "_auc", return_value=0.50):
+                first = model.fit(examples, last_sample_id=1001)
+                self.assertTrue(first["ready"])
+                self.assertEqual(first["bad_validation_streak"], 1)
+                self.assertEqual(model.weights, validated_weights)
+
+                second = model.fit(examples, last_sample_id=1002)
+                self.assertTrue(second["ready"])
+                self.assertEqual(second["bad_validation_streak"], 2)
+                self.assertEqual(model.weights, validated_weights)
+
+                third = model.fit(examples, last_sample_id=1003)
+                self.assertFalse(third["ready"])
+                self.assertEqual(third["bad_validation_streak"], 3)
+
+            restored = LocalAdaptiveModel(model_path)
+            self.assertFalse(restored.ready)
+            self.assertEqual(restored.bad_validation_streak, 3)
 
     def test_fractional_size_multiplier_is_preserved_and_bounded(self):
         self.assertEqual(_decision_size_multiplier({"size_mult": 0.25}), 0.25)

@@ -1107,13 +1107,31 @@ class TradingEngine:
                 quote, str(row.get("trigger_kind") or "micro_impulse"))
             price = float(quote.get("price") or 0.0)
             old_price = float(row.get("price") or 0.0)
+            # Повторно подтверждаем сетап по текущему snapshot. Если он
+            # всё ещё существует, небольшой сдвиг цены сам по себе не делает
+            # кандидата протухшим: обновляем цену, признаки и экономику входа.
+            # Большой сдвиг (>0.30%) по-прежнему требует нового триггера.
             if (signal is None or price <= 0 or old_price <= 0
-                    or abs(price / old_price - 1.0) > 0.0015):
+                    or abs(price / old_price - 1.0) > 0.0030):
                 self._scalp_ai_queue.pop(ticker, None)
                 expired_rows.append(ticker)
                 continue
             row["price"] = price
             row["microstructure"] = signal
+            summary = dict(row.get("summary") or {})
+            fresh_cost = self._effective_round_trip_cost(ticker, summary)
+            row["summary"] = summary
+            row["round_trip_cost_pct"] = summary.get("round_trip_cost_pct", fresh_cost)
+            row["spread_pct"] = summary.get("spread_pct", row.get("spread_pct"))
+            row["planned_stop_pct"] = summary.get(
+                "planned_stop_pct", row.get("planned_stop_pct"))
+            potential = float(
+                signal.get("projected_30s_pct")
+                or signal.get("rebound_to_vwap_pct")
+                or signal.get("rebound_to_mean_pct") or 0.0)
+            row["breakeven_probability"] = self._breakeven_confidence(
+                float(row.get("planned_stop_pct") or 0.0),
+                potential, float(row.get("round_trip_cost_pct") or fresh_cost))
             if local_backend:
                 # Сохраняем именно тот вектор, на котором модель сейчас
                 # принимает решение; он соответствует snapshot, который увидит Supervisor.
@@ -1775,7 +1793,9 @@ class TradingEngine:
         сохраняется в summary["round_trip_cost_pct"] и участвует во всех
         проверках издержек и в расчёте безубыточной вероятности.
         """
-        base = max(0.0, float(self._cfg.estimated_round_trip_cost_pct))
+        base = max(0.0, float(getattr(
+            self._cfg, "estimated_round_trip_cost_pct",
+            getattr(self._cfg, "scalp_round_trip_cost_pct", 0.0)) or 0.0))
         slip = max(0.0, float(getattr(self._cfg, "slippage_pct", 0.0) or 0.0))
         spread_getter = getattr(self._client, "get_spread_pct", None)
         try:
