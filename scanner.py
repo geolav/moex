@@ -469,17 +469,27 @@ class MarketScanner:
         по какой цене и кратко почему. Возвращаем текст или None -
         отправкой занимается scan_once.
         """
-        # В скальпе заявки разрешены только после event-driven сигнала потока
-        # и свежего AI batch; автопокупка от 10-минутного scanner snapshot
-        # иначе обходит микроструктурный триггер и покупает запоздалую цену.
-        if self._engine_scalp():
+        # В скальпе сканер тоже может инициировать попытку входа, но НЕ
+        # отправляет ордер по своему 10-минутному snapshot. auto_buy_from_scan
+        # вызывает _process_ticker -> _evaluate_entry, где движок заново
+        # проверяет свежую цену, действующий микротриггер, стакан, spread,
+        # издержки, ML/fast-track, риск и лимиты. Если live-триггера нет,
+        # позиция не открывается; кандидат остаётся только в watchlist.
+        if not top:
+            log.info("Сканер: автопокупка пропущена - нет кандидатов для повторной проверки")
             return None
-        if not top or not _auto_buy_enabled(self._cfg, self._state):
+        if not _auto_buy_enabled(self._cfg, self._state):
+            log.info("Сканер: кандидаты найдены, но /autobuy выключен")
             return None
         method = getattr(self._engine, "auto_buy_from_scan", None)
         if method is None:   # тестовый/старый движок без автопокупки
+            log.warning("Сканер: движок не поддерживает auto_buy_from_scan")
             return None
-        candidates = [row["ticker"] for row in top]
+        candidates = [row["ticker"] for row in top if row.get("ticker")]
+        log.info("Сканер: передаю %d кандидата(ов) на повторную live-проверку автопокупки: %s",
+                 len(candidates), ", ".join(candidates) or "нет")
+        if not candidates:
+            return None
         try:
             bought = await method(candidates)
         except Exception as exc:  # noqa: BLE001 - сканер обязан пережить сбой

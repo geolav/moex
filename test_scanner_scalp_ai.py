@@ -64,6 +64,26 @@ class CapturingAnalyst:
 
 
 class ScalpScannerAIRegressionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_autobuy_is_dispatched_in_scalp_mode(self):
+        cfg = SimpleNamespace(scan_auto_buy=True)
+        state = FakeState()
+        state.scan_auto_buy = True
+        engine = FakeEngine()
+        engine.auto_buy_calls = []
+
+        async def auto_buy_from_scan(candidates):
+            engine.auto_buy_calls.append(list(candidates))
+            return []
+
+        engine.auto_buy_from_scan = auto_buy_from_scan
+        scanner = MarketScanner(cfg, state, FakeClient(), CapturingAnalyst(),
+                                engine, lambda *_: asyncio.sleep(0), None)
+        result = await scanner._maybe_auto_buy([{"ticker": "SBER"},
+                                                {"ticker": "GAZP"}])
+        self.assertIsNone(result)
+        self.assertEqual(engine.auto_buy_calls, [["SBER", "GAZP"]])
+        self.assertTrue(engine.scalp_mode())
+
     async def test_empty_strict_shortlist_still_sends_safe_fallback_to_groq(self):
         cfg = SimpleNamespace(
             scan_min_price=5.0,

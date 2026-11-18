@@ -1266,6 +1266,8 @@ class TradingEngine:
         for ticker in self.watchlist():
             if self._stop_event.is_set():
                 break
+            log.info("Автопокупка сканера: %s - начинаю полную live-проверку "
+                     "(свежий триггер/котировка/стакан/экономика/риск)", ticker)
             try:
                 await self._process_ticker(ticker)
             except asyncio.CancelledError:
@@ -1707,9 +1709,14 @@ class TradingEngine:
         Возвращает тикеры, по которым РЕАЛЬНО открылись позиции.
         """
         if not self._scan_auto_buy_enabled():
+            log.info("Автопокупка сканера отключена (/autobuy off)")
             return []
         if not getattr(self._state, "trading_enabled", True):
+            log.info("Автопокупка сканера остановлена: торговля выключена")
             return []   # автоторговля выключена - и автопокупка тоже
+        if not candidates:
+            log.info("Автопокупка сканера: нет кандидатов после AI shortlist")
+            return []
         limit = max(1, int(getattr(self._cfg, "scan_auto_buy_per_scan", 1) or 1))
         bought: List[str] = []
         for raw in candidates:
@@ -1744,8 +1751,8 @@ class TradingEngine:
             if ticker in self._state.positions:
                 bought.append(ticker)
             else:
-                log.info("Автопокупка: %s все проверки не прошёл "
-                         "(сигнал/ИИ/новости/лимиты) - только смотрю", ticker)
+                log.info("Автопокупка сканера: %s - позиция не открыта; "
+                         "смотри причину live-фильтра в событиях выше", ticker)
         return bought
 
     # ------------------------------------------------------------------- вход
@@ -2977,7 +2984,7 @@ class TradingEngine:
 
     async def _check_scalp_exit(self, ticker: str, price: float,
                                 position: Dict[str, Any]) -> None:
-        """Scalp exit: emergency ATR stop + positive-net profit taking; no age stop."""
+        """Scalp exit: risk stop, net-profit targets, session flatten and time stop."""
         entry = float(position.get("entry_price", 0) or 0)
         lots = int(position.get("lots", 0) or 0)
         if entry <= 0 or lots < 1:
@@ -3003,6 +3010,55 @@ class TradingEngine:
             self._cfg, "scalp_min_net_profit_rub", 1.0)))
         projected_net = self._scalp_projected_net_pnl(ticker, price, update)
 
+        # Скальп-позиция не переносится через границу сессии, даже если старый
+        # .env явно содержит SCALP_FORCE_FLAT_AT_SESSION_END=false.
+        entry_session = str(position.get("scalp_session_key") or "")
+        current_session = sessions.scalp_session_key()
+        if (entry_session and entry_session != "unknown" and current_session
+                and entry_session != current_session):
+            await self._sell(ticker, price, update,
+                             "скальп: закрытие предыдущей сессии", profit_pct,
+                             f"entry_session={entry_session}; current={current_session}")
+            return
+        if sessions.should_force_flatten_scalp():
+            await self._sell(ticker, price, update, "скальп: обязательное закрытие сессии",
+                             profit_pct, "защитное закрытие перед клирингом/концом сессии")
+            return
+
+        # Максимальное время удержания ограничено. Сначала даём позиции
+        # SCALP_TIME_STOP_MIN на движение хотя бы на заданную долю R; если
+        # прогресса нет — выходим. Даже при наличии прогресса абсолютный
+        # максимум удержания равен двум тайм-стопам.
+        entry_epoch = float(position.get("entry_epoch") or 0.0)
+        if entry_epoch <= 0:
+            entry_ts = str(position.get("entry_ts") or "")
+            try:
+                entry_dt = datetime.strptime(entry_ts, "%Y-%m-%d %H:%M:%S")
+                entry_epoch = entry_dt.replace(tzinfo=sessions.msk_now().tzinfo).timestamp()
+            except (TypeError, ValueError):
+                entry_epoch = 0.0
+        if entry_epoch > 0:
+            age_min = max(0.0, (time.time() - entry_epoch) / 60.0)
+            time_stop_min = max(5, int(getattr(self._cfg, "scalp_time_stop_min", 30)))
+            max_hold_min = 2 * time_stop_min
+            min_progress_r = max(0.0, float(getattr(self._cfg, "scalp_min_progress_r", 0.3)))
+            progress_required_pct = min_progress_r * risk_pct
+            max_favorable_pct = float(update.get("max_profit_pct", 0.0) or 0.0)
+            if age_min >= max_hold_min:
+                await self._sell(ticker, price, update,
+                                 "скальп: достигнут максимальный срок удержания",
+                                 profit_pct,
+                                 f"позиция открыта {age_min:.1f} мин; лимит {max_hold_min} мин")
+                return
+            if age_min >= time_stop_min and max_favorable_pct < progress_required_pct:
+                await self._sell(ticker, price, update,
+                                 "скальп: тайм-стоп без достаточного прогресса",
+                                 profit_pct,
+                                 f"за {age_min:.1f} мин максимум движения "
+                                 f"{max_favorable_pct:.3f}%, требуется "
+                                 f"{progress_required_pct:.3f}% ({min_progress_r:.2f}R)")
+                return
+
         # Стоп сначала трактуется как предупреждение. Если цена стабилизируется
         # или восстановится, позиция остаётся открытой; если после паузы цена
         # снова обновит минимум — закрываем. Слишком глубокий пробой закрывается
@@ -3024,20 +3080,6 @@ class TradingEngine:
             if price <= hard_stop_price or float(update.get(
                     "scalp_stop_breach_started_ts", 0.0) or 0.0) > 0:
                 return
-
-        # Закрытие на сессионной границе по умолчанию отключено: позиции могут
-        # пережить перерыв/ночь. При желании владелец может явно включить его ENV.
-        force_flat = bool(getattr(self._cfg, "scalp_force_flat_at_session_end", False))
-        entry_session = str(position.get("scalp_session_key") or "")
-        current_session = sessions.scalp_session_key()
-        if force_flat and entry_session and entry_session != "unknown" and current_session and entry_session != current_session:
-            await self._sell(ticker, price, update, "скальп: закрытие предыдущей сессии",
-                             profit_pct, f"entry_session={entry_session}; current={current_session}")
-            return
-        if force_flat and sessions.should_force_flatten_scalp():
-            await self._sell(ticker, price, update, "скальп: закрытие сессии",
-                             profit_pct, "включено SCALP_FORCE_FLAT_AT_SESSION_END=true")
-            return
 
         monitor_now = time.monotonic()
         monitor_every = max(5.0, float(getattr(self._cfg, "scalp_exit_poll_sec", 10)))
@@ -3112,9 +3154,7 @@ class TradingEngine:
                                  lots_to_sell=partial_lots, partial=True)
                 return
 
-        # Никакого автоматического выхода из-за возраста позиции: 30/45/60 минут
-        # и более не являются причиной продажи. Позиция держится до ценового
-        # защитного стопа либо до прибыльного выхода; ручное закрытие остаётся доступным.
+        # Временные ограничения проверены выше, до стопов и обычных тейков.
 
     async def _position_summary(self, ticker: str, price: float
                                 ) -> Tuple[List[Tuple[float, float]], Dict[str, Any]]:
@@ -3268,6 +3308,48 @@ class TradingEngine:
         await self._safe_notify(friendly)
 
     # --------------------------------------------------------- ручные сделки
+    def _scalp_manual_risk_plan(self, ticker: str) -> Dict[str, float]:
+        """Единый стоп и оценка полного круга издержек для ручного scalp-входа.
+
+        Эту функцию используют и расчёт объёма, и сохранение позиции, поэтому
+        фактический стоп больше не может отличаться от стопа, заложенного в риск.
+        При недоступном ATR используем явно настроенный фиксированный стоп.
+        """
+        atr_pct = 0.0
+        atr_getter = getattr(self._client, "get_atr_pct", None)
+        if callable(atr_getter):
+            try:
+                value = atr_getter(ticker, 14)
+                if value is not None and math.isfinite(float(value)) and float(value) > 0:
+                    atr_pct = float(value)
+            except (TypeError, ValueError, RuntimeError):
+                atr_pct = 0.0
+
+        spread_pct = 0.0
+        spread_getter = getattr(self._client, "get_spread_pct", None)
+        if callable(spread_getter):
+            try:
+                value = spread_getter(ticker)
+                if value is not None and math.isfinite(float(value)) and float(value) > 0:
+                    spread_pct = float(value)
+            except (TypeError, ValueError, RuntimeError):
+                spread_pct = 0.0
+
+        if atr_pct > 0:
+            raw_stop = float(self._cfg.scalp_atr_multiplier) * atr_pct
+            stop_source = 1.0
+        else:
+            raw_stop = float(self._cfg.scalp_stop_loss_pct)
+            stop_source = 0.0
+        stop_pct = min(float(self._cfg.scalp_max_stop_pct),
+                       max(float(self._cfg.scalp_min_stop_pct), raw_stop))
+        cost_pct = (max(0.0, float(self._cfg.scalp_round_trip_cost_pct))
+                    + max(0.0, float(getattr(self._cfg, "slippage_pct", 0.0) or 0.0))
+                    + spread_pct)
+        return {"atr_pct": atr_pct, "spread_pct": spread_pct,
+                "stop_pct": stop_pct, "cost_pct": cost_pct,
+                "stop_from_atr": stop_source}
+
     async def smart_buy_units(self, ticker: str) -> Tuple[int, str]:
         """Логичный объём покупки по кнопке сканера и /buy ТИКЕР без числа (v1.9.0).
 
@@ -3304,29 +3386,26 @@ class TradingEngine:
         budget = min(cash, max(room, 0.0))
         reasons: List[str] = []
         if self.scalp_mode():
-            atr_getter = getattr(self._client, "get_atr_pct", None)
-            atr_pct = atr_getter(ticker, 14) if callable(atr_getter) else None
-            if atr_pct and atr_pct > 0:
-                stop_pct = min(self._cfg.scalp_max_stop_pct,
-                               max(self._cfg.scalp_min_stop_pct,
-                                   self._cfg.scalp_atr_multiplier * float(atr_pct)))
-                open_risk = self._open_scalp_risk_pct(total_money)
-                remaining = max(0.0, self._cfg.scalp_max_portfolio_risk_pct - open_risk)
-                risk_pct = min(self._cfg.scalp_risk_per_trade_pct, remaining)
-                if risk_pct <= 0:
-                    return 0, (f"❌ {ticker}: лимит суммарного риска скальпа "
-                               f"{self._cfg.scalp_max_portfolio_risk_pct:.2f}% уже "
-                               f"выбран ({open_risk:.2f}%).")
-                risk_sized = total_money * risk_pct / 100.0 / (stop_pct / 100.0)
-                budget = min(budget, risk_sized,
-                             total_money * self._cfg.scalp_max_position_pct / 100.0)
-                reasons.append(
-                    f"риск на сделку {risk_pct:.2f}% equity при стопе "
-                    f"{stop_pct:.2f}% -> номинал до {_fmt_rub(risk_sized)} ₽")
-            else:
-                budget = min(budget, cash * self._cfg.max_position_pct / 100.0)
-                reasons.append(f"лимит на сделку {self._cfg.max_position_pct:.0f}% "
-                               f"свободных (ATR недоступен)")
+            plan = self._scalp_manual_risk_plan(ticker)
+            stop_pct = plan["stop_pct"]
+            cost_pct = plan["cost_pct"]
+            open_risk = self._open_scalp_risk_pct(total_money)
+            remaining = max(0.0, self._cfg.scalp_max_portfolio_risk_pct - open_risk)
+            risk_pct = min(self._cfg.scalp_risk_per_trade_pct, remaining)
+            if risk_pct <= 0:
+                return 0, (f"❌ {ticker}: лимит суммарного риска скальпа "
+                           f"{self._cfg.scalp_max_portfolio_risk_pct:.2f}% уже "
+                           f"выбран ({open_risk:.2f}%).")
+            # В бюджет риска входят и ход до стопа, и полные круговые издержки.
+            risk_sized = total_money * risk_pct / (stop_pct + cost_pct)
+            budget = min(budget, risk_sized,
+                         total_money * self._cfg.scalp_max_position_pct / 100.0)
+            atr_note = (f"ATR {plan['atr_pct']:.3f}%" if plan["stop_from_atr"]
+                        else "ATR недоступен, фиксированный стоп")
+            reasons.append(
+                f"риск {risk_pct:.3f}% equity, стоп {stop_pct:.3f}% "
+                f"({atr_note}), круговые издержки {cost_pct:.3f}% "
+                f"-> номинал до {_fmt_rub(risk_sized)} ₽")
         else:
             budget = min(budget, cash * self._cfg.max_position_pct / 100.0)
             reasons.append(f"лимит на сделку {self._cfg.max_position_pct:.0f}% "
@@ -3431,24 +3510,16 @@ class TradingEngine:
                 "source": "manual",
             }
             if self.scalp_mode():
-                # v1.14.0: ручная покупка в скальпе сопровождается РОВНО так
-                # же, как покупки бота: быстрый тейк «издержки+маржа» на каждом
-                # тике, жёсткий стоп, ценовые стопы; возраст позиции не запускает выход. Цену
-                # пингуем каждые SCALP_EXIT_POLL_SEC (5-10 сек) или на каждом
-                # тике потока.
-                spread_getter = getattr(self._client, "get_spread_pct", None)
-                spread_val = (spread_getter(ticker)
-                              if callable(spread_getter) else None)
-                expected_cost = (self._cfg.scalp_round_trip_cost_pct
-                                 + max(0.0, float(getattr(self._cfg, "slippage_pct", 0.0) or 0.0))
-                                 + (float(spread_val) if spread_val else 0.0))
-                risk_pct = min(self._cfg.scalp_max_stop_pct,
-                               max(self._cfg.scalp_min_stop_pct,
-                                   float(self._cfg.scalp_stop_loss_pct)))
+                # Тот же план, что использовал smart_buy_units: один стоп
+                # для расчёта объёма, ограничения портфельного риска и сопровождения.
+                risk_plan = self._scalp_manual_risk_plan(ticker)
+                risk_pct = float(risk_plan["stop_pct"])
+                expected_cost = float(risk_plan["cost_pct"])
                 pos_data.update({
                     "scalp_managed": True,
                     "scalp_session_key": sessions.scalp_session_key() or "unknown",
                     "scalp_risk_pct": risk_pct,
+                    "scalp_atr_pct": float(risk_plan["atr_pct"]),
                     "scalp_round_trip_cost_pct": float(self._cfg.scalp_round_trip_cost_pct),
                     "scalp_expected_round_trip_cost_pct": round(expected_cost, 4),
                     "stop_price": round(price * (1.0 - risk_pct / 100.0), 4),
@@ -3483,10 +3554,14 @@ class TradingEngine:
                     f"• Автопродажа: закрываю при net P&L не менее "
                     f"+{getattr(self._cfg, 'scalp_min_net_profit_rub', 1.0):.2f} ₽ "
                     f"после полного круга оценочных издержек.\n"
-                    f"• Жёсткий стоп: {scalp_stop:.2f} ₽ "
-                    f"(−{float(pos_data.get('scalp_risk_pct') or 0):.2f}%).\n"
-                    "• Максимального времени удержания нет; позиция может пережить "
-                    "сессионный перерыв/ночь. Защитный ATR-стоп остаётся активным.")
+                    f"• Защитный стоп: {scalp_stop:.2f} ₽ "
+                    f"(−{float(pos_data.get('scalp_risk_pct') or 0):.3f}%).\n"
+                    f"• Оценка полного круга издержек: "
+                    f"{float(pos_data.get('scalp_expected_round_trip_cost_pct') or 0):.3f}%.\n"
+                    f"• Тайм-стоп: {max(5, int(self._cfg.scalp_time_stop_min))} мин "
+                    f"без прогресса; максимум удержания — "
+                    f"{2 * max(5, int(self._cfg.scalp_time_stop_min))} мин. "
+                    "Закрытие перед окончанием сессии обязательно.")
         stop_price = price * (1.0 - self._cfg.stop_loss_pct / 100.0)
         return (f"✅ РУЧНАЯ ПОКУПКА {ticker}: {lots} лот(а) = {shares} шт "
                 f"по ~{price:.2f} ₽ (≈{_fmt_rub(cost)} ₽).\n"

@@ -246,7 +246,7 @@ class BotConfig:
     scalp_stop_emergency_extra_pct: float
     scalp_quick_tp_margin_pct: float  # legacy: запас сверху издержек, п.п.
     scalp_min_net_profit_rub: float  # минимум ожидаемой чистой прибыли для обычной фиксации
-    scalp_force_flat_at_session_end: bool  # аварийное закрытие перед клирингом, по умолчанию выкл
+    scalp_force_flat_at_session_end: bool  # legacy: скальп всегда закрывается перед границей сессии
     # --- Режим рынка и локальный микро-детектор (v1.13.0) ---------------------
     market_breadth_riskoff_pct: float
     # ниже этого breadth новые лонги запрещены (раньше был жёсткий 35%)
@@ -490,7 +490,7 @@ def load_config() -> BotConfig:
         scalp_min_net_profit_rub=_env_float("SCALP_MIN_NET_PROFIT_RUB", 1.0,
                                             low=0.0, high=10000.0),
         scalp_force_flat_at_session_end=_env_bool(
-            "SCALP_FORCE_FLAT_AT_SESSION_END", False),
+            "SCALP_FORCE_FLAT_AT_SESSION_END", True),
         # v1.13.0: настраиваемый порог risk-off и пороги локального
         # микро-детектора (см. scalp_microstructure.py). Порог 30% вместо
         # прежнего жёсткого 35%: между 30% и 55% входы разрешены с половинным

@@ -26,42 +26,79 @@ class SellClient(FakeStreamClient):
 
 
 class ScalpHoldProfitPolicyTests(unittest.IsolatedAsyncioTestCase):
-    async def test_120_minutes_is_not_a_sell_reason_and_one_ruble_net_is(self):
+    async def test_time_stop_closes_stale_trade_and_absolute_limit_closes_progressed_trade(self):
         with tempfile.TemporaryDirectory() as tmp:
             state = StateStore(str(Path(tmp) / "state.json"),
                                initial_overrides={"trading_enabled": True})
             state.set_scalp_mode(True)
             cfg = make_config(tmp)
-            cfg.scalp_quick_tp_enabled = True
+            cfg.scalp_quick_tp_enabled = False
             cfg.scalp_min_net_profit_rub = 1.0
             cfg.scalp_force_flat_at_session_end = False
+            cfg.scalp_time_stop_min = 30
+            cfg.scalp_min_progress_r = 0.3
             cfg.scalp_round_trip_cost_pct = 0.15
             cfg.scalp_min_stop_pct = 0.6
             cfg.scalp_max_stop_pct = 1.0
             cfg.scalp_stop_loss_pct = 0.8
-            cfg.scalp_quick_tp_margin_pct = 0.0
             cfg.learning_enabled = False
-            engine = TradingEngine(cfg, state, SellClient(), None, notify)
-            pos = {
+            client = SellClient()
+            engine = TradingEngine(cfg, state, client, None, notify)
+
+            stale = {
                 "lots": 1, "initial_lots": 1, "entry_price": 100.0,
-                "entry_epoch": time.time() - 120 * 60,
-                "entry_ts": "2026-11-11 12:00:00",
+                "entry_epoch": time.time() - 35 * 60,
                 "scalp_managed": True, "scalp_risk_pct": 0.8,
-                "scalp_round_trip_cost_pct": 0.15,
                 "scalp_expected_round_trip_cost_pct": 0.15,
+                "max_profit_pct": 0.05,
                 "stop_price": 99.2, "tp1_done": False,
-                "scalp_session_key": "unknown", "llm_confidence": 0.5,
+                "scalp_session_key": "unknown",
             }
-            state.set_position("SBER", pos)
-
-            await engine._check_scalp_exit("SBER", 100.30, dict(pos))
-            self.assertIn("SBER", state.positions)
-            self.assertEqual(engine._client.sells, [])
-
-            # Gross +1.16 RUB, estimated cost 0.15 RUB => net +1.01 RUB.
-            await engine._check_scalp_exit("SBER", 101.16, dict(pos))
+            state.set_position("SBER", stale)
+            with patch("trading_engine.sessions.should_force_flatten_scalp", return_value=False):
+                await engine._check_scalp_exit("SBER", 100.10, dict(stale))
             self.assertNotIn("SBER", state.positions)
-            self.assertEqual(len(engine._client.sells), 1)
+            self.assertEqual(len(client.sells), 1)
+
+            progressed = {
+                "lots": 1, "initial_lots": 1, "entry_price": 100.0,
+                "entry_epoch": time.time() - 61 * 60,
+                "scalp_managed": True, "scalp_risk_pct": 0.8,
+                "scalp_expected_round_trip_cost_pct": 0.15,
+                "max_profit_pct": 0.40,
+                "stop_price": 99.2, "tp1_done": False,
+                "scalp_session_key": "unknown",
+            }
+            state.set_position("GAZP", progressed)
+            with patch("trading_engine.sessions.should_force_flatten_scalp", return_value=False):
+                await engine._check_scalp_exit("GAZP", 100.10, dict(progressed))
+            self.assertNotIn("GAZP", state.positions)
+            self.assertEqual(len(client.sells), 2)
+
+    async def test_manual_scalp_risk_plan_is_shared_and_includes_round_trip_costs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = StateStore(str(Path(tmp) / "state.json"),
+                               initial_overrides={"trading_enabled": True})
+            state.set_scalp_mode(True)
+            cfg = make_config(tmp)
+            cfg.scalp_stop_loss_pct = 0.8
+            cfg.scalp_min_stop_pct = 0.6
+            cfg.scalp_max_stop_pct = 1.0
+            cfg.scalp_atr_multiplier = 1.2
+            cfg.scalp_round_trip_cost_pct = 0.10
+            cfg.slippage_pct = 0.02
+
+            class RiskClient(SellClient):
+                def get_atr_pct(self, ticker, period=14):
+                    return 0.30
+                def get_spread_pct(self, ticker):
+                    return 0.05
+
+            engine = TradingEngine(cfg, state, RiskClient(), None, notify)
+            plan = engine._scalp_manual_risk_plan("SBER")
+            self.assertAlmostEqual(plan["stop_pct"], 0.60)
+            self.assertAlmostEqual(plan["cost_pct"], 0.17)
+            self.assertAlmostEqual(plan["atr_pct"], 0.30)
 
     async def test_small_positive_net_does_not_trigger_quick_sell_by_default(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -226,7 +263,7 @@ class ScalpHoldProfitPolicyTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(client.sells), 1)
             self.assertNotIn("GAZP", state.positions)
 
-    async def test_session_boundary_does_not_force_flat_by_default(self):
+    async def test_session_boundary_forces_flat_even_if_legacy_flag_is_false(self):
         with tempfile.TemporaryDirectory() as tmp:
             state = StateStore(str(Path(tmp) / "state.json"),
                                initial_overrides={"trading_enabled": True})
@@ -254,8 +291,8 @@ class ScalpHoldProfitPolicyTests(unittest.IsolatedAsyncioTestCase):
             with patch("trading_engine.sessions.scalp_session_key", return_value="new-session"), \
                  patch("trading_engine.sessions.should_force_flatten_scalp", return_value=True):
                 await engine._check_scalp_exit("SBER", 100.20, dict(pos))
-            self.assertIn("SBER", state.positions)
-            self.assertEqual(client.sells, [])
+            self.assertNotIn("SBER", state.positions)
+            self.assertEqual(len(client.sells), 1)
 
 
 if __name__ == "__main__":

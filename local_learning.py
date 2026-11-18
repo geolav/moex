@@ -217,6 +217,9 @@ class LocalAdaptiveModel:
         # переобучения: сохраняем последнюю проверенную модель и требуем
         # три последовательных провала, прежде чем снять ready.
         self.bad_validation_streak = 0
+        self.last_good_validation_epoch = 0.0
+        self.max_model_stale_hours = min(168.0, max(
+            1.0, _finite(os.getenv("LOCAL_MODEL_MAX_STALE_HOURS", "24"), 24.0)))
         self.not_ready_reason = "недостаточно размеченных примеров"
         self._load()
 
@@ -246,6 +249,37 @@ class LocalAdaptiveModel:
             self.not_ready_reason = str(data.get("not_ready_reason") or
                                         ("модель прошла проверку качества" if self.ready else
                                          "модель ещё не прошла проверку качества"))
+            stored_last_good = _finite(data.get("last_good_validation_epoch"), 0.0)
+            self.last_good_validation_epoch = stored_last_good
+            if self.last_good_validation_epoch <= 0 and self.ready:
+                self.last_good_validation_epoch = self.last_fit_epoch
+
+            # Миграция состояния v1.18.7: там holdout с <10 положительными
+            # примерами немедленно снимал ready, хотя веса и метрики прошлой
+            # успешной проверки оставались на диске. Восстанавливаем только
+            # такой INCONCLUSIVE-случай, если прежние метрики действительно
+            # проходили gate и модель ещё не устарела. Реальный провал gate
+            # таким способом никогда не реабилитируется.
+            inconclusive_reason = "недостаточно обоих классов во временной проверке" in self.not_ready_reason
+            # В старом файле timestamp успешной проверки отсутствовал.
+            # Если последние сохранённые метрики всё ещё проходят оба gate,
+            # используем last_fit_epoch как консервативную дату старого holdout.
+            if (self.last_good_validation_epoch <= 0 and inconclusive_reason
+                    and self.validation_auc >= self.min_auc
+                    and self.validation_brier < self.baseline_brier):
+                self.last_good_validation_epoch = self.last_fit_epoch
+            old_metrics_valid = (
+                self.validation_auc >= self.min_auc
+                and self.validation_brier < self.baseline_brier
+                and self.bad_validation_streak < 3
+                and self.last_good_validation_epoch > 0
+                and time.time() - self.last_good_validation_epoch
+                    <= self.max_model_stale_hours * 3600.0)
+            if not self.ready and inconclusive_reason and old_metrics_valid:
+                self.ready = True
+                self.not_ready_reason = (
+                    "восстановлена последняя проверенная модель: предыдущий holdout "
+                    "содержал недостаточно примеров одного класса")
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             return
 
@@ -282,19 +316,38 @@ class LocalAdaptiveModel:
         n = len(data)
         positives = sum(y for _, y in data)
         negatives = n - positives
-        if n < self.min_samples or positives < self.min_class_samples or negatives < self.min_class_samples:
-            self.ready = False
-            if n < self.min_samples:
-                self.not_ready_reason = f"нужно ещё {self.min_samples - n} размеченных примеров"
-            elif positives < self.min_class_samples:
-                self.not_ready_reason = f"нужно ещё {self.min_class_samples - positives} target-примеров"
-            else:
-                self.not_ready_reason = f"нужно ещё {self.min_class_samples - negatives} HOLD-примеров"
+
+        def inconclusive(reason: str) -> Dict[str, Any]:
+            """Record missing validation evidence without poisoning a good model."""
             self.sample_count, self.positive_count, self.negative_count = n, positives, negatives
             self.last_sample_id = max(self.last_sample_id, int(last_sample_id))
-            self.last_fit_epoch = time.time()
+            now = time.time()
+            self.last_fit_epoch = now
+            if self.ready:
+                last_good = self.last_good_validation_epoch or now
+                age_hours = max(0.0, now - last_good) / 3600.0
+                if age_hours <= self.max_model_stale_hours:
+                    self.not_ready_reason = (
+                        f"переоценка неубедительна ({reason}); сохранена последняя "
+                        f"проверенная модель, её возраст {age_hours:.1f} ч")
+                else:
+                    self.ready = False
+                    self.not_ready_reason = (
+                        f"модель отключена: последняя успешная проверка устарела "
+                        f"({age_hours:.1f} ч); новая проверка неубедительна: {reason}")
+            else:
+                self.not_ready_reason = reason
             self._save()
             return self.status()
+
+        if n < self.min_samples or positives < self.min_class_samples or negatives < self.min_class_samples:
+            if n < self.min_samples:
+                reason = f"нужно ещё {self.min_samples - n} размеченных примеров"
+            elif positives < self.min_class_samples:
+                reason = f"нужно ещё {self.min_class_samples - positives} target-примеров"
+            else:
+                reason = f"нужно ещё {self.min_class_samples - negatives} HOLD-примеров"
+            return inconclusive(reason)
 
         split = max(int(n * 0.80), 1)
         train, validation = data[:split], data[split:]
@@ -304,14 +357,9 @@ class LocalAdaptiveModel:
         val_neg = len(validation) - val_pos
         if (train_pos < self.min_class_samples // 2 or train_neg < self.min_class_samples // 2
                 or val_pos < 10 or val_neg < 10):
-            self.ready = False
-            self.not_ready_reason = (f"недостаточно обоих классов во временной проверке "
-                                     f"(holdout target={val_pos}, HOLD={val_neg}; нужно >=10 каждого)")
-            self.sample_count, self.positive_count, self.negative_count = n, positives, negatives
-            self.last_sample_id = max(self.last_sample_id, int(last_sample_id))
-            self.last_fit_epoch = time.time()
-            self._save()
-            return self.status()
+            reason = (f"недостаточно обоих классов во временной проверке "
+                      f"(holdout target={val_pos}, HOLD={val_neg}; нужно >=10 каждого)")
+            return inconclusive(reason)
 
         weights = [0.0] * len(FEATURE_NAMES)
         bias = math.log((train_pos + 1.0) / (train_neg + 1.0))
@@ -351,6 +399,7 @@ class LocalAdaptiveModel:
             self.bias = bias
             self.ready = True
             self.bad_validation_streak = 0
+            self.last_good_validation_epoch = time.time()
             self.not_ready_reason = "модель прошла временную проверку качества"
         elif self.ready:
             # Не заменяем последнюю валидированную модель заведомо худшей.
@@ -403,6 +452,7 @@ class LocalAdaptiveModel:
             "last_sample_id": self.last_sample_id,
             "last_fit_epoch": self.last_fit_epoch,
             "bad_validation_streak": self.bad_validation_streak,
+            "last_good_validation_epoch": self.last_good_validation_epoch,
             "not_ready_reason": self.not_ready_reason,
             "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
@@ -422,6 +472,7 @@ class LocalAdaptiveModel:
             "last_sample_id": self.last_sample_id,
             "last_fit_epoch": self.last_fit_epoch,
             "bad_validation_streak": self.bad_validation_streak,
+            "last_good_validation_epoch": self.last_good_validation_epoch,
             "not_ready_reason": self.not_ready_reason,
             "min_samples": self.min_samples,
             "min_auc": self.min_auc,

@@ -1,5 +1,7 @@
 """Tests for the offline adaptive scalp decision model."""
 import random
+import json
+import time
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -121,6 +123,62 @@ class LocalLearningTests(unittest.TestCase):
             restored = LocalAdaptiveModel(model_path)
             self.assertFalse(restored.ready)
             self.assertEqual(restored.bad_validation_streak, 3)
+
+    def test_inconclusive_holdout_preserves_last_validated_model(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            model = LocalAdaptiveModel(Path(tmp) / "model.json")
+            model.min_samples = 120
+            model.min_class_samples = 30
+            rng = random.Random(41)
+            examples = []
+            for _ in range(180):
+                positive = [0.0] * len(FEATURE_NAMES)
+                positive[1] = 1.5 + rng.uniform(-0.15, 0.15)
+                positive[4] = 0.4 + rng.uniform(-0.1, 0.1)
+                examples.append((positive, 1))
+                negative = [0.0] * len(FEATURE_NAMES)
+                negative[1] = -1.5 + rng.uniform(-0.15, 0.15)
+                negative[4] = -0.4 + rng.uniform(-0.1, 0.1)
+                examples.append((negative, 0))
+            rng.shuffle(examples)
+            self.assertTrue(model.fit(examples, last_sample_id=1000)["ready"])
+            weights = list(model.weights)
+            streak = model.bad_validation_streak
+
+            # 80% train has enough classes, while chronological holdout has
+            # only negatives. This is missing evidence, not a measured failure.
+            inconclusive = []
+            inconclusive.extend(([1.0] * len(FEATURE_NAMES), 1) for _ in range(40))
+            inconclusive.extend(([-1.0] * len(FEATURE_NAMES), 0) for _ in range(160))
+            status = model.fit(inconclusive, last_sample_id=1001)
+            self.assertTrue(status["ready"], status)
+            self.assertEqual(model.weights, weights)
+            self.assertEqual(status["bad_validation_streak"], streak)
+
+    def test_legacy_v1187_inconclusive_state_recovers_recent_good_weights(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "model.json"
+            payload = {
+                "version": LocalAdaptiveModel.VERSION,
+                "feature_names": list(FEATURE_NAMES),
+                "weights": [0.0] * len(FEATURE_NAMES),
+                "bias": -1.0,
+                "ready": False,
+                "sample_count": 1000,
+                "positive_count": 80,
+                "negative_count": 920,
+                "validation_auc": 0.61,
+                "validation_brier": 0.06,
+                "baseline_brier": 0.07,
+                "last_sample_id": 1000,
+                "last_fit_epoch": time.time(),
+                "bad_validation_streak": 0,
+                "not_ready_reason": "недостаточно обоих классов во временной проверке (holdout target=3, HOLD=197; нужно >=10 каждого)",
+            }
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            restored = LocalAdaptiveModel(path)
+            self.assertTrue(restored.ready)
+            self.assertGreater(restored.last_good_validation_epoch, 0)
 
     def test_fractional_size_multiplier_is_preserved_and_bounded(self):
         self.assertEqual(_decision_size_multiplier({"size_mult": 0.25}), 0.25)
