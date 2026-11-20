@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import math
 import platform
@@ -16,6 +17,16 @@ import pandas as pd
 from . import CLASS_NAMES, FEATURE_NAMES, HORIZONS_MINUTES, __version__
 from .data import build_dataset, chronological_split, load_candles
 from .models import standardize_sequences, train_neural, train_sklearn_baselines
+
+
+def _release_memory() -> None:
+    """Ask Python and glibc to release temporary training buffers."""
+    gc.collect()
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
 
 
 def _json_default(value: Any):
@@ -88,7 +99,7 @@ def main() -> int:
     parser.add_argument("--sample-stride", type=int, default=3)
     parser.add_argument("--event-horizon-seconds", type=int, default=300)
     parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch-size", type=int, default=512)
+    parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--patience", type=int, default=3)
     parser.add_argument("--models", default="logistic,hgb,mlp,gru",
                         help="любая комбинация logistic,hgb,mlp,gru")
@@ -121,8 +132,16 @@ def main() -> int:
         event_horizon_seconds=args.event_horizon_seconds,
         main_session_only=not args.include_evening,
     )
+    n_candles = int(len(candles))
+    n_tickers = int(candles.ticker.nunique())
+    n_trading_days = int(candles.trade_day.nunique())
     print(f"      samples={len(dataset.x):,}; shape={dataset.x.shape}; "
           f"Supervisor events added={dataset.event_rows_used}")
+
+    # The normalized candle DataFrame is no longer needed once X/Y are built.
+    # Release it before standardization/model fitting to leave RAM for training.
+    del candles
+    _release_memory()
 
     print("[3/6] Разделяю данные по торговым датам (70/15/15), без перемешивания...")
     train_idx, val_idx, test_idx, split_dates = chronological_split(dataset.days)
@@ -140,10 +159,10 @@ def main() -> int:
             "platform": platform.platform(),
             "input_files": args.csv,
             "sqlite_path": args.sqlite,
-            "n_candles": int(len(candles)),
+            "n_candles": n_candles,
             "n_samples": int(len(dataset.x)),
-            "n_tickers": int(candles.ticker.nunique()),
-            "n_trading_days": int(candles.trade_day.nunique()),
+            "n_tickers": n_tickers,
+            "n_trading_days": n_trading_days,
             "supervisor_event_rows_added": int(dataset.event_rows_used),
             "sequence_length": args.sequence_length,
             "sample_stride": args.sample_stride,
@@ -182,6 +201,10 @@ def main() -> int:
                 joblib.dump(comparison_models, output / "comparison_models.joblib", compress=3)
             except Exception as exc:
                 print(f"      Не удалось сохранить sklearn-модели: {exc}", file=sys.stderr)
+        # Baseline estimators are already persisted; do not keep all 14 models
+        # resident while PyTorch is imported and neural training begins.
+        del baseline_models, comparison_models
+        _release_memory()
 
     print("[5/6] Обучаю нейросети (MLP и GRU)...")
     neural_reports = {}
@@ -215,6 +238,8 @@ def main() -> int:
             print(f"      {kind}: {neural_report['epochs_completed']} эпох, "
                   f"лучшая эпоха={neural_report['best_epoch']}, "
                   f"val_loss={neural_report['best_validation_loss']:.5f}")
+            del model
+            _release_memory()
         except ImportError:
             report["models"][kind] = {"status": "skipped", "reason": "PyTorch не установлен"}
             print("      PyTorch не установлен; установите requirements_market_ai.txt", file=sys.stderr)
@@ -237,9 +262,9 @@ def main() -> int:
     )
     with (output / "REPORT_RU.md").open("w", encoding="utf-8") as f:
         f.write("# Отчёт обучения MOEX Market AI\n\n")
-        f.write(f"- Объём свечей: **{len(candles):,}**\n")
+        f.write(f"- Объём свечей: **{n_candles:,}**\n")
         f.write(f"- Обучающих последовательностей: **{len(dataset.x):,}**\n")
-        f.write(f"- Тикеров: **{candles.ticker.nunique()}**; торговых дней: **{candles.trade_day.nunique()}**\n")
+        f.write(f"- Тикеров: **{n_tickers}**; торговых дней: **{n_trading_days}**\n")
         f.write(f"- Supervisor событий добавлено: **{dataset.event_rows_used}**\n")
         f.write(f"- Полные издержки в целевой разметке: **{args.round_trip_cost_pct:.3f}%**\n\n")
         f.write("## Временное разбиение\n\n")

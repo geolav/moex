@@ -215,6 +215,12 @@ def build_dataset(
     event_max_age_seconds: int = 120,
     main_session_only: bool = True,
 ) -> MarketDataset:
+    """Build a multi-horizon dataset with a single preallocated feature array.
+
+    The previous implementation kept every sequence as a separate NumPy object
+    and then called np.stack(), temporarily holding two complete copies of X.
+    Preallocation avoids that peak-memory spike on small servers.
+    """
     if sequence_length < 10:
         raise ValueError("sequence_length должен быть не меньше 10")
     if sample_stride < 1:
@@ -226,33 +232,11 @@ def build_dataset(
 
     horizons = tuple(HORIZONS_MINUTES)
     h_to_col = {h: i for i, h in enumerate(horizons)}
-    xs: list[np.ndarray] = []
-    ys: list[np.ndarray] = []
-    masks: list[np.ndarray] = []
-    rets: list[np.ndarray] = []
-    weights: list[np.ndarray] = []
-    tickers: list[str] = []
-    timestamps: list[str] = []
-    days: list[str] = []
-    sources: list[str] = []
 
-    # Индексы групп нужны, чтобы контрфактические ямы можно было привязать
-    # к последовательности свечей, существовавшей на момент события.
-    groups: dict[tuple[str, str], tuple[pd.DataFrame, np.ndarray, np.ndarray]] = {}
-
-    def append_sample(seq: np.ndarray, y: np.ndarray, mask: np.ndarray, ret: np.ndarray,
-                      sample_weights: np.ndarray, ticker: str, ts: str, day: str,
-                      source: str) -> None:
-        xs.append(seq.astype(np.float32, copy=False))
-        ys.append(y.astype(np.int64, copy=False))
-        masks.append(mask.astype(bool, copy=False))
-        rets.append(ret.astype(np.float32, copy=False))
-        weights.append(sample_weights.astype(np.float32, copy=False))
-        tickers.append(ticker)
-        timestamps.append(ts)
-        days.append(day)
-        sources.append(source)
-
+    # Keep only the compact arrays needed for candle and Supervisor examples;
+    # do not retain one pandas DataFrame per ticker/day.
+    groups: dict[tuple[str, str], tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
+    candle_capacity = 0
     for (ticker, day), raw_group in candles.groupby(["ticker", "trade_day"], sort=True):
         group = raw_group.sort_values("begin").reset_index(drop=True)
         if main_session_only:
@@ -262,39 +246,14 @@ def build_dataset(
             continue
         features = _features_for_group(group)
         close = group["close"].to_numpy(dtype=np.float64)
+        begins = group["begin"].to_numpy(dtype="datetime64[ns]")
         ts_sec = (pd.DatetimeIndex(pd.to_datetime(group["begin"]))
                   .tz_localize(MOSCOW).asi8 // 1_000_000_000).astype(np.int64)
-        n = len(group)
-        for idx in range(sequence_length - 1, n, sample_stride):
-            seq = features[idx - sequence_length + 1:idx + 1]
-            label_arr = np.ones(len(horizons), dtype=np.int64)
-            mask_arr = np.zeros(len(horizons), dtype=bool)
-            ret_arr = np.full(len(horizons), np.nan, dtype=np.float32)
-            weight_arr = np.ones(len(horizons), dtype=np.float32)
-            for col, horizon in enumerate(horizons):
-                future_idx = idx + horizon
-                if future_idx >= n:
-                    weight_arr[col] = 0.0
-                    continue
-                elapsed = ts_sec[future_idx] - ts_sec[idx]
-                # Горизонт задаётся числом минутных свечей. Слишком большой
-                # разрыв означает отсутствие наблюдений, а не подтверждённый HOLD.
-                max_elapsed = horizon * 60.0 * 1.8 + 60.0
-                if elapsed <= 0 or elapsed > max_elapsed:
-                    weight_arr[col] = 0.0
-                    continue
-                gross = (close[future_idx] / close[idx] - 1.0) * 100.0
-                ret_arr[col] = gross
-                label_arr[col] = _classify(gross, round_trip_cost_pct)
-                mask_arr[col] = True
-            if mask_arr.any():
-                begin_str = pd.Timestamp(group.loc[idx, "begin"]).isoformat(sep=" ")
-                append_sample(seq, label_arr, mask_arr, ret_arr, weight_arr,
-                              str(ticker), begin_str, str(day), "candle")
-        groups[(str(ticker), str(day))] = (group, features, ts_sec)
+        groups[(str(ticker), str(day))] = (begins, close, features, ts_sec)
+        candle_capacity += len(range(sequence_length - 1, len(group), sample_stride))
 
-    # Supervisor examples: event-trigger / shadow snapshots, matched to actual
-    # historical candles. They affect only the 5-minute head, never all horizons.
+    # Load and deduplicate Supervisor rows before allocating X so the exact
+    # upper bound is known. The final count can only be lower than this bound.
     events = _read_supervisor_events(sqlite_path)
     prepared_events: list[tuple[dict[str, Any], int, str, str]] = []
     for event in events:
@@ -312,8 +271,6 @@ def build_dataset(
             continue
         prepared_events.append((event, int(ts), ticker, day))
 
-    # Дедупликация повторных snapshot одного тикера. В каждом временном
-    # кластере приоритет у пропущенной ямы, затем у фактической сделки.
     def event_priority(item: tuple[dict[str, Any], int, str, str]) -> tuple[str, int, int]:
         event, ts_int, ticker, _day = item
         source = str(event.get("ml_source") or "")
@@ -331,33 +288,87 @@ def build_dataset(
         selected_events.append((event, ts_int, ticker, day))
         recent.append(ts_int)
 
+    capacity = candle_capacity + len(selected_events)
+    if capacity <= 0:
+        raise ValueError("Недостаточно свечей для последовательностей. Нужны минимум 60 минут истории на день/тикер.")
+
+    x_out = np.empty((capacity, sequence_length, len(FEATURE_NAMES)), dtype=np.float32)
+    y_out = np.empty((capacity, len(horizons)), dtype=np.int64)
+    mask_out = np.empty((capacity, len(horizons)), dtype=bool)
+    returns_out = np.empty((capacity, len(horizons)), dtype=np.float32)
+    weights_out = np.empty((capacity, len(horizons)), dtype=np.float32)
+    tickers: list[str] = []
+    timestamps: list[str] = []
+    days: list[str] = []
+    sources: list[str] = []
+    sample_count = 0
+
+    def append_sample(seq: np.ndarray, y: np.ndarray, mask: np.ndarray, ret: np.ndarray,
+                      sample_weights: np.ndarray, ticker: str, ts: str, day: str,
+                      source: str) -> None:
+        nonlocal sample_count
+        x_out[sample_count] = seq
+        y_out[sample_count] = y
+        mask_out[sample_count] = mask
+        returns_out[sample_count] = ret
+        weights_out[sample_count] = sample_weights
+        tickers.append(ticker)
+        timestamps.append(ts)
+        days.append(day)
+        sources.append(source)
+        sample_count += 1
+
+    # Historical candle labels: same horizons, cost band, and session-boundary
+    # rules as v1.19.0; only the storage strategy has changed.
+    for (ticker, day), (begins, close, features, ts_sec) in groups.items():
+        n = len(close)
+        for idx in range(sequence_length - 1, n, sample_stride):
+            label_arr = np.ones(len(horizons), dtype=np.int64)
+            mask_arr = np.zeros(len(horizons), dtype=bool)
+            ret_arr = np.full(len(horizons), np.nan, dtype=np.float32)
+            weight_arr = np.ones(len(horizons), dtype=np.float32)
+            for col, horizon in enumerate(horizons):
+                future_idx = idx + horizon
+                if future_idx >= n:
+                    weight_arr[col] = 0.0
+                    continue
+                elapsed = ts_sec[future_idx] - ts_sec[idx]
+                max_elapsed = horizon * 60.0 * 1.8 + 60.0
+                if elapsed <= 0 or elapsed > max_elapsed:
+                    weight_arr[col] = 0.0
+                    continue
+                gross = (close[future_idx] / close[idx] - 1.0) * 100.0
+                ret_arr[col] = gross
+                label_arr[col] = _classify(gross, round_trip_cost_pct)
+                mask_arr[col] = True
+            if mask_arr.any():
+                begin_str = pd.Timestamp(begins[idx]).isoformat(sep=" ")
+                append_sample(features[idx - sequence_length + 1:idx + 1], label_arr,
+                              mask_arr, ret_arr, weight_arr, ticker, begin_str, day, "candle")
+
+    # Supervisor examples still affect only the five-minute output head.
     event_rows_used = 0
-    for event, epoch, ticker, day in selected_events:
+    for event, _epoch, ticker, day in selected_events:
         group_data = groups.get((ticker, day))
         if group_data is None:
             continue
-        group, features, ts_sec = group_data
-        event_dt = datetime.fromtimestamp(float(event["ts"]), tz=timezone.utc).astimezone(MOSCOW).replace(tzinfo=None)
+        begins, close, features, ts_sec = group_data
         event_epoch = int(float(event["ts"]))
-        # Не используем OHLCV текущей незакрытой минуты: snapshot в середине
-        # минуты должен опираться только на свечи, чьё закрытие уже произошло.
         last_completed_start = event_epoch - 60
         idx = int(np.searchsorted(ts_sec, last_completed_start, side="right") - 1)
-        if idx < sequence_length - 1 or idx >= len(group):
+        if idx < sequence_length - 1 or idx >= len(close):
             continue
         age = event_epoch - (int(ts_sec[idx]) + 60)
         if age < 0 or age > event_max_age_seconds:
             continue
         price = float(event.get("price") or 0.0)
-        candle_price = float(group.loc[idx, "close"])
+        candle_price = float(close[idx])
         if price <= 0 or abs(price / candle_price - 1.0) * 100.0 > 1.0:
             continue
         label_info = _event_label(event, round_trip_cost_pct)
         if label_info is None:
             continue
         event_label, event_return, source = label_info
-        # Остальные горизонты оставляем маскированными: у SQLite-разметки
-        # Supervisor свой горизонт (по умолчанию 300 сек), не 1/10/30 минут.
         y = np.ones(len(horizons), dtype=np.int64)
         mask = np.zeros(len(horizons), dtype=bool)
         ret = np.full(len(horizons), np.nan, dtype=np.float32)
@@ -366,8 +377,7 @@ def build_dataset(
         if col is None:
             continue
         y[col] = event_label
-        # В SQLite исход хранится NET после издержек; приводим к gross,
-        # чтобы общий evaluator вычел round-trip cost ровно один раз.
+        # SQLite stores NET return; the evaluator subtracts costs once from gross.
         ret[col] = event_return + round_trip_cost_pct
         mask[col] = True
         if int(event.get("missed") or 0) == 1:
@@ -379,27 +389,25 @@ def build_dataset(
         else:
             w[col] = 1.0
             row_source = "supervisor_counterfactual"
-        begin_str = pd.Timestamp(group.loc[idx, "begin"]).isoformat(sep=" ")
+        begin_str = pd.Timestamp(begins[idx]).isoformat(sep=" ")
         event_sequence = features[idx - sequence_length + 1:idx + 1].copy()
-        # Дополняем последний закрытый бар реальной ценой в момент кандидата;
-        # значение строится только из доступного на тот момент snapshot.
         event_sequence[-1, -1] = float(np.clip(
             np.log(price / candle_price) * 100.0, -5.0, 5.0
         ))
-        append_sample(event_sequence, y, mask, ret,
-                      w, ticker, begin_str, day, row_source)
+        append_sample(event_sequence, y, mask, ret, w, ticker, begin_str, day, row_source)
         event_rows_used += 1
 
-    if not xs:
+    if sample_count == 0:
         raise ValueError("Недостаточно свечей для последовательностей. Нужны минимум 60 минут истории на день/тикер.")
+
+    # Slices are views into the preallocated arrays (no final np.stack copy).
     return MarketDataset(
-        x=np.stack(xs), y=np.stack(ys), mask=np.stack(masks),
-        gross_returns=np.stack(rets), weights=np.stack(weights),
+        x=x_out[:sample_count], y=y_out[:sample_count], mask=mask_out[:sample_count],
+        gross_returns=returns_out[:sample_count], weights=weights_out[:sample_count],
         tickers=np.asarray(tickers), timestamps=np.asarray(timestamps),
         days=np.asarray(days), sources=np.asarray(sources),
         event_rows_used=event_rows_used,
     )
-
 
 def chronological_split(days: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, list[str]]]:
     unique_days = sorted(set(str(x) for x in days))

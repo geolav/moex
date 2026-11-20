@@ -6,15 +6,52 @@ from typing import Any
 import numpy as np
 
 
-def standardize_sequences(x: np.ndarray, train_idx: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    train_values = x[train_idx].reshape(-1, x.shape[-1]).astype(np.float64)
-    mean = train_values.mean(axis=0)
-    scale = train_values.std(axis=0)
-    scale = np.where(scale < 1e-6, 1.0, scale)
-    normalized = ((x - mean) / scale).astype(np.float32)
-    normalized = np.clip(normalized, -8.0, 8.0)
-    return normalized, mean.astype(np.float32), scale.astype(np.float32)
+def standardize_sequences(
+    x: np.ndarray,
+    train_idx: np.ndarray,
+    *,
+    chunk_size: int = 2048,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Fit feature-wise statistics on train only and normalize X in-place.
 
+    Accumulate float64 sums in small chunks. This is numerically stable enough
+    for the bounded Market AI features and avoids the old 600+ MiB float64
+    materialization of the complete train split. Returning the same array is
+    intentional: callers must not expect a second copy of X.
+    """
+    if x.ndim != 3:
+        raise ValueError(f"Ожидался X размерности [samples, time, features], получено {x.shape}")
+    if len(train_idx) == 0:
+        raise ValueError("Пустая train-выборка для стандартизации")
+    if chunk_size < 1:
+        raise ValueError("chunk_size должен быть >= 1")
+
+    n_features = x.shape[-1]
+    sums = np.zeros(n_features, dtype=np.float64)
+    sums_sq = np.zeros(n_features, dtype=np.float64)
+    n_values = 0
+    for start in range(0, len(train_idx), chunk_size):
+        ids = train_idx[start:start + chunk_size]
+        block = np.asarray(x[ids], dtype=np.float64).reshape(-1, n_features)
+        sums += block.sum(axis=0, dtype=np.float64)
+        sums_sq += np.square(block).sum(axis=0, dtype=np.float64)
+        n_values += block.shape[0]
+        del block
+
+    mean64 = sums / max(1, n_values)
+    variance = np.maximum(sums_sq / max(1, n_values) - mean64 * mean64, 0.0)
+    scale64 = np.sqrt(variance)
+    scale64 = np.where(scale64 < 1e-6, 1.0, scale64)
+
+    # Normalize in-place in contiguous blocks; no full-size temporary array.
+    mean32 = mean64.astype(np.float32)
+    scale32 = scale64.astype(np.float32)
+    for start in range(0, len(x), chunk_size):
+        block = x[start:start + chunk_size]
+        np.subtract(block, mean32, out=block)
+        np.divide(block, scale32, out=block)
+        np.clip(block, -8.0, 8.0, out=block)
+    return x, mean32, scale32
 
 def summarize_sequences(x: np.ndarray) -> np.ndarray:
     """Компактные табличные признаки для LR/HGB/MLP baseline."""
@@ -119,20 +156,24 @@ def classification_metrics(
     }
 
 
-def _predict_torch(model, x: np.ndarray, batch_size: int = 1024) -> np.ndarray:
+def _predict_torch_indices(model, x: np.ndarray, indices: np.ndarray, batch_size: int = 256) -> np.ndarray:
+    """Predict selected rows without copying an entire validation/test split."""
     import torch
     model.eval()
     outputs = []
     with torch.no_grad():
-        for start in range(0, len(x), batch_size):
-            batch = torch.from_numpy(x[start:start + batch_size]).float()
+        for start in range(0, len(indices), batch_size):
+            ids = indices[start:start + batch_size]
+            batch_np = np.ascontiguousarray(x[ids], dtype=np.float32)
+            batch = torch.from_numpy(batch_np)
             logits = model(batch)
             outputs.append(torch.softmax(logits, dim=-1).cpu().numpy())
-    return np.concatenate(outputs, axis=0) if outputs else np.empty((0, 0, 3))
+            del batch, batch_np, logits
+    return np.concatenate(outputs, axis=0) if outputs else np.empty((0, 0, 3), dtype=np.float32)
 
 
 def _evaluate_model(model, x, y, mask, returns, weights, indices, cost_pct) -> dict[str, Any]:
-    probabilities = _predict_torch(model, x[indices])
+    probabilities = _predict_torch_indices(model, x, indices)
     per_horizon = {}
     for h_idx, horizon in enumerate((1, 5, 10, 30, 60, 180, 300)):
         valid = mask[indices, h_idx] & (weights[indices, h_idx] > 0)
@@ -143,8 +184,8 @@ def _evaluate_model(model, x, y, mask, returns, weights, indices, cost_pct) -> d
             y[indices[valid], h_idx], probabilities[valid, h_idx],
             returns[indices[valid], h_idx], cost_pct=cost_pct,
         )
+    del probabilities
     return per_horizon
-
 
 def train_neural(
     kind: str,
@@ -159,7 +200,7 @@ def train_neural(
     *,
     cost_pct: float,
     epochs: int = 10,
-    batch_size: int = 512,
+    batch_size: int = 64,
     learning_rate: float = 0.001,
     patience: int = 3,
     seed: int = 42,
@@ -172,7 +213,9 @@ def train_neural(
     torch.set_num_threads(max(1, min(4, torch.get_num_threads())))
     model = _TorchNetFactory.build(kind, x.shape[-1], y.shape[-1])
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
-    x_t = torch.from_numpy(x).float()
+    if x.dtype != np.float32 or not x.flags.c_contiguous:
+        raise ValueError("X должен быть непрерывным C-order массивом float32")
+    x_t = torch.from_numpy(x)
     y_t = torch.from_numpy(y).long()
     mask_t = torch.from_numpy(mask).bool()
     weights_t = torch.from_numpy(weights).float()
