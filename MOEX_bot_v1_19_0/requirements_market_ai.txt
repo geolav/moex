@@ -1,0 +1,8 @@
+# Необязательные зависимости только для offline Market AI research.
+# Сам бот может работать без PyTorch / scikit-learn.
+numpy>=1.26,<3.0
+pandas>=2.1,<3.0
+requests>=2.31,<3.0
+scikit-learn>=1.4,<2.0
+joblib>=1.3,<2.0
+torch>=2.2,<3.0

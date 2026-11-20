@@ -1,0 +1,21 @@
+# Добавь эти строки в конец существующего .env, если их ещё нет.
+# НЕ заменяй весь .env: сохрани рабочие токены и прочие настройки.
+
+# --- Supervisor: частая телеметрия и контрфактическая проверка ---------------
+SUPERVISOR_ENABLED=true
+SUPERVISOR_INTERVAL_SEC=60
+SUPERVISOR_LOOKAHEAD_SEC=300
+SUPERVISOR_GROQ_ENABLED=true
+SUPERVISOR_GROQ_MIN_INTERVAL_SEC=3600
+SUPERVISOR_AUTO_TUNE=true
+SUPERVISOR_GENERATE_PATCHES=true
+
+# --- Подробная история микродвижений ----------------------------------------
+SCALP_TICK_BUFFER_MAXLEN=2400
+
+# --- REST-резерв цены, если last-price stream молчит -------------------------
+SCALP_PRICE_REST_REFRESH_SEC=2.5
+SCALP_PRICE_STALE_SEC=2.5
+
+# Важно: торговля включается НЕ этой настройкой, а командой Telegram /trading_on.
+# Существующий state.json хранит флаг автоторговли независимо от .env.

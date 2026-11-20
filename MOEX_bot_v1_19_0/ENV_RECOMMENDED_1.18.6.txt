@@ -1,0 +1,22 @@
+# Рекомендуемые строки для .env v1.18.6.
+# Не заменяйте весь .env: сохраните токены и остальные настройки.
+
+DECISION_BACKEND=local
+LOCAL_MODEL_MIN_SAMPLES=200
+LOCAL_MODEL_MIN_CLASS_SAMPLES=40
+LOCAL_MODEL_MIN_AUC=0.53
+LOCAL_MODEL_MIN_PROBABILITY=0.62
+LOCAL_MODEL_MIN_EDGE_MULTIPLE=1.25
+
+SUPERVISOR_ENABLED=true
+SUPERVISOR_GROQ_ENABLED=false
+SUPERVISOR_AUTO_TUNE=true
+SUPERVISOR_GENERATE_PATCHES=true
+SUPERVISOR_INTERVAL_SEC=60
+SUPERVISOR_LOOKAHEAD_SEC=300
+SUPERVISOR_TARGET_COST_MULTIPLE=1.25
+SUPERVISOR_TUNE_MIN_EPISODES=40
+
+# Важное: не снижать фильтры комиссий/спреда и стопы ради количества сделок.
+# Автонастройка v2 меняет пороги только на независимых данных и при CI net expectancy.
+# Решения по покупке принимает локальная модель; Groq diagnostics остаётся выключенным.

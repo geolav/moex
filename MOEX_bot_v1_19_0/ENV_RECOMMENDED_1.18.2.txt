@@ -1,0 +1,9 @@
+# Добавить в существующий .env (старые токены и остальные настройки не заменять)
+SCALP_MAX_POSITIONS=12
+SCALP_RISK_PER_TRADE_PCT=0.03
+SCALP_MAX_PORTFOLIO_RISK_PCT=0.40
+SCALP_MAX_ENTRIES_PER_DAY=100
+SCALP_MIN_NET_PROFIT_RUB=1.0
+SCALP_FORCE_FLAT_AT_SESSION_END=false
+
+# SCALP_TIME_STOP_MIN теперь legacy: на автоматическое закрытие по возрасту не влияет.

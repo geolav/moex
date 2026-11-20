@@ -1,0 +1,1079 @@
+"""Самонаблюдение и ограниченное самообучение скальп-бота.
+
+Supervisor собирает телеметрию в SQLite, размечает контрфактические входы
+по последующим ценам, осторожно калибрует только разрешённые пороги и при
+системной проблеме просит Groq подготовить patch в изолированной копии.
+Живой торговый код автоматически не перезаписывается.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import math
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Awaitable, Callable, Dict, List, Optional
+
+from local_learning import features_from_quote
+
+log = logging.getLogger("supervisor")
+
+_ALLOWED_PATCH_FILES = {
+    "trading_engine.py", "scalp_microstructure.py", "tinkoff_client.py", "config.py"
+}
+_PATCH_TESTS = [
+    "test_supervisor.py",
+    "test_scalp_price_rest_fallback.py",
+    "test_fasttrack_economics.py",
+    "test_scalp_microstructure.py",
+    "test_scalp_engine_stream.py",
+    "test_scalp_book_fallback.py",
+    "test_trade_costs_consistency.py",
+]
+_SYSTEM_PROMPT = """Ты независимый инженер-аудитор торгового Python-бота.
+Твоя задача — находить доказуемые причины пропущенных прибыльных возможностей,
+потери ценовых данных, отказов входа и отрицательного net P&L.
+Не предлагай просто увеличить число сделок, отключать риск, игнорировать комиссии,
+покупать падающий нож или считать будущий максимум гарантированной прибылью.
+Разделяй доказанный факт, гипотезу и недостающие данные. Не обещай доходность.
+Верни строго JSON: {"severity":"info|warning|critical","root_cause":"...",
+"evidence":["..."],"missing_data":["..."],"code_change_needed":true|false,
+"target_file":"один файл из allowlist или пустая строка",
+"patch_instructions":"минимальное конкретное исправление"}."""
+
+
+def _json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+
+
+def _number(value: Any, default: float = 0.0) -> float:
+    try:
+        result = float(value)
+        return result if math.isfinite(result) else default
+    except (TypeError, ValueError):
+        return default
+
+
+class LearningSupervisor:
+    """SQLite-телеметрия, постфактум-разметка и безопасная калибровка."""
+
+    def __init__(self, config, state, analyst,
+                 notify: Callable[[str], Awaitable[None]], client,
+                 get_tickers: Callable[[], List[str]]) -> None:
+        self._cfg = config
+        self._state = state
+        self._analyst = analyst
+        self._notify = notify
+        self._client = client
+        self._get_tickers = get_tickers
+        self._stop = asyncio.Event()
+        self._db_path = Path(config.data_dir) / "supervisor.sqlite3"
+        self._root = Path(config.base_dir)
+        self._work_dir = Path(config.data_dir) / "supervisor"
+        self._proposals_dir = self._work_dir / "proposals"
+        self._staging_dir = self._work_dir / "staging"
+        self._policy_path = self._work_dir / "learned_policy.json"
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._work_dir.mkdir(parents=True, exist_ok=True)
+        self._proposals_dir.mkdir(parents=True, exist_ok=True)
+        self._staging_dir.mkdir(parents=True, exist_ok=True)
+        self._db = sqlite3.connect(str(self._db_path), timeout=10.0)
+        self._db.row_factory = sqlite3.Row
+        self._db.execute("PRAGMA journal_mode=WAL")
+        self._db.execute("PRAGMA synchronous=NORMAL")
+        self._db.execute("PRAGMA busy_timeout=10000")
+        self._init_db()
+        self._last_sample: Dict[str, float] = {}
+        self._last_shadow: Dict[str, float] = {}
+        self._last_signal: Dict[str, float] = {}
+        self._last_event: Dict[str, float] = {}
+        self._last_groq = 0.0
+        self._last_alert = 0.0
+        self._started_mono = time.monotonic()
+        self._cycle_count = 0
+        self._lookahead_sec = max(120, int(os.getenv("SUPERVISOR_LOOKAHEAD_SEC", "300")))
+        self._interval_sec = max(30, int(os.getenv("SUPERVISOR_INTERVAL_SEC", "60")))
+        self._groq_interval_sec = max(1800, int(os.getenv("SUPERVISOR_GROQ_MIN_INTERVAL_SEC", "3600")))
+        self._enabled = os.getenv("SUPERVISOR_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+        self._groq_enabled = os.getenv("SUPERVISOR_GROQ_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+        self._auto_tune_enabled = os.getenv("SUPERVISOR_AUTO_TUNE", "false").strip().lower() in {"1", "true", "yes", "on"}
+        self._generate_patches = os.getenv("SUPERVISOR_GENERATE_PATCHES", "false").strip().lower() in {"1", "true", "yes", "on"}
+        self._legacy_policy_ignored = False
+
+    def _init_db(self) -> None:
+        self._db.executescript("""
+        CREATE TABLE IF NOT EXISTS samples (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts REAL NOT NULL,
+            ticker TEXT NOT NULL,
+            price REAL NOT NULL,
+            price_source TEXT NOT NULL,
+            price_age REAL NOT NULL,
+            book_age REAL NOT NULL,
+            spread_pct REAL NOT NULL,
+            cost_pct REAL NOT NULL,
+            stop_pct REAL NOT NULL,
+            has_position INTEGER NOT NULL,
+            signal_json TEXT,
+            shadow_json TEXT,
+            reason TEXT,
+            stage TEXT NOT NULL DEFAULT 'detector',
+            label TEXT,
+            label_net_pct REAL,
+            label_ts REAL,
+            missed INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_samples_ticker_ts ON samples(ticker, ts);
+        CREATE INDEX IF NOT EXISTS idx_samples_pending ON samples(label, ts);
+        CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts REAL NOT NULL,
+            ticker TEXT,
+            kind TEXT NOT NULL,
+            details TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
+        CREATE TABLE IF NOT EXISTS trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts REAL NOT NULL,
+            ticker TEXT NOT NULL,
+            side TEXT NOT NULL,
+            price REAL NOT NULL,
+            lots INTEGER NOT NULL,
+            pnl_rub REAL,
+            pnl_pct REAL,
+            reason TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_trades_ts ON trades(ts);
+        """)
+        # Миграция существующей supervisor.sqlite3 без удаления старой телеметрии.
+        columns = {str(row[1]) for row in self._db.execute("PRAGMA table_info(samples)").fetchall()}
+        for name, declaration in (
+            ("features_json", "TEXT"),
+            ("ml_label", "INTEGER"),
+            ("ml_return_pct", "REAL"),
+            ("ml_prediction", "REAL"),
+            ("actual_pnl_pct", "REAL"),
+            ("ml_source", "TEXT"),
+            ("ml_updated_ts", "REAL"),
+        ):
+            if name not in columns:
+                self._db.execute(f"ALTER TABLE samples ADD COLUMN {name} {declaration}")
+        self._db.execute("CREATE INDEX IF NOT EXISTS idx_samples_ml ON samples(ml_label, ts)")
+        self._db.commit()
+
+    def request_stop(self) -> None:
+        self._stop.set()
+
+    def close(self) -> None:
+        try:
+            self._db.commit()
+            self._db.close()
+        except Exception:
+            pass
+
+    def current_policy(self) -> Dict[str, float]:
+        """Параметры, обученные только на размеченных shadow-кандидатах."""
+        base = {
+            "dip_min_score": _number(getattr(self._cfg, "scalp_micro_dip_min_score", 48.0), 48.0),
+            "dip_min_drop_pct": _number(getattr(self._cfg, "scalp_micro_dip_min_drop_pct", 0.02), 0.02),
+            "fasttrack_min_score": _number(getattr(self._cfg, "scalp_fasttrack_min_score", 75.0), 75.0),
+        }
+        try:
+            payload = json.loads(self._policy_path.read_text(encoding="utf-8"))
+            # Политика v1 могла за несколько минут поднять фильтры до верхних
+            # границ на коррелированных shadow-событиях. После обновления такие
+            # параметры не наследуем: стартуем с явно заданных безопасных ENV.
+            if int(payload.get("version", 0) or 0) >= 2:
+                for key in base:
+                    if key in payload:
+                        base[key] = _number(payload[key], base[key])
+            elif not self._legacy_policy_ignored:
+                log.warning("Supervisor: устаревшая learned_policy v1 не применяется; "
+                            "возвращаю базовые пороги из конфигурации")
+                self._legacy_policy_ignored = True
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            pass
+        base["dip_min_score"] = min(60.0, max(42.0, base["dip_min_score"]))
+        base["dip_min_drop_pct"] = min(0.05, max(0.005, base["dip_min_drop_pct"]))
+        base["fasttrack_min_score"] = min(85.0, max(65.0, base["fasttrack_min_score"]))
+        return base
+
+    def record_event(self, kind: str, ticker: str = "", **details: Any) -> None:
+        try:
+            self._db.execute(
+                "INSERT INTO events(ts,ticker,kind,details) VALUES(?,?,?,?)",
+                (time.time(), ticker.upper(), kind, _json(details)[:12000]))
+            self._db.commit()
+        except sqlite3.Error as exc:
+            log.warning("Supervisor: не удалось сохранить событие %s: %s", kind, exc)
+
+    def record_event_throttled(self, kind: str, ticker: str = "",
+                               interval_sec: float = 60.0, **details: Any) -> None:
+        """Не даёт однотипной причине забить SQLite тысячами одинаковых событий."""
+        key = f"{kind}:{str(ticker).upper()}"
+        now = time.monotonic()
+        if now - self._last_event.get(key, 0.0) < max(1.0, interval_sec):
+            return
+        self._last_event[key] = now
+        self.record_event(kind, ticker, **details)
+
+    def record_market_sample(self, ticker: str, quote: Dict[str, Any], *,
+                             signal: Optional[Dict[str, Any]],
+                             shadow: Optional[Dict[str, Any]],
+                             reason: str, has_position: bool,
+                             cost_pct: float, stop_pct: float) -> None:
+        """Фиксирует входные данные для последующей проверки пропущенных входов."""
+        now = time.time()
+        ticker = str(ticker).upper()
+        is_shadow = shadow is not None and signal is None and not has_position
+        if signal is not None and not has_position:
+            if now - self._last_signal.get(ticker, 0.0) < 15.0:
+                return
+            self._last_signal[ticker] = now
+        elif is_shadow:
+            # Один теневой эпизод на локальный минимум; одинаковый минимум не
+            # записываем на каждом тике, но новые ямы не теряем 30-секундным throttle.
+            trough_ts = _number(shadow.get("trough_ts"), 0.0) if shadow else 0.0
+            shadow_key = round(trough_ts, 1) if trough_ts else int(now // 3)
+            key = f"{ticker}:{shadow_key}"
+            if getattr(self, "_last_shadow_episode", {}).get(ticker) == key:
+                return
+            if not hasattr(self, "_last_shadow_episode"):
+                self._last_shadow_episode = {}
+            self._last_shadow_episode[ticker] = key
+            self._last_shadow[ticker] = now
+        else:
+            if now - self._last_sample.get(ticker, 0.0) < 10.0:
+                return
+            self._last_sample[ticker] = now
+        price = _number(quote.get("price"))
+        if price <= 0:
+            return
+        try:
+            features = features_from_quote(quote, signal, shadow)
+            model = getattr(self._analyst, "local_model", None)
+            prediction = (model.predict_probability(features)
+                          if model is not None and bool(getattr(model, "ready", False)) else None)
+            self._db.execute("""INSERT INTO samples(
+                ts,ticker,price,price_source,price_age,book_age,spread_pct,cost_pct,
+                stop_pct,has_position,signal_json,shadow_json,reason,stage,
+                features_json,ml_prediction)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
+                now, ticker, price, str(quote.get("price_source") or "stream"),
+                _number(quote.get("price_age_sec"), 9999.0),
+                _number(quote.get("book_age_sec"), 9999.0),
+                _number(quote.get("spread_pct")), max(0.0, cost_pct),
+                max(0.1, stop_pct), int(bool(has_position)),
+                _json(signal) if signal else None, _json(shadow) if shadow else None,
+                (reason or "")[:500], "signal" if signal else ("shadow" if shadow else "no_signal"),
+                _json(features), prediction))
+            self._db.commit()
+        except sqlite3.Error as exc:
+            log.warning("Supervisor: не удалось сохранить sample %s: %s", ticker, exc)
+
+    def record_entry_outcome(self, ticker: str, stage: str, reason: str = "") -> None:
+        """Связывает найденный сигнал с фактическим исходом pipeline входа."""
+        now = time.time()
+        ticker = str(ticker).upper()
+        try:
+            self._db.execute("""UPDATE samples SET stage=? WHERE id=(
+                SELECT id FROM samples WHERE ticker=?
+                AND (signal_json IS NOT NULL OR shadow_json IS NOT NULL)
+                AND ts>=? ORDER BY ts DESC LIMIT 1)""",
+                (stage[:40], ticker, now - 90.0))
+            self._db.commit()
+        except sqlite3.Error as exc:
+            log.warning("Supervisor: не удалось обновить исход сигнала %s: %s", ticker, exc)
+        self.record_event("entry_pipeline", ticker, stage=stage, reason=(reason or "")[:500])
+        if stage.startswith("blocked_"):
+            self.record_event("entry_blocked", ticker, reason=stage, detail=(reason or "")[:500])
+
+    def record_trade(self, ticker: str, side: str, price: float, lots: int,
+                     pnl_rub: Optional[float] = None,
+                     pnl_pct: Optional[float] = None, reason: str = "") -> None:
+        try:
+            now = time.time()
+            ticker = ticker.upper()
+            self._db.execute("""INSERT INTO trades(ts,ticker,side,price,lots,pnl_rub,pnl_pct,reason)
+                VALUES(?,?,?,?,?,?,?,?)""", (
+                now, ticker, side, float(price), int(lots),
+                pnl_rub, pnl_pct, (reason or "")[:400]))
+            # Реальный исход закрытой scalp-сделки важнее виртуального барьерного
+            # исхода. Привязываем net P&L к последнему sample, помеченному bought.
+            if side.lower() == "sell" and pnl_pct is not None:
+                entry_sample = self._db.execute("""SELECT id FROM samples
+                    WHERE ticker=? AND stage='bought' AND features_json IS NOT NULL
+                    AND actual_pnl_pct IS NULL AND ts>? ORDER BY ts DESC LIMIT 1""",
+                    (ticker, now - 30 * 86400)).fetchone()
+                if entry_sample is not None:
+                    actual_label = 1 if float(pnl_pct) > 0.0 else 0
+                    self._db.execute("""UPDATE samples SET ml_label=?,ml_return_pct=?,
+                        actual_pnl_pct=?,ml_source='actual',ml_updated_ts=? WHERE id=?""",
+                        (actual_label, float(pnl_pct), float(pnl_pct), now, entry_sample["id"]))
+            self._db.commit()
+        except (sqlite3.Error, TypeError, ValueError) as exc:
+            log.warning("Supervisor: не удалось сохранить сделку %s %s: %s", ticker, side, exc)
+
+    def _label_pending(self, now: float) -> Dict[str, int]:
+        """Размечает контрфактический путь: цель раньше стопа или наоборот."""
+        pending = self._db.execute(
+            "SELECT * FROM samples WHERE label IS NULL AND ts <= ? ORDER BY ts LIMIT 300",
+            (now - self._lookahead_sec,)).fetchall()
+        counts = {"target": 0, "stop": 0, "no_hit": 0, "missed": 0}
+        target_multiple = max(1.05, _number(os.getenv("SUPERVISOR_TARGET_COST_MULTIPLE", "1.25"), 1.25))
+        for row in pending:
+            if row["has_position"]:
+                label, net, missed = "position", 0.0, 0
+            else:
+                target_pct = max(0.10, float(row["cost_pct"]) * target_multiple)
+                stop_pct = min(1.5, max(0.25, float(row["stop_pct"] or 0.6)))
+                future = self._db.execute(
+                    "SELECT ts,price FROM samples WHERE ticker=? AND ts>? AND ts<=? ORDER BY ts LIMIT 500",
+                    (row["ticker"], row["ts"], row["ts"] + self._lookahead_sec)).fetchall()
+                label, net = "no_hit", 0.0
+                for point in future:
+                    change = (float(point["price"]) / float(row["price"]) - 1.0) * 100.0
+                    if change >= target_pct:
+                        label, net = "target", target_pct - float(row["cost_pct"])
+                        break
+                    if change <= -stop_pct:
+                        label, net = "stop", -stop_pct - float(row["cost_pct"])
+                        break
+                was_candidate = bool(row["shadow_json"]) or bool(row["signal_json"])
+                candidate_not_bought = row["stage"] in {
+                    "shadow", "signal_not_bought", "queued_ai", "ai_hold",
+                    "ai_expired", "ai_buy_cancelled", "buy_attempt_failed",
+                    "blocked_trading_disabled", "blocked_session_time_window",
+                }
+                missed = int(was_candidate and candidate_not_bought and label == "target")
+            self._db.execute(
+                "UPDATE samples SET label=?,label_net_pct=?,label_ts=?,missed=? WHERE id=?",
+                (label, net, now, missed, row["id"]))
+            if label in counts:
+                counts[label] += 1
+            counts["missed"] += missed
+        self._db.commit()
+        return counts
+
+    def _label_ml_pending(self, now: float) -> Dict[str, int]:
+        """Размечает задачу BUY/HOLD по первому касанию целевого барьера.
+
+        1: цель достигнута раньше стопа.
+        0: стоп достигнут раньше цели ИЛИ цель не достигнута за горизонт,
+           хотя в окне есть реальные будущие ценовые наблюдения.
+        -1: данных для оценки вообще нет; такие строки не попадают в обучение.
+
+        Это делает HOLD полноценным обучающим классом, но не превращает
+        отсутствие котировок в отрицательный пример. Старые -1 переоцениваются,
+        если в SQLite уже есть будущие ценовые точки для их временного окна.
+        """
+        pending = self._db.execute(
+            "SELECT s.* FROM samples s WHERE (s.ml_label IS NULL OR "
+            "(s.ml_label=-1 AND (s.ml_source IS NULL OR s.ml_source IN ('counterfactual','no_future_data')) "
+            "AND EXISTS (SELECT 1 FROM samples f "
+            "WHERE f.ticker=s.ticker AND f.ts>s.ts AND f.ts<=s.ts+?))) "
+            "AND s.features_json IS NOT NULL AND s.has_position=0 AND s.stage!='bought' "
+            "AND (s.signal_json IS NOT NULL OR s.shadow_json IS NOT NULL) "
+            "AND s.ts<=? ORDER BY s.ts LIMIT 1000",
+            (self._lookahead_sec, now - self._lookahead_sec),
+        ).fetchall()
+        counts = {"up": 0, "not_up": 0, "neutral": 0, "pending": 0}
+        target_multiple = max(1.05, _number(os.getenv("SUPERVISOR_TARGET_COST_MULTIPLE", "1.25"), 1.25))
+        for row in pending:
+            horizon_end = float(row["ts"]) + self._lookahead_sec
+            future = self._db.execute(
+                "SELECT ts,price FROM samples WHERE ticker=? AND ts>? AND ts<=? "
+                "ORDER BY ts LIMIT 1000",
+                (row["ticker"], row["ts"], horizon_end),
+            ).fetchall()
+            if not future:
+                if now < horizon_end + 30.0:
+                    counts["pending"] += 1
+                    continue
+                self._db.execute(
+                    "UPDATE samples SET ml_label=-1,ml_return_pct=NULL,ml_source='no_future_data',"
+                    "ml_updated_ts=? WHERE id=?",
+                    (now, row["id"]),
+                )
+                counts["neutral"] += 1
+                continue
+
+            try:
+                trigger_data = json.loads(row["signal_json"] or row["shadow_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                trigger_data = {}
+            projected = _number(
+                trigger_data.get("projected_30s_pct"),
+                _number(trigger_data.get("rebound_to_mean_pct"),
+                        _number(trigger_data.get("rebound_to_vwap_pct"))),
+            )
+            up_barrier = max(float(row["cost_pct"] or 0.0) * target_multiple, 0.08)
+            if projected > 0:
+                up_barrier = max(up_barrier, min(projected, 1.5))
+            down_barrier = max(float(row["stop_pct"] or 0.6) * 0.75, 0.08)
+            outcome = -1
+            net_return = 0.0
+            last_change = 0.0
+            entry_price = float(row["price"] or 0.0)
+            for point in future:
+                future_price = float(point["price"] or 0.0)
+                if future_price <= 0 or entry_price <= 0:
+                    continue
+                change = (future_price / entry_price - 1.0) * 100.0
+                last_change = change
+                if change >= up_barrier:
+                    outcome = 1
+                    net_return = change - float(row["cost_pct"] or 0.0)
+                    break
+                if change <= -down_barrier:
+                    outcome = 0
+                    net_return = change - float(row["cost_pct"] or 0.0)
+                    break
+
+            if outcome == -1:
+                # Если цель/стоп не достигнуты, HOLD ставится только при
+                # достаточном покрытии горизонта реальными котировками. Один
+                # ранний snapshot не должен изображать полноценный 5-минутный
+                # исход: это мог бы быть пропуск данных, а не отсутствие движения.
+                latest_future_ts = max(float(point["ts"]) for point in future)
+                coverage_tolerance = max(30.0, self._lookahead_sec * 0.20)
+                if now < horizon_end + 30.0:
+                    counts["pending"] += 1
+                    continue
+                if latest_future_ts < horizon_end - coverage_tolerance:
+                    self._db.execute(
+                        "UPDATE samples SET ml_label=-1,ml_return_pct=NULL,"
+                        "ml_source='insufficient_future_coverage',ml_updated_ts=? WHERE id=?",
+                        (now, row["id"]),
+                    )
+                    counts["neutral"] += 1
+                    continue
+                # Горизонт покрыт котировками, но ни цель, ни стоп
+                # не достигнуты: это HOLD; return оцениваем по последней цене окна.
+                outcome = 0
+                net_return = last_change - float(row["cost_pct"] or 0.0)
+            self._db.execute(
+                "UPDATE samples SET ml_label=?,ml_return_pct=?,ml_source='counterfactual',"
+                "ml_updated_ts=? WHERE id=?",
+                (outcome, net_return, now, row["id"]),
+            )
+            counts["up" if outcome == 1 else "not_up"] += 1
+        self._db.commit()
+        return counts
+
+    def _train_local_model(self) -> Optional[Dict[str, Any]]:
+        """Переобучает локальную модель на зрелых out-of-time исходах.
+
+        Используем только feature snapshots реальных/теневых триггеров,
+        сделанные ДО будущего движения. Обычные no-signal snapshots не смешиваем
+        с распределением входов. Контрфактические наблюдения одного тикера разрежаются на полный
+        горизонт прогноза. Реальные закрытые сделки имеют приоритет и
+        добавляются по фактическому net P&L.
+        """
+        model = getattr(self._analyst, "local_model", None)
+        if model is None or not callable(getattr(model, "fit", None)):
+            return None
+        rows = self._db.execute("""SELECT id,ticker,ts,features_json,ml_label,ml_source,ml_updated_ts
+            FROM samples WHERE ml_label IN (0,1) AND features_json IS NOT NULL
+            AND has_position=0 AND (signal_json IS NOT NULL OR shadow_json IS NOT NULL)
+            AND ts>? ORDER BY ts DESC LIMIT 5000""",
+            (time.time() - 30 * 86400,)).fetchall()
+        if not rows:
+            return None
+        rows = list(reversed(rows))
+        last_by_ticker: Dict[str, float] = {}
+        examples = []
+        max_id = 0
+        for row in rows:
+            max_id = max(max_id, int(row["id"]))
+            ticker = str(row["ticker"])
+            ts = float(row["ts"])
+            source = str(row["ml_source"] or "counterfactual")
+            if source != "actual" and ts - last_by_ticker.get(ticker, -1e12) < self._lookahead_sec:
+                continue
+            last_by_ticker[ticker] = max(ts, last_by_ticker.get(ticker, -1e12))
+            try:
+                features = json.loads(row["features_json"])
+                if not isinstance(features, list) or len(features) != 13:
+                    continue
+                examples.append((features, int(row["ml_label"])))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+        previous_id = int(getattr(model, "last_sample_id", 0))
+        last_fit_epoch = float(getattr(model, "last_fit_epoch", 0.0) or 0.0)
+        new_count = sum(1 for row in rows
+                        if float(row["ml_updated_ts"] or row["ts"]) > last_fit_epoch)
+        if (max_id <= previous_id and new_count == 0) or new_count < 10:
+            return None
+        status = model.fit(examples, last_sample_id=max_id)
+        status["new_samples"] = new_count
+        return status
+
+    def _auto_tune(self, now: float) -> Optional[Dict[str, Any]]:
+        """Осторожная калибровка порогов на независимых завершённых эпизодах.
+
+        Не меняет политику по 20 соседним точкам одной и той же ямы. Для
+        изменения нужны 40+ независимых эпизодов, 8+ тикеров, минимум час
+        наблюдений и статистически заметное изменение net expectancy.
+        Между фактическими изменениями действует шестичасовой cooldown.
+        """
+        if not self._auto_tune_enabled:
+            return None
+        since = now - 7 * 86400
+        try:
+            previous_policy = json.loads(self._policy_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            previous_policy = {}
+        last_trained_id = int(previous_policy.get("last_sample_id", 0) or 0)
+        last_tune_ts = (_number(previous_policy.get("last_tune_ts"))
+                        if int(previous_policy.get("version", 0) or 0) >= 2 else 0.0)
+        if last_tune_ts and now - last_tune_ts < 6 * 3600:
+            return None
+
+        raw_rows = self._db.execute("""SELECT id,ticker,ts,label,label_net_pct FROM samples
+            WHERE ts>=? AND id>? AND (shadow_json IS NOT NULL OR stage IN
+            ('signal_not_bought','queued_ai','ai_hold','ai_expired','ai_buy_cancelled','buy_attempt_failed',
+             'blocked_trading_disabled','blocked_session_time_window'))
+            AND missed IN (0,1) AND label IN ('target','stop')
+            ORDER BY ts DESC LIMIT 2000""", (since, last_trained_id)).fetchall()
+        max_sample_id = max((int(r["id"]) for r in raw_rows), default=last_trained_id)
+        if max_sample_id <= last_trained_id:
+            return None
+
+        # Берём не более одного наблюдения с тикера на полный горизонт label.
+        spacing = max(float(self._lookahead_sec), 300.0)
+        rows = []
+        last_by_ticker: Dict[str, float] = {}
+        for row in raw_rows:
+            ticker = str(row["ticker"])
+            ts = float(row["ts"])
+            previous = last_by_ticker.get(ticker)
+            if previous is not None and abs(ts - previous) < spacing:
+                continue
+            last_by_ticker[ticker] = ts
+            rows.append(row)
+
+        min_episodes = max(40, int(os.getenv("SUPERVISOR_TUNE_MIN_EPISODES", "40")))
+        unique_tickers = {str(row["ticker"]) for row in rows}
+        span_sec = (max((float(r["ts"]) for r in rows), default=0.0)
+                    - min((float(r["ts"]) for r in rows), default=0.0))
+        if len(rows) < min_episodes or len(unique_tickers) < 8 or span_sec < 3600.0:
+            return None
+
+        values = [float(r["label_net_pct"] or 0.0) for r in rows]
+        wins = sum(1 for r in rows if r["label"] == "target")
+        win_rate = wins / len(rows)
+        expectancy = sum(values) / len(values)
+        variance = sum((value - expectancy) ** 2 for value in values) / max(1, len(values))
+        standard_error = math.sqrt(variance) / math.sqrt(len(values))
+        lower_95 = expectancy - 1.96 * standard_error
+        upper_95 = expectancy + 1.96 * standard_error
+
+        policy = self.current_policy()
+        old = dict(policy)
+        reason = ""
+        if upper_95 < -0.03:
+            # Подтверждённо отрицательное ожидание: лишь маленький шаг по score.
+            # Не увеличиваем min_drop: это дополнительно прятало бы новые
+            # наблюдения и замедляло сбор обучающих примеров.
+            policy["dip_min_score"] = min(60.0, policy["dip_min_score"] + 0.5)
+            reason = "net expectancy статистически отрицательный; осторожно повышаю score"
+        elif lower_95 > 0.03 and win_rate >= 0.62:
+            policy["dip_min_score"] = max(42.0, policy["dip_min_score"] - 0.5)
+            policy["dip_min_drop_pct"] = max(0.005, policy["dip_min_drop_pct"] * 0.99)
+            reason = "net expectancy устойчиво положительный; немного расширяю поиск"
+
+        changed = any(abs(policy[k] - old[k]) > 1e-9 for k in old)
+        last_tune_value = now if changed else last_tune_ts
+        payload = {
+            "version": 2,
+            **policy,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "last_sample_id": max_sample_id,
+            "last_tune_ts": last_tune_value,
+            "last_evaluated_ts": now,
+            "evidence_n": len(rows),
+            "unique_tickers": len(unique_tickers),
+            "span_sec": round(span_sec, 1),
+            "win_rate": round(win_rate, 4),
+            "expectancy_net_pct": round(expectancy, 5),
+            "expectancy_ci95": [round(lower_95, 5), round(upper_95, 5)],
+            "reason": reason or "недостаточно статистических доказательств для изменения порогов",
+        }
+        # Сохраняем watermark даже при отсутствии изменения: одни и те же
+        # данные не должны переоцениваться каждую минуту.
+        tmp = self._policy_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, self._policy_path)
+        if not changed:
+            log.info("Supervisor: пороги оставлены без изменений: episodes=%d, tickers=%d, "
+                     "net expectancy=%.4f%%, 95%% CI=[%.4f%%; %.4f%%]",
+                     len(rows), len(unique_tickers), expectancy, lower_95, upper_95)
+            return None
+
+        self.record_event("policy_updated", **payload)
+        log.warning("Supervisor: адаптивная политика v2: score %.1f→%.1f; "
+                    "min_drop %.4f%%→%.4f%%; episodes=%d/%d тикеров; "
+                    "net expectancy=%.4f%% (95%% CI %.4f..%.4f)",
+                    old["dip_min_score"], policy["dip_min_score"],
+                    old["dip_min_drop_pct"], policy["dip_min_drop_pct"],
+                    len(rows), len(unique_tickers), expectancy, lower_95, upper_95)
+        return payload
+
+    def _recent_log_excerpt(self) -> str:
+        """Возвращает короткий диагностический хвост без токенов/секретов."""
+        log_path = Path(getattr(self._cfg, "log_file", self._root / "logs" / "bot.log"))
+        try:
+            lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-350:]
+        except OSError:
+            return ""
+        pattern = re.compile(r"scalp|микро|покуп|вход|продаж|ошиб|rate.?limit|groq|last.?price|rest price|stream|spread|atr", re.I)
+        selected = [line for line in lines if pattern.search(line)]
+        safe = []
+        secret_patterns = [
+            (re.compile(r"(?i)(gsk_[A-Za-z0-9_-]{8,})"), "[GROQ_TOKEN_REDACTED]"),
+            (re.compile(r"(?i)(Bearer\s+)[A-Za-z0-9._-]{12,}"), r"\1[BEARER_REDACTED]"),
+            (re.compile(r"(?i)((?:token|api[_-]?key|password)=)[^\s,;]+"), r"\1[REDACTED]"),
+        ]
+        for line in selected[-45:]:
+            for regex, replacement in secret_patterns:
+                line = regex.sub(replacement, line)
+            safe.append(line[:700])
+        return "\n".join(safe)[-9000:]
+
+    def report_text(self) -> str:
+        """Короткий статус для Telegram /supervisor."""
+        tickers = sorted(set(str(t).upper() for t in self._get_tickers() if t))
+        m = self._metrics(tickers)
+        policy = self.current_policy()
+        buy_count = int(m.get("buys_24h", 0))
+        sell_count = int(m.get("sells_24h", 0))
+        win_rate = m.get("win_rate_24h")
+        win_text = f"{win_rate:.0%}" if isinstance(win_rate, (float, int)) else "н/д"
+        lines = [
+            "🧠 SUPERVISOR — состояние наблюдения",
+            f"Backend решений: {getattr(self._analyst, 'decision_backend', 'unknown')}",
+            ("Автоторговля: ВКЛ" if m["trading_enabled"] else
+             "⛔ Автоторговля ВЫКЛ — новые ордера запрещены; включить /trading_on"),
+            (f"Снимки свежие: stream {m['price_stream_fresh']}, REST {m['price_rest_fresh']}, "
+             f"устарели {m['price_stale']} / отсутствуют {len(m['price_missing'])} "
+             f"из {m['tickers_total']} бумаг; реальные изменения цены за 8с: "
+             f"{m['price_changed_recent']}/{m['tickers_total']}"),
+            (f"За час: измерений {m['samples_1h']}, реальных триггеров {m['signals_1h']}, "
+             f"теневых кандидатов {m['shadow_candidates_1h']}"),
+            ("Причины отказов детектора: " + "; ".join(
+                f"{reason[:90]} ({count})" for reason, count in m["no_signal_reasons_1h"])
+             if m["no_signal_reasons_1h"] else "Причины отказов: пока нет измерений"),
+            ("Заблокировано входов: " + ", ".join(
+                f"{reason}={count}" for reason, count in m["blocked_reasons_24h"].items())
+             if m["blocked_reasons_24h"] else "Блокировок входа за 24 ч: нет"),
+            (f"За 24 ч: потенциально пропущенных прибыльных входов {m['missed_profitable_24h']}; "
+             f"покупок {buy_count}, закрытий {sell_count}, win-rate закрытий {win_text}"),
+            (f"Net P&L закрытий за 24 ч: {m['net_pnl_24h_rub']:+.2f} ₽; "
+             f"открыто позиций: {m['open_positions']}"),
+            (f"Адаптивные пороги: dip score ≥{policy['dip_min_score']:.1f}; "
+             f"локальная просадка ≥{policy['dip_min_drop_pct']:.4f}%"),
+            f"Локальная ML-модель: {self._local_model_text()}",
+            f"SQLite: {self._db_path}",
+        ]
+        last = self._db.execute("SELECT details FROM events WHERE kind='groq_diagnosis' ORDER BY id DESC LIMIT 1").fetchone()
+        if last:
+            try:
+                diagnosis = json.loads(last[0])
+                lines.append("Последний диагноз Groq: " + str(diagnosis.get("root_cause", ""))[:500])
+            except (TypeError, json.JSONDecodeError):
+                pass
+        return "\n".join(lines)
+
+    def _local_model_text(self) -> str:
+        model = getattr(self._analyst, "local_model", None)
+        if model is None:
+            return "не подключена"
+        status = model.status() if callable(getattr(model, "status", None)) else {}
+        return (f"{'ГОТОВА' if status.get('ready') else 'прогрев'}; "
+                f"размечено {status.get('sample_count', 0)}/{status.get('min_samples', 200)} "
+                f"(target/HOLD={status.get('positive_count', 0)}/{status.get('negative_count', 0)}); "
+                f"AUC={status.get('validation_auc', 0.5):.3f}; "
+                f"Brier={status.get('validation_brier', 0.25):.4f}/"
+                f"{status.get('baseline_brier', 0.25):.4f}; "
+                f"причина: {status.get('not_ready_reason', 'не указана')}; "
+                f"порог BUY={status.get('min_probability', 0.62):.0%}")
+
+    def _metrics(self, tickers: List[str]) -> Dict[str, Any]:
+        getter = getattr(self._client, "get_scalp_quote", None)
+        stream_fresh, rest_fresh, stale, missing, changed_recent = [], [], [], [], []
+        for ticker in tickers:
+            quote = getter(ticker) if callable(getter) else None
+            if not quote:
+                missing.append(ticker)
+                continue
+            age = _number(quote.get("price_age_sec"), 9999.0)
+            change_age = _number(quote.get("price_change_age_sec"), 9999.0)
+            if change_age <= 8.0:
+                changed_recent.append(ticker)
+            if age <= 8.0:
+                if str(quote.get("price_source") or "stream") == "rest":
+                    rest_fresh.append(ticker)
+                else:
+                    stream_fresh.append(ticker)
+            else:
+                stale.append(ticker)
+        now = time.time()
+        since = now - 3600
+        sample_count = self._db.execute("SELECT COUNT(*) FROM samples WHERE ts>=?", (since,)).fetchone()[0]
+        trigger_count = self._db.execute("SELECT COUNT(*) FROM samples WHERE ts>=? AND signal_json IS NOT NULL", (since,)).fetchone()[0]
+        shadow_count = self._db.execute("SELECT COUNT(*) FROM samples WHERE ts>=? AND shadow_json IS NOT NULL AND signal_json IS NULL", (since,)).fetchone()[0]
+        labelled = self._db.execute("SELECT COUNT(*) FROM samples WHERE ts>=? AND label IN ('target','stop')", (now - 86400,)).fetchone()[0]
+        missed = self._db.execute("SELECT COUNT(*) FROM samples WHERE ts>=? AND missed=1", (now - 86400,)).fetchone()[0]
+        since_day = now - 86400
+        trade_rows = self._db.execute("""SELECT side,pnl_rub,pnl_pct FROM trades
+            WHERE ts>=? ORDER BY ts""", (since_day,)).fetchall()
+        sells = [r for r in trade_rows if r["side"] == "sell" and r["pnl_rub"] is not None]
+        wins = sum(1 for r in sells if float(r["pnl_rub"]) > 0)
+        losses = sum(1 for r in sells if float(r["pnl_rub"]) < 0)
+        entry_events = self._db.execute("SELECT COUNT(*) FROM events WHERE ts>=? AND kind='entry_pipeline'",
+                                        (since_day,)).fetchone()[0]
+        blocked_rows = self._db.execute("SELECT details FROM events WHERE ts>=? AND kind='entry_blocked'",
+                                        (since_day,)).fetchall()
+        blocked_events = len(blocked_rows)
+        blocked_reasons: Dict[str, int] = {}
+        for item in blocked_rows:
+            try:
+                reason = str(json.loads(item[0]).get("reason", "unknown"))
+            except (TypeError, json.JSONDecodeError):
+                reason = "unknown"
+            blocked_reasons[reason] = blocked_reasons.get(reason, 0) + 1
+        no_signal_rows = self._db.execute(
+            "SELECT reason,COUNT(*) n FROM samples WHERE ts>=? AND signal_json IS NULL "
+            "AND shadow_json IS NULL GROUP BY reason ORDER BY n DESC LIMIT 3",
+            (now - 3600,)).fetchall()
+        no_signal_reasons = [(str(r["reason"] or "не указана"), int(r["n"]))
+                             for r in no_signal_rows]
+        return {
+            "tickers_total": len(tickers), "price_stream_fresh": len(stream_fresh),
+            "price_rest_fresh": len(rest_fresh), "price_stale": len(stale),
+            "price_changed_recent": len(changed_recent),
+            "price_missing": missing[:20], "stream_tickers": stream_fresh[:20],
+            "rest_tickers": rest_fresh[:20], "samples_1h": sample_count,
+            "signals_1h": trigger_count, "shadow_candidates_1h": shadow_count,
+            "labelled_24h": labelled, "missed_profitable_24h": missed,
+            "closed_trades_24h": len(sells), "buys_24h": sum(1 for r in trade_rows if r["side"] == "buy"),
+            "sells_24h": len(sells), "wins_24h": wins, "losses_24h": losses,
+            "win_rate_24h": (wins / len(sells)) if sells else None,
+            "entry_events_24h": int(entry_events), "blocked_events_24h": int(blocked_events),
+            "blocked_reasons_24h": blocked_reasons, "no_signal_reasons_1h": no_signal_reasons,
+            "trading_enabled": bool(getattr(self._state, "trading_enabled", False)),
+            "net_pnl_24h_rub": round(sum(float(r["pnl_rub"]) for r in sells), 2),
+            "open_positions": len(getattr(self._state, "positions", {}) or {}),
+        }
+
+    def _needs_groq(self, m: Dict[str, Any]) -> bool:
+        bad_feed = (m["tickers_total"] > 0 and
+                    (m["price_stream_fresh"] + m["price_rest_fresh"]) / m["tickers_total"] < 0.60)
+        missed = int(m["missed_profitable_24h"]) >= 3
+        losses = int(m["closed_trades_24h"]) >= 4 and float(m["net_pnl_24h_rub"]) < 0
+        starvation = (int(m["samples_1h"]) > 100 and
+                      int(m["signals_1h"]) + int(m["shadow_candidates_1h"]) == 0)
+        return bad_feed or missed or losses or starvation
+
+    async def _ask_groq(self, metrics: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if (not self._groq_enabled or self._analyst is None
+                or getattr(self._analyst, "decision_backend", "groq") == "local"):
+            return None
+        now = time.monotonic()
+        if now - self._last_groq < self._groq_interval_sec:
+            return None
+        chat = getattr(self._analyst, "_chat", None)
+        if not callable(chat):
+            return None
+        # Собираем доказательства, а не весь лог: запрос редкий и небольшой.
+        evidence = self._db.execute(
+            "SELECT ts,ticker,kind,details FROM events ORDER BY id DESC LIMIT 30").fetchall()
+        event_data = [{"ts": r["ts"], "ticker": r["ticker"],
+                       "kind": r["kind"], "details": r["details"][:1000]} for r in evidence]
+        missed_rows = self._db.execute("""SELECT ticker,price,cost_pct,stop_pct,reason,
+            stage,label,label_net_pct,shadow_json FROM samples WHERE missed=1
+            ORDER BY ts DESC LIMIT 8""").fetchall()
+        rejected_rows = self._db.execute("""SELECT ticker,reason,stage,price_source,price_age,
+            book_age,spread_pct,cost_pct FROM samples WHERE ts>? ORDER BY ts DESC LIMIT 15""",
+            (time.time() - 3600,)).fetchall()
+        user = _json({"metrics": metrics, "recent_events": event_data,
+                      "missed_opportunities": [dict(r) for r in missed_rows],
+                      "recent_pipeline_samples": [dict(r) for r in rejected_rows],
+                      "recent_filtered_log_excerpt": self._recent_log_excerpt(),
+                      "current_policy": self.current_policy()})
+        try:
+            raw = await chat(_SYSTEM_PROMPT, user[:14000], max_tokens=650,
+                             temperature=0.1, tries=1,
+                             response_format={"type": "json_object"})
+            result = json.loads(raw[raw.find("{"):raw.rfind("}") + 1])
+            if not isinstance(result, dict):
+                return None
+            self._last_groq = now
+            self.record_event("groq_diagnosis", severity=result.get("severity", "info"),
+                              root_cause=str(result.get("root_cause", ""))[:1200],
+                              evidence=result.get("evidence", []),
+                              target_file=result.get("target_file", ""))
+            return result
+        except Exception as exc:  # rate/TPD/JSON errors are non-fatal
+            log.warning("Supervisor: Groq-диагностика не выполнена: %s", exc)
+            self._last_groq = now
+            return None
+
+    @staticmethod
+    def _relevant_source_excerpt(target: str, source_text: str) -> str:
+        try:
+            import ast
+            tree = ast.parse(source_text)
+            wanted = {
+                "trading_engine.py": {"scalp_stream_cycle", "_dip_trigger", "_shadow_dip_trigger",
+                                      "_any_micro_trigger", "_process_ticker", "_evaluate_entry",
+                                      "_scalp_fasttrack_decision", "_flush_scalp_ai_queue"},
+                "tinkoff_client.py": {"refresh_stale_prices", "refresh_stale_books", "get_scalp_quote",
+                                      "_handle_scalp_stream_event", "_scalp_feed_loop"},
+                "scalp_microstructure.py": {"detect_multiscale_dip_trigger",
+                                            "detect_micro_impulse_trigger",
+                                            "detect_dip_reversal_trigger"},
+                "config.py": {"_env_int", "_env_float", "load_config"},
+            }.get(target, set())
+            lines = source_text.splitlines()
+            chunks = []
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in wanted:
+                    start = max(1, int(node.lineno) - 3)
+                    end = min(len(lines), int(getattr(node, "end_lineno", node.lineno)) + 3)
+                    chunks.append(f"# lines {start}-{end}: {node.name}\n" + "\n".join(lines[start-1:end]))
+            # Keep useful methods within context limits, preferring named core functions.
+            result = "\n\n".join(chunks)
+            if result:
+                return result[:22000]
+        except Exception:
+            pass
+        return source_text[:22000]
+
+    async def _prepare_patch(self, diagnosis: Dict[str, Any], metrics: Dict[str, Any]) -> Optional[str]:
+        """Генерирует и тестирует patch в копии; активные файлы не меняет."""
+        target = str(diagnosis.get("target_file") or "").strip()
+        instructions = str(diagnosis.get("patch_instructions") or "").strip()
+        if (not self._generate_patches or not diagnosis.get("code_change_needed")
+                or target not in _ALLOWED_PATCH_FILES or not instructions):
+            return None
+        source = self._root / target
+        if not source.is_file():
+            return None
+        try:
+            source_text = source.read_text(encoding="utf-8")
+        except OSError:
+            return None
+        # Не отправляем начало большого файла наугад: извлекаем методы,
+        # относящиеся к потоку цен, детектору и входам.
+        source_excerpt = self._relevant_source_excerpt(target, source_text)
+        system = ("Ты опытный Python-разработчик. Создай минимальный unified diff patch. "
+                  "Не меняй другие файлы, API-безопасность, стопы, лимиты риска или издержки. "
+                  "Ответи только diff с заголовками --- a/FILE и +++ b/FILE.")
+        user = (f"Проблема: {diagnosis.get('root_cause')}\n"
+                f"Инструкции: {instructions}\nМетрики: {_json(metrics)}\n"
+                f"Файл {target}:\n{source_excerpt}")
+        try:
+            patch_raw = await self._analyst._chat(system, user[:24000], max_tokens=1800,
+                                                  temperature=0.1, tries=1)
+        except Exception as exc:
+            log.warning("Supervisor: Groq не смог подготовить patch: %s", exc)
+            return None
+        patch = patch_raw.strip()
+        if patch.startswith("```"):
+            patch = patch.strip("`").strip()
+            if patch.lower().startswith("diff"):
+                patch = patch[4:].lstrip()
+        if f"--- a/{target}" not in patch or f"+++ b/{target}" not in patch:
+            log.warning("Supervisor: Groq patch отклонён - нет корректных заголовков для %s", target)
+            return None
+        # Убедимся, что в diff нет выхода за allowlist.
+        for line in patch.splitlines():
+            if line.startswith(("--- ", "+++ ")):
+                path = line[4:].split("\t", 1)[0]
+                if path == "/dev/null":
+                    continue
+                if path.startswith(("a/", "b/")):
+                    path = path[2:]
+                if path != target:
+                    log.warning("Supervisor: patch отклонён - затрагивает запрещённый файл %s", path)
+                    return None
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        proposal_dir = self._proposals_dir / stamp
+        proposal_dir.mkdir(parents=True, exist_ok=True)
+        patch_path = proposal_dir / "proposal.diff"
+        patch_path.write_text(patch + "\n", encoding="utf-8")
+        report_path = proposal_dir / "diagnosis.json"
+        report_path.write_text(json.dumps({"diagnosis": diagnosis, "metrics": metrics},
+                                          ensure_ascii=False, indent=2), encoding="utf-8")
+        status = self._validate_patch_in_staging(patch_path, target, stamp)
+        (proposal_dir / "TEST_STATUS.txt").write_text(status, encoding="utf-8")
+        self.record_event("patch_prepared", target=target, proposal=str(proposal_dir), status=status)
+        return f"{proposal_dir} ({status})"
+
+    def _validate_patch_in_staging(self, patch_path: Path, target: str, stamp: str) -> str:
+        """Проверка patch в копии проекта: compileall + регрессионные тесты."""
+        stage = self._staging_dir / stamp
+        try:
+            if stage.exists():
+                shutil.rmtree(stage)
+            shutil.copytree(self._root, stage, ignore=shutil.ignore_patterns(
+                ".env", ".git", "venv", ".venv", "__pycache__", "logs", "data", "*.pyc"))
+            if not shutil.which("git"):
+                return "NOT_TESTED: git executable отсутствует; patch сохранён для ручной проверки"
+            check = subprocess.run(["git", "apply", "--check", str(patch_path)],
+                                   cwd=stage, capture_output=True, text=True, timeout=20)
+            if check.returncode != 0:
+                return "REJECTED: git apply --check: " + (check.stderr or check.stdout)[-1000:]
+            applied = subprocess.run(["git", "apply", str(patch_path)], cwd=stage,
+                                     capture_output=True, text=True, timeout=20)
+            if applied.returncode != 0:
+                return "REJECTED: git apply: " + (applied.stderr or applied.stdout)[-1000:]
+            compile_result = subprocess.run(
+                [sys.executable, "-m", "compileall", "-q", "."], cwd=stage,
+                capture_output=True, text=True, timeout=60)
+            if compile_result.returncode != 0:
+                return "REJECTED: compileall: " + (compile_result.stderr or compile_result.stdout)[-1200:]
+            test_paths = [f for f in _PATCH_TESTS if (stage / f).is_file()]
+            if test_paths and shutil.which("pytest"):
+                tests = subprocess.run([sys.executable, "-m", "pytest", "-q", *test_paths,
+                                        "--disable-warnings", "--maxfail=1"],
+                                       cwd=stage, capture_output=True, text=True, timeout=180)
+                if tests.returncode != 0:
+                    return "REJECTED: tests failed: " + (tests.stdout + tests.stderr)[-2000:]
+                return "STAGING_TESTS_PASS: " + tests.stdout.strip().splitlines()[-1]
+            return "STAGING_COMPILE_PASS: pytest unavailable or no tests; manual review required"
+        except subprocess.TimeoutExpired:
+            return "NOT_TESTED: staging validation timeout"
+        except Exception as exc:
+            return f"NOT_TESTED: {type(exc).__name__}: {exc}"
+
+    async def _cycle(self) -> None:
+        tickers = sorted(set(str(t).upper() for t in self._get_tickers() if t))
+        metrics = self._metrics(tickers)
+        cycle_now = time.time()
+        labels = self._label_pending(cycle_now)
+        ml_labels = self._label_ml_pending(cycle_now)
+        ml_update = self._train_local_model()
+        if sum(ml_labels.values()) > 0 and self._cycle_count % 5 == 0:
+            log.info("Supervisor ML-разметка: target=%d, HOLD/no-target=%d, без данных=%d, ждут=%d",
+                     ml_labels["up"], ml_labels["not_up"], ml_labels["neutral"], ml_labels["pending"])
+        if ml_update:
+            log.info("Supervisor: локальная ML-модель обновлена: n=%d, target=%d, HOLD/no-target=%d, "
+                     "AUC=%.3f, ready=%s; новых размеченных=%d",
+                     ml_update.get("sample_count", 0), ml_update.get("positive_count", 0),
+                     ml_update.get("negative_count", 0), ml_update.get("validation_auc", 0.5),
+                     ml_update.get("ready", False), ml_update.get("new_samples", 0))
+        policy_update = self._auto_tune(time.time())
+        log.info("Supervisor: снимки stream=%d REST=%d stale=%d/%d; "
+                 "реальные изменения цены за 8с=%d/%d; "
+                 "оценок детектора/ч=%d, триггеров=%d, теневых ям=%d; "
+                 "прибыльных пропусков/24ч=%d; блокировки/24ч=%d; "
+                 "автоторговля=%s; net P&L/24ч=%+.2f ₽",
+                 metrics["price_stream_fresh"], metrics["price_rest_fresh"],
+                 metrics["price_stale"], metrics["tickers_total"],
+                 metrics["price_changed_recent"], metrics["tickers_total"],
+                 metrics["samples_1h"], metrics["signals_1h"],
+                 metrics["shadow_candidates_1h"], metrics["missed_profitable_24h"],
+                 metrics["blocked_events_24h"],
+                 "ВКЛ" if metrics["trading_enabled"] else "ВЫКЛ",
+                 metrics["net_pnl_24h_rub"])
+        model = getattr(self._analyst, "local_model", None)
+        if model is not None:
+            ms = model.status()
+            log.info("Supervisor ML: ready=%s, samples=%d (target=%d/HOLD=%d), "
+                     "holdout AUC=%.3f, Brier=%.4f/baseline %.4f; причина=%s",
+                     ms.get("ready"), ms.get("sample_count", 0),
+                     ms.get("positive_count", 0), ms.get("negative_count", 0),
+                     ms.get("validation_auc", 0.5), ms.get("validation_brier", 0.25),
+                     ms.get("baseline_brier", 0.25), ms.get("not_ready_reason", "не указана"))
+        if metrics["samples_1h"] == 0:
+            if metrics["price_changed_recent"] == 0:
+                log.info("Supervisor: новых изменений цены сейчас нет; свежие REST-снимки "
+                         "не считаются новыми тиками. Детектор ждёт реального движения.")
+            else:
+                log.warning("Supervisor: есть изменения цены, но за последний час не зафиксировано "
+                            "ни одной оценки детектора. Проверь price_seq/scalp_stream_cycle.")
+        if policy_update:
+            await self._safe_notify(
+                "🧠 Supervisor обучил локальные пороги на размеченных контрфактических "
+                f"сделках: {policy_update['reason']}. Новые min_score="
+                f"{policy_update['dip_min_score']:.1f}, min_drop="
+                f"{policy_update['dip_min_drop_pct']:.4f}%. Доказательств: "
+                f"{policy_update['evidence_n']}, win-rate={policy_update['win_rate']:.0%}."
+            )
+        bad_feed = metrics["tickers_total"] > 0 and (
+            metrics["price_stream_fresh"] + metrics["price_rest_fresh"]
+        ) / metrics["tickers_total"] < 0.60
+        now_mono = time.monotonic()
+        if bad_feed and time.monotonic() - self._started_mono >= 180.0 and now_mono - self._last_alert >= 1800:
+            self._last_alert = now_mono
+            await self._safe_notify(
+                "⚠️ Supervisor: недостаточно свежих цен даже после REST-fallback. "
+                f"Stream={metrics['price_stream_fresh']}, REST={metrics['price_rest_fresh']}, "
+                f"stale={metrics['price_stale']} из {metrics['tickers_total']}. "
+                "Новые входы могут быть пропущены; смотри supervisor.sqlite3 и bot.log."
+            )
+        # Не отправляем Groq ложную тревогу во время холодного старта, когда
+        # stream ещё подключается, а первый REST snapshot ещё не пришёл.
+        startup_ready = time.monotonic() - self._started_mono >= 180.0
+        if startup_ready and self._needs_groq(metrics):
+            diagnosis = await self._ask_groq(metrics)
+            if diagnosis:
+                patch_ref = await self._prepare_patch(diagnosis, metrics)
+                message = (
+                    "🧠 Groq Supervisor обнаружил проблему.\n"
+                    f"Важность: {diagnosis.get('severity', 'unknown')}\n"
+                    f"Причина: {str(diagnosis.get('root_cause', 'нет описания'))[:700]}\n"
+                    "Доказательства: " + "; ".join(str(x) for x in diagnosis.get("evidence", [])[:4])
+                )
+                if patch_ref:
+                    message += f"\nPatch и отчёт в staging: {patch_ref}"
+                    message += "\nЖивые файлы НЕ заменены: сначала требуется проверка и подтверждение."
+                await self._safe_notify(message[:3500])
+        # Храним 30 дней, чтобы SQLite не рос бесконечно.
+        if self._cycle_count % 60 == 0:
+            cutoff = time.time() - 30 * 86400
+            self._db.execute("DELETE FROM samples WHERE ts<?", (cutoff,))
+            self._db.execute("DELETE FROM events WHERE ts<?", (cutoff,))
+            self._db.execute("DELETE FROM trades WHERE ts<?", (cutoff,))
+            self._db.commit()
+        self._cycle_count += 1
+
+    async def _safe_notify(self, message: str) -> None:
+        try:
+            await self._notify(message)
+        except Exception as exc:
+            log.warning("Supervisor: Telegram-уведомление не отправлено: %s", exc)
+
+    async def run(self) -> None:
+        backend = getattr(self._analyst, "decision_backend", "groq") if self._analyst else "none"
+        log.info("Learning Supervisor запущен: SQLite=%s; interval=%ds; lookahead=%ds; "
+                 "backend=%s; Groq-diagnostics=%s; auto_tune=%s; code patches=staging only",
+                 self._db_path, self._interval_sec, self._lookahead_sec,
+                 backend, self._groq_enabled and backend != "local", self._auto_tune_enabled)
+        if not self._enabled:
+            log.info("Learning Supervisor выключен: SUPERVISOR_ENABLED=false")
+            return
+        while not self._stop.is_set():
+            try:
+                await self._cycle()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Supervisor: ошибка цикла; торговый движок продолжает работу")
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=self._interval_sec)
+            except asyncio.TimeoutError:
+                pass
+        log.info("Learning Supervisor остановлен")

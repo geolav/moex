@@ -1,0 +1,59 @@
+# ============================================================================
+# systemd unit для автозапуска и авто-восстановления MOEX Trading Bot.
+#
+# Установка (Ubuntu VPS):
+#   1) Разместите проект в /opt/trading_bot (см. README.md)
+#   2) sudo cp trading_bot.service /etc/systemd/system/
+#   3) sudo systemctl daemon-reload
+#   4) sudo systemctl enable --now trading_bot
+#
+# Полезные команды:
+#   systemctl status trading_bot          - статус
+#   journalctl -u trading_bot -f          - поток логов journald
+#   sudo systemctl restart trading_bot    - перезапуск
+#   sudo systemctl stop trading_bot       - остановка (корректная, SIGINT)
+# ============================================================================
+
+[Unit]
+Description=MOEX Trading Bot (T-Invest API + Groq AI + Telegram)
+Documentation=https://developer.tbank.ru/invest/
+# Ждём сеть, чтобы токены и API были доступны сразу после старта VPS
+After=network-online.target
+Wants=network-online.target
+# 0 = не блокировать перезапуски: бот обязан восстанавливаться всегда
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=botuser
+Group=botuser
+WorkingDirectory=/opt/trading_bot
+# Все секреты только через окружение, никаких хардкодов в коде
+EnvironmentFile=/opt/trading_bot/.env
+ExecStart=/opt/trading_bot/venv/bin/python /opt/trading_bot/main.py
+
+# --- Надежность: авто-восстановление после любых сбоев ----------------------
+Restart=always
+RestartSec=15
+
+# --- Корректная остановка: SIGINT -> graceful shutdown в main.py ------------
+KillSignal=SIGINT
+TimeoutStopSec=40
+
+# --- Защита VPS с 1 ГБ ОЗУ ---------------------------------------------------
+# Жёсткий потолок памяти процесса (бот реально потребляет ~120-180 МБ).
+# Если утечка памяти всё-таки произойдёт, systemd убьёт процесс и
+# Restart=always поднимет его через 15 секунд - вместо падения всего VPS.
+MemoryMax=400M
+# Не даём боту забирать весь CPU однопоточного VPS
+CPUQuota=50%
+
+# --- Логирование --------------------------------------------------------------
+# Основной лог пишется в /opt/trading_bot/logs/bot.log (ротация 5 МБ x 3).
+# В journald дублируется stdout/stderr для journalctl.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trading-bot
+
+[Install]
+WantedBy=multi-user.target
