@@ -29,6 +29,7 @@ class MarketDataset:
     days: np.ndarray              # YYYY-MM-DD, chronological split key
     sources: np.ndarray           # candle / supervisor_missed / supervisor_actual / supervisor_counterfactual
     event_rows_used: int = 0
+    event_rows_skipped_actual_horizon: int = 0
 
 
 def _as_float(series: pd.Series, default: float = 0.0) -> pd.Series:
@@ -100,31 +101,77 @@ def _features_for_group(group: pd.DataFrame) -> np.ndarray:
     times = (pd.DatetimeIndex(pd.to_datetime(group["begin"]))
              .tz_localize(MOSCOW).asi8 // 1_000_000_000).astype(np.int64)
 
+    close_s = pd.Series(close)
+    low_s = pd.Series(low)
+    high_s = pd.Series(high)
+    log_volume = np.log1p(np.maximum(volume, 0.0))
+    log_volume_s = pd.Series(log_volume)
+
     prev_close = np.r_[close[0], close[:-1]]
     logret = np.log(np.maximum(close, 1e-12) / np.maximum(prev_close, 1e-12)) * 100.0
+    logret_s = pd.Series(logret)
     body = np.log(np.maximum(close, 1e-12) / np.maximum(opn, 1e-12)) * 100.0
     range_pct = np.log(np.maximum(high, 1e-12) / np.maximum(low, 1e-12)) * 100.0
     upper = np.log(np.maximum(high, np.maximum(opn, close)) /
                    np.maximum(np.maximum(opn, close), 1e-12)) * 100.0
     lower = np.log(np.minimum(opn, close) / np.maximum(low, 1e-12)) * 100.0
     close_location = (close - low) / np.maximum(high - low, 1e-12)
-    log_volume = np.log1p(np.maximum(volume, 0.0))
-    vol_mean = pd.Series(log_volume).rolling(30, min_periods=5).mean().to_numpy()
-    vol_std = pd.Series(log_volume).rolling(30, min_periods=5).std(ddof=0).to_numpy()
-    vol_mean = np.where(np.isfinite(vol_mean), vol_mean, np.nanmean(log_volume))
-    vol_std = np.where(np.isfinite(vol_std) & (vol_std > 1e-6), vol_std, 1.0)
-    volume_z = np.clip((log_volume - vol_mean) / vol_std, -5.0, 5.0)
+
+    def rolling_z(values: pd.Series, window: int) -> np.ndarray:
+        minimum = max(3, window // 4)
+        mean = values.rolling(window, min_periods=minimum).mean()
+        std = values.rolling(window, min_periods=minimum).std(ddof=0)
+        z = (values - mean) / std.where(std > 1e-6, np.nan)
+        return np.clip(z.fillna(0.0).to_numpy(dtype=np.float64), -5.0, 5.0)
+
+    def trailing_return(window: int) -> np.ndarray:
+        previous = close_s.shift(window)
+        result = np.log(close_s / previous) * 100.0
+        return np.clip(result.replace([np.inf, -np.inf], np.nan).fillna(0.0).to_numpy(), -15.0, 15.0)
+
+    def realized_vol(window: int) -> np.ndarray:
+        minimum = max(3, window // 3)
+        result = logret_s.rolling(window, min_periods=minimum).std(ddof=0) * np.sqrt(window)
+        return np.clip(result.fillna(0.0).to_numpy(dtype=np.float64), 0.0, 15.0)
+
+    def trend_efficiency(window: int) -> np.ndarray:
+        numerator = trailing_return(window)
+        denominator = logret_s.abs().rolling(window, min_periods=max(3, window // 3)).sum()
+        denominator = denominator.to_numpy(dtype=np.float64)
+        return np.clip(numerator / np.maximum(denominator, 1e-6), -1.0, 1.0)
+
+    def range_position(window: int) -> np.ndarray:
+        rolling_low = low_s.rolling(window, min_periods=max(3, window // 3)).min().to_numpy()
+        rolling_high = high_s.rolling(window, min_periods=max(3, window // 3)).max().to_numpy()
+        value = (close - rolling_low) / np.maximum(rolling_high - rolling_low, 1e-12)
+        return np.clip(np.nan_to_num(value, nan=0.5, posinf=0.5, neginf=0.5), 0.0, 1.0)
+
+    volume_mean = log_volume_s.rolling(30, min_periods=5).mean()
+    volume_std = log_volume_s.rolling(30, min_periods=5).std(ddof=0)
+    volume_z30 = ((log_volume_s - volume_mean) /
+                  volume_std.where(volume_std > 1e-6, np.nan)).fillna(0.0).to_numpy()
+
     gap_minutes = np.r_[1.0, np.maximum(0.0, np.diff(times) / 60.0)]
     gap_minutes = np.clip(gap_minutes, 0.0, 60.0)
     dt = pd.to_datetime(group["begin"])
-    minute_of_day = (dt.dt.hour.to_numpy() * 60.0 + dt.dt.minute.to_numpy())
+    minute_of_day = dt.dt.hour.to_numpy() * 60.0 + dt.dt.minute.to_numpy()
     angle = 2.0 * np.pi * minute_of_day / 1440.0
+
+    # Все дополнительные статистики строятся только по текущей и прошлым
+    # свечам. Будущая цена не попадает в признаки.
     features = np.column_stack([
         np.clip(logret, -5.0, 5.0), np.clip(body, -5.0, 5.0),
         np.clip(range_pct, 0.0, 10.0), np.clip(upper, 0.0, 5.0),
         np.clip(lower, 0.0, 5.0), np.clip(close_location, 0.0, 1.0),
-        np.clip(log_volume, 0.0, 30.0), volume_z, np.log1p(gap_minutes),
-        np.sin(angle), np.cos(angle), np.zeros(len(group), dtype=np.float64),
+        np.clip(log_volume, 0.0, 30.0), np.clip(volume_z30, -5.0, 5.0),
+        np.log1p(gap_minutes), np.sin(angle), np.cos(angle),
+        trailing_return(3), trailing_return(5), trailing_return(10),
+        trailing_return(20), trailing_return(60),
+        realized_vol(5), realized_vol(15), realized_vol(30), realized_vol(60),
+        rolling_z(log_volume_s, 5), rolling_z(log_volume_s, 60),
+        trend_efficiency(10), trend_efficiency(30),
+        range_position(20), range_position(60),
+        np.zeros(len(group), dtype=np.float64),
     ])
     return np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
 
@@ -153,7 +200,7 @@ def _read_supervisor_events(db_path: str | Path | None) -> list[dict[str, Any]]:
         select_cols = [
             "id", "ts", "ticker", "price", "features_json", "stage", "missed",
             "ml_label", "ml_return_pct", "ml_source", "label", "label_net_pct",
-            "actual_pnl_pct", "has_position", "cost_pct",
+            "actual_pnl_pct", "ml_updated_ts", "has_position", "cost_pct",
         ]
         select_cols = [c for c in select_cols if c in columns]
         rows = conn.execute(
@@ -183,8 +230,16 @@ def _event_label(event: dict[str, Any], cost_pct: float) -> tuple[int, float, st
         if raw_actual is None:
             return None
         net_return = float(raw_actual)
-        gross_return = net_return + cost_pct
-        label = _classify(gross_return, cost_pct)
+        # actual_pnl_pct / ml_return_pct уже NET: повторно применять к ним
+        # полные издержки нельзя. Оставляем небольшую нейтральную зону против
+        # шума округления и микроскопических результатов.
+        deadband = max(0.01, min(float(cost_pct) * 0.10, 0.05))
+        if net_return > deadband:
+            label = 2
+        elif net_return < -deadband:
+            label = 0
+        else:
+            label = 1
         return label, net_return, "actual"
 
     ml_label = event.get("ml_label")
@@ -209,7 +264,7 @@ def build_dataset(
     *,
     sqlite_path: str | Path | None = None,
     sequence_length: int = 60,
-    sample_stride: int = 3,
+    sample_stride: int = 8,
     round_trip_cost_pct: float = 0.20,
     event_horizon_seconds: int = 300,
     event_max_age_seconds: int = 120,
@@ -256,6 +311,7 @@ def build_dataset(
     # upper bound is known. The final count can only be lower than this bound.
     events = _read_supervisor_events(sqlite_path)
     prepared_events: list[tuple[dict[str, Any], int, str, str]] = []
+    event_rows_skipped_actual_horizon = 0
     for event in events:
         ticker = str(event.get("ticker") or "").upper()
         try:
@@ -265,10 +321,22 @@ def build_dataset(
         is_actual = str(event.get("ml_source") or "") == "actual" or str(event.get("stage") or "") == "bought"
         if not ticker or ts <= 0 or (bool(event.get("has_position", 0)) and not is_actual):
             continue
-        dt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(MOSCOW).replace(tzinfo=None)
-        day = dt.strftime("%Y-%m-%d")
         if _event_label(event, round_trip_cost_pct) is None:
             continue
+        if is_actual:
+            # Реализованный P&L относится к фактической длительности сделки,
+            # а не автоматически к 5-минутному горизонту. ml_updated_ts
+            # записывается при закрытии сделки в Supervisor.record_trade.
+            try:
+                exit_ts = float(event.get("ml_updated_ts") or 0.0)
+            except (TypeError, ValueError):
+                exit_ts = 0.0
+            duration = exit_ts - ts
+            if exit_ts <= 0 or duration <= 0 or duration > event_horizon_seconds:
+                event_rows_skipped_actual_horizon += 1
+                continue
+        dt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(MOSCOW).replace(tzinfo=None)
+        day = dt.strftime("%Y-%m-%d")
         prepared_events.append((event, int(ts), ticker, day))
 
     def event_priority(item: tuple[dict[str, Any], int, str, str]) -> tuple[str, int, int]:
@@ -407,6 +475,7 @@ def build_dataset(
         tickers=np.asarray(tickers), timestamps=np.asarray(timestamps),
         days=np.asarray(days), sources=np.asarray(sources),
         event_rows_used=event_rows_used,
+        event_rows_skipped_actual_horizon=event_rows_skipped_actual_horizon,
     )
 
 def chronological_split(days: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, list[str]]]:

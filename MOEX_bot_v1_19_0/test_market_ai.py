@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 
 from market_ai.data import _event_label, build_dataset, chronological_split, load_candles
+from market_ai.models import calibrate_signal_threshold, standardize_sequences
 
 MSK = ZoneInfo("Europe/Moscow")
 
@@ -46,7 +47,7 @@ class MarketAIDataTests(unittest.TestCase):
         frame = synthetic_candles(days=5, bars_per_day=390)
         ds = build_dataset(frame, sequence_length=30, sample_stride=5,
                            round_trip_cost_pct=0.05)
-        self.assertEqual(ds.x.shape[1:], (30, 12))
+        self.assertEqual(ds.x.shape[1:], (30, len(__import__("market_ai").FEATURE_NAMES)))
         self.assertEqual(ds.y.shape[1], 7)
         self.assertEqual(ds.mask.shape, ds.y.shape)
         self.assertTrue(ds.mask[:, 0].any())
@@ -93,6 +94,34 @@ class MarketAIDataTests(unittest.TestCase):
         self.assertTrue(ds.timestamps[i].endswith("12:29:00"))
 
 
+    def test_actual_trade_longer_than_five_minutes_is_not_added_to_five_min_head(self):
+        frame = synthetic_candles(days=5, bars_per_day=390)
+        row = frame[(frame.ticker == "SBER") & (frame.trade_day == "2026-01-06")].iloc[150]
+        event_ts = row.begin.replace(tzinfo=MSK).timestamp() + 20
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "supervisor.sqlite3"
+            conn = sqlite3.connect(db)
+            conn.execute("""CREATE TABLE samples (
+                id INTEGER PRIMARY KEY, ts REAL, ticker TEXT, price REAL,
+                features_json TEXT, stage TEXT, missed INTEGER, ml_label INTEGER,
+                ml_return_pct REAL, ml_source TEXT, label TEXT, label_net_pct REAL,
+                actual_pnl_pct REAL, ml_updated_ts REAL, has_position INTEGER,
+                cost_pct REAL, signal_json TEXT, shadow_json TEXT
+            )""")
+            conn.execute("""INSERT INTO samples VALUES(1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
+                event_ts, "SBER", float(row.close), json.dumps([0.0] * 13),
+                "bought", 0, 1, 0.35, "actual", None, None,
+                0.35, event_ts + 301, 1, 0.20, None, "{}",
+            ))
+            conn.commit()
+            conn.close()
+            ds = build_dataset(frame, sqlite_path=db, sequence_length=30,
+                               sample_stride=5, round_trip_cost_pct=0.20,
+                               event_horizon_seconds=300)
+        self.assertEqual(ds.event_rows_used, 0)
+        self.assertEqual(ds.event_rows_skipped_actual_horizon, 1)
+        self.assertFalse(np.any(ds.sources == "supervisor_actual"))
+
     def test_binary_supervisor_hold_is_not_mislabeled_as_down(self):
         label, net_return, source = _event_label({
             "ml_source": "counterfactual", "ml_label": 0, "ml_return_pct": -0.08,
@@ -108,6 +137,51 @@ class MarketAIDataTests(unittest.TestCase):
         self.assertEqual(label, 0)
         self.assertAlmostEqual(net_return, -0.45)
         self.assertEqual(source, "actual")
+
+    def test_standardization_is_in_place_and_matches_train_only_statistics(self):
+        rng = np.random.default_rng(17)
+        original = rng.normal(size=(40, 12, 5)).astype(np.float32)
+        expected_source = original.copy()
+        train_idx = np.arange(0, 30, dtype=np.int64)
+        train_values = expected_source[train_idx].reshape(-1, expected_source.shape[-1]).astype(np.float64)
+        mean = train_values.mean(axis=0)
+        scale = train_values.std(axis=0)
+        scale = np.where(scale < 1e-6, 1.0, scale)
+        expected = np.clip((expected_source - mean) / scale, -8.0, 8.0).astype(np.float32)
+
+        result, actual_mean, actual_scale = standardize_sequences(original, train_idx, chunk_size=7)
+        self.assertIs(result, original)
+        np.testing.assert_allclose(actual_mean, mean.astype(np.float32), rtol=1e-6, atol=1e-6)
+        np.testing.assert_allclose(actual_scale, scale.astype(np.float32), rtol=1e-5, atol=1e-6)
+        np.testing.assert_allclose(result, expected, rtol=2e-5, atol=2e-5)
+
+
+    def test_actual_net_pnl_is_not_charged_costs_twice(self):
+        label, net_return, source = _event_label({
+            "ml_source": "actual", "stage": "bought", "actual_pnl_pct": -0.15,
+        }, cost_pct=0.20)
+        self.assertEqual(label, 0)
+        self.assertAlmostEqual(net_return, -0.15)
+        self.assertEqual(source, "actual")
+
+    def test_signal_threshold_uses_validation_returns_and_disables_bad_edge(self):
+        # Синтетически отделяем 70 сильных UP сигналов с положительным net.
+        probabilities = np.zeros((200, 3), dtype=np.float64)
+        probabilities[:, 1] = 0.80
+        probabilities[:, 2] = 0.10
+        probabilities[:, 0] = 0.10
+        probabilities[:70, 1] = 0.10
+        probabilities[:70, 2] = 0.80
+        probabilities[:70, 0] = 0.10
+        gross = np.full(200, 0.05, dtype=np.float64)
+        gross[:70] = 0.50
+        calibrated = calibrate_signal_threshold(gross, probabilities, cost_pct=0.20)
+        self.assertEqual(calibrated["status"], "CALIBRATED_ON_VALIDATION")
+        self.assertGreater(calibrated["validation_lcb95_pct"], 0.0)
+
+        bad = calibrate_signal_threshold(np.full(200, 0.05), probabilities, cost_pct=0.20)
+        self.assertEqual(bad["status"], "NO_POSITIVE_VALIDATION_EDGE")
+        self.assertGreater(bad["buy_threshold"], 1.0)
 
     def test_chronological_split_rejects_too_few_days(self):
         with self.assertRaises(ValueError):

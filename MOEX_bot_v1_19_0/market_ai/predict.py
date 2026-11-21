@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from . import CLASS_NAMES, HORIZONS_MINUTES
+from . import CLASS_NAMES, FEATURE_NAMES, HORIZONS_MINUTES
 from .data import _features_for_group, load_candles
 from .models import _TorchNetFactory
 
@@ -19,6 +19,16 @@ def predict_latest(model_path: str | Path, csv_paths: list[str], *, main_session
     sequence_length = int(checkpoint["sequence_length"])
     mean = np.asarray(checkpoint["scaler_mean"], dtype=np.float32)
     scale = np.asarray(checkpoint["scaler_scale"], dtype=np.float32)
+    saved_features = tuple(checkpoint.get("feature_names", ()))
+    if saved_features and saved_features != tuple(FEATURE_NAMES):
+        raise ValueError(
+            "Чекпойнт обучен на другой схеме признаков. Переобучите модель новой версией Market AI."
+        )
+    if len(mean) != len(FEATURE_NAMES) or len(scale) != len(FEATURE_NAMES):
+        raise ValueError(
+            "Размер scaler не совпадает с текущей схемой признаков. Нужна новая модель и scaler."
+        )
+    trade_thresholds = checkpoint.get("trade_thresholds", {})
     model = _TorchNetFactory.build(kind, int(checkpoint["n_features"]), len(HORIZONS_MINUTES))
     model.load_state_dict(checkpoint["state_dict"])
     model.eval()
@@ -48,11 +58,18 @@ def predict_latest(model_path: str | Path, csv_paths: list[str], *, main_session
         item = {"ticker": ticker, "timestamp": ts}
         for h_idx, horizon in enumerate(HORIZONS_MINUTES):
             p_down, p_flat, p_up = [float(x) for x in probabilities[h_idx]]
-            action = "BUY_CANDIDATE" if (p_up >= 0.60 and p_up - p_down >= 0.10) else "HOLD"
+            threshold = trade_thresholds.get(str(horizon), {})
+            buy_threshold = float(threshold.get("buy_threshold", 0.60))
+            edge_threshold = float(threshold.get("edge_threshold", 0.10))
+            action = "BUY_CANDIDATE" if (
+                p_up >= buy_threshold and p_up - p_down >= edge_threshold
+            ) else "HOLD"
             item[f"{horizon}m_down"] = p_down
             item[f"{horizon}m_flat"] = p_flat
             item[f"{horizon}m_up"] = p_up
             item[f"{horizon}m_action"] = action
+            item[f"{horizon}m_buy_threshold"] = buy_threshold
+            item[f"{horizon}m_threshold_status"] = threshold.get("status", "LEGACY_DEFAULT")
         rows.append(item)
     if not rows:
         raise ValueError("Не получилось построить прогноз: нужны минимум sequence_length свечей на тикер и торговую дату.")

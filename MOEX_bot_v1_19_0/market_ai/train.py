@@ -96,11 +96,11 @@ def main() -> int:
     parser.add_argument("--round-trip-cost-pct", type=float, default=0.20,
                         help="оценка полного входа+выхода в процентах; проверьте под свой тариф/спред/проскальзывание")
     parser.add_argument("--sequence-length", type=int, default=60)
-    parser.add_argument("--sample-stride", type=int, default=3)
+    parser.add_argument("--sample-stride", type=int, default=8)
     parser.add_argument("--event-horizon-seconds", type=int, default=300)
-    parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--patience", type=int, default=3)
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--patience", type=int, default=5)
     parser.add_argument("--models", default="logistic,hgb,mlp,gru",
                         help="любая комбинация logistic,hgb,mlp,gru")
     parser.add_argument("--include-evening", action="store_true",
@@ -164,6 +164,7 @@ def main() -> int:
             "n_tickers": n_tickers,
             "n_trading_days": n_trading_days,
             "supervisor_event_rows_added": int(dataset.event_rows_used),
+            "supervisor_actual_events_skipped_wrong_horizon": int(dataset.event_rows_skipped_actual_horizon),
             "sequence_length": args.sequence_length,
             "sample_stride": args.sample_stride,
             "horizons_minutes": list(HORIZONS_MINUTES),
@@ -225,6 +226,7 @@ def main() -> int:
             torch.save({
                 "kind": kind,
                 "state_dict": model.state_dict(),
+                "trade_thresholds": neural_report.get("trade_thresholds", {}),
                 "sequence_length": args.sequence_length,
                 "n_features": len(FEATURE_NAMES),
                 "horizons_minutes": list(HORIZONS_MINUTES),
@@ -248,9 +250,11 @@ def main() -> int:
     report["metadata"]["duration_seconds"] = round(time.time() - started, 2)
     report["best_by_validation_macro_f1"] = _select_best(report["models"])
     report["warnings"] = [
-        "Высокая accuracy сама по себе не доказывает прибыльность; оценивайте UP precision и net return сигналов.",
+        "Высокая accuracy сама по себе не доказывает прибыльность; сравнивайте её с majority_baseline_accuracy и balanced accuracy.",
+        "Порог BUY выбирается только на validation по консервативной нижней границе среднего net-return; при отсутствии положительного validation edge сигналы отключаются.",
+        "Метрики BUY — исследовательская оценка по отдельным сигналам, а не портфельный backtest: сигналы могут перекрываться по времени.",
         "Обучение не подключено к отправке ордеров: это отдельная исследовательская модель.",
-        "Supervisor labels используют действующие контрфактические правила и примерно 5-минутный lookahead; это не биржевой ground truth.",
+        "Supervisor labels используют правила бота и примерно 5-минутный lookahead; это не независимая биржевая разметка.",
     ]
     (output / "report.json").write_text(
         json.dumps(report, ensure_ascii=False, indent=2, default=_json_default), encoding="utf-8"
@@ -270,8 +274,20 @@ def main() -> int:
         f.write("## Временное разбиение\n\n")
         for split, dates in split_dates.items():
             f.write(f"- {split}: {dates[0]} — {dates[1]} ({len({'train': train_idx, 'validation': val_idx, 'test': test_idx}[split]):,} образцов)\n")
-        f.write("\n## Сравнение\n\n")
-        f.write("Подробные метрики по каждому горизонту см. в `metrics.csv` и `report.json`.\n\n")
+        f.write("\n## Распределение классов\n\n")
+        f.write("Доли классов по каждому горизонту помогают увидеть, насколько accuracy лучше простого прогноза самого частого класса.\n\n")
+        for split_name in ("train", "validation", "test"):
+            f.write(f"### {split_name}\n\n")
+            for horizon, counts in report["metadata"]["class_counts"][split_name].items():
+                total = max(1, counts["n"])
+                down = counts["down"] / total * 100.0
+                flat = counts["flat"] / total * 100.0
+                up = counts["up"] / total * 100.0
+                majority = max(counts["down"], counts["flat"], counts["up"]) / total
+                f.write(f"- {horizon} мин: DOWN={down:.1f}%, FLAT={flat:.1f}%, UP={up:.1f}%; baseline большинства={majority:.3f}\n")
+            f.write("\n")
+        f.write("## Сравнение\n\n")
+        f.write("Подробные метрики по каждому горизонту см. в `metrics.csv` и `report.json`. Порог BUY подбирается только на validation; test оценивается с зафиксированным порогом.\n\n")
         for model_name, section in report["models"].items():
             f.write(f"### {model_name}\n\n")
             if model_name in {"mlp", "gru"}:
@@ -282,10 +298,15 @@ def main() -> int:
                 metrics = {h: m.get("test", {}) for h, m in section.items()}
             for horizon, metric in metrics.items():
                 if metric.get("n", 0):
+                    lcb = metric.get("net_return_lcb95_pct")
+                    lcb_text = f"{lcb:.3f}%" if lcb is not None else "n/a"
+                    threshold_status = metric.get("threshold_status", "n/a")
                     f.write(f"- {horizon} мин: n={metric['n']}, acc={metric['accuracy']:.3f}, "
                             f"balanced acc={metric['balanced_accuracy']:.3f}, macro-F1={metric['macro_f1']:.3f}, "
                             f"UP precision={metric['up_precision']:.3f}, buys={metric['buy_signals']}, "
-                            f"mean net/buy={metric['mean_net_return_of_buys_pct']}%\n")
+                            f"mean net/buy={metric['mean_net_return_of_buys_pct']}%, "
+                            f"net LCB95={lcb_text}, threshold={metric.get('buy_threshold', 1.01):.3f}/"
+                            f"{metric.get('edge_threshold', 1.01):.3f} ({threshold_status})\n")
             f.write("\n")
         f.write("## Важно\n\n")
         f.write("Результаты — только историческая проверка. Они не гарантируют будущую доходность. "
